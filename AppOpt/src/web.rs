@@ -542,7 +542,7 @@ fn config_set_api(req: &Request) -> (u16, String) {
     if name.is_some_and(|n| !valid_name(n)) {
         return err_json(400, "无效的 cpuset 目录名");
     }
-    if path.is_some_and(|p| !valid_path(p)) {
+    if path.is_some_and(|p| !valid_path(p) || !path_allowed(p)) {
         return err_json(400, "无效的配置文件路径");
     }
 
@@ -611,6 +611,54 @@ fn valid_path(s: &str) -> bool {
     !s.is_empty() && s.len() < 256 && !s.bytes().any(|b| b < 0x20 || b == 0x7f)
 }
 
+/// Web 端只能把配置文件指到固定白名单目录内，避免 root 权限下被诱导写入任意路径。
+/// 目录白名单：模块（可执行文件）目录、当前配置所在目录、/data/adb、/data/local/tmp、/sdcard。
+/// 路径先拒绝 `..` 组件，再规范化父目录后比较前缀，符号链接指向外部同样被拒绝。
+fn path_allowed(p: &str) -> bool {
+    use std::path::{Component, Path, PathBuf};
+
+    let path = Path::new(p);
+    if path
+        .components()
+        .any(|c| matches!(c, Component::ParentDir | Component::Prefix(_)))
+    {
+        return false;
+    }
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let Ok(dir) = fs::canonicalize(parent) else {
+        return false;
+    };
+
+    let mut roots: Vec<PathBuf> = vec![
+        PathBuf::from("/data/adb"),
+        PathBuf::from("/data/local/tmp"),
+        PathBuf::from("/sdcard"),
+    ];
+    if let Some(exe_dir) = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+    {
+        roots.push(exe_dir);
+    }
+    // 当前配置可能写成相对路径（如 ./applist.conf），此时以工作目录为准
+    let cur = lock_ignore_poison(&CONFIG_FILE).clone();
+    if let Some(dir) = Path::new(&cur)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.to_path_buf())
+        .or_else(|| std::env::current_dir().ok())
+    {
+        roots.push(dir);
+    }
+
+    roots.iter().any(|root| {
+        fs::canonicalize(root)
+            .map(|root| dir.starts_with(&root))
+            .unwrap_or(false)
+    })
+}
 
 impl Settings {
     fn from_json(v: &Value) -> Self {
@@ -694,3 +742,50 @@ pub fn settings_save() {
     .save(SETTINGS_FILE);
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn exe_dir() -> std::path::PathBuf {
+        std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf()
+    }
+
+    #[test]
+    fn path_inside_module_dir_is_allowed() {
+        let p = exe_dir().join("rules.conf");
+        assert!(path_allowed(p.to_str().unwrap()));
+    }
+
+    #[test]
+    fn path_outside_whitelist_is_rejected() {
+        assert!(!path_allowed("/etc/passwd"));
+        assert!(!path_allowed("/proc/sys/kernel/core_pattern"));
+        assert!(!path_allowed("/root/.ssh/authorized_keys"));
+    }
+
+    #[test]
+    fn parent_dir_component_is_rejected() {
+        let p = format!("{}/../escape.conf", exe_dir().display());
+        assert!(!path_allowed(&p));
+        assert!(!path_allowed("../applist.conf"));
+    }
+
+    #[test]
+    fn symlink_escape_is_rejected() {
+        let link = exe_dir().join("escape_link");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink("/etc", &link).unwrap();
+        let p = link.join("evil.conf");
+        assert!(!path_allowed(p.to_str().unwrap()));
+        let _ = std::fs::remove_file(&link);
+    }
+
+    #[test]
+    fn nonexistent_parent_is_rejected() {
+        assert!(!path_allowed("/data/adb/not_exist_dir/x.conf"));
+    }
+}
