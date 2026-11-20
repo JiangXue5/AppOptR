@@ -14,6 +14,7 @@ mod web;
 
 use std::env;
 use std::fs;
+use std::os::unix::io::AsRawFd;
 use std::process;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -78,6 +79,51 @@ fn print_help(prog_name: &str) {
     println!("  }}");
     println!("  线程 RenderThread 绑定到 CPU 6-7");
     println!("  线程 Thread-1 绑定到 CPU 0-5");
+}
+
+/// 单实例锁的持有者，进程退出（含被 kill）时由内核自动释放
+struct InstanceLock {
+    // 句柄存活即持锁，无需手动解锁
+    _file: fs::File,
+}
+
+/// 同一 cpuset 目录只允许一个进程管理，不同 -b 名称各自成锁、仍可并行。
+///
+/// 锁文件与可执行文件同目录（模块安装后即模块目录），文件内的 PID 仅用于冲突提示。
+/// 目录不可写、SELinux 受限等情况一律视为“锁不可用”并放行，避免模块整体失效。
+fn instance_lock(cpuset_name: &str) -> Option<InstanceLock> {
+    let dir = env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .or_else(|| env::current_dir().ok())
+        .unwrap_or_else(|| ".".into());
+    let path = dir.join(format!(".AppOpt.{}.lock", cpuset_name));
+    let file = match fs::OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("警告: 无法创建锁文件 {} ({})，跳过单实例检查", path.display(), e);
+            return None;
+        }
+    };
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            let holder = fs::read_to_string(&path).unwrap_or_default();
+            let holder = holder.trim();
+            if holder.is_empty() {
+                eprintln!("错误: 已有实例在管理 cpuset 目录 {}，本进程退出", cpuset_name);
+            } else {
+                eprintln!("错误: 已有实例(PID {})在管理 cpuset 目录 {}，本进程退出", holder, cpuset_name);
+            }
+            eprintln!("提示: 如需并行请用 -b 指定不同的 cpuset 目录名");
+            process::exit(0);
+        }
+        eprintln!("警告: 锁文件 {} 加锁失败 ({})，跳过单实例检查", path.display(), err);
+        return None;
+    }
+    // 仅作冲突提示用途，不参与运行判定
+    let _ = fs::write(&path, format!("{}\n", process::id()));
+    Some(InstanceLock { _file: file })
 }
 
 fn main() {
@@ -164,6 +210,9 @@ fn main() {
     let sleep_interval = cli_interval.unwrap_or(st.check_interval);
     let cpuset_name = cli_cpuset.unwrap_or(st.cpuset_name);
     let web_enable = cli_web || st.web_enable;
+
+    // 单实例锁贯穿整个运行生命周期，先于 cpuset 初始化，避免重复建目录与双份绑核
+    let _instance = instance_lock(&cpuset_name);
 
     // 先设置 cpuset 路径再初始化拓扑，init_cpu_topo 会创建 BASE_CPUSET 目录
     set_base_cpuset(&cpuset_name);
