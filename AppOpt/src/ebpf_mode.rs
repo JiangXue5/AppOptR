@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread;
 
-use aya::maps::{Array as AyaArray, HashMap as AyaHashMap};
+use aya::maps::{Array as AyaArray, HashMap as AyaHashMap, Map, PerCpuArray as AyaPerCpuArray};
 use aya::{programs::TracePoint as AyaTracePoint, Ebpf, EbpfLoader, Pod};
 
 use crate::apply_affinity::{affinity_set, proc_walk, task_tids, tid_comm};
@@ -58,6 +58,8 @@ pub struct EbpfState {
     pub comm_capacity: u32,
     /// 本轮生效的逐包规则指纹，用于配置热更新时定位变化的包
     pub cfg_sig: HashMap<String, u64>,
+    /// 上一轮读到的内核累计丢弃数，用于差分求新增丢弃
+    pub drop_seen: u64,
 }
 
 impl Drop for EbpfState {
@@ -377,6 +379,7 @@ pub fn ebpf_init() -> Option<EbpfState> {
         wakeup_fd,
         comm_capacity: capacity,
         cfg_sig: HashMap::new(),
+        drop_seen: 0,
     })
 }
 
@@ -470,30 +473,46 @@ fn applied_clear(bpf: &mut Ebpf) {
     }
 }
 
-/// 读取并清零内核侧丢弃计数，返回本次丢弃的事件数
-/// 旧版 AppOpt-ebpf 无此 Map，读不到时按 0 处理
-fn drop_count_take(bpf: &mut Ebpf) -> u64 {
-    let Some(map) = bpf.map_mut("DROP_COUNT") else { return 0 };
-    let Ok(mut arr) = AyaArray::<_, u64>::try_from(map) else { return 0 };
-    let dropped = arr.get(&0, 0).unwrap_or(0);
-    if dropped > 0 {
-        let _ = arr.set(0, 0, 0);
+/// 读取内核侧累计丢弃数：per-CPU 槽位求和。旧版对象文件是普通 Array，同样返回累计值
+fn drop_count_read(bpf: &mut Ebpf) -> Option<u64> {
+    let map = bpf.map_mut("DROP_COUNT")?;
+    if matches!(map, Map::PerCpuArray(_)) {
+        let arr = AyaPerCpuArray::<_, u64>::try_from(map).ok()?;
+        let values = arr.get(&0, 0).ok()?;
+        return Some(values.iter().fold(0u64, |acc, v| acc.saturating_add(*v)));
     }
-    dropped
+    // 旧版 AppOpt-ebpf 用普通 Array；按累计值差分，不依赖清零也不会丢增量
+    if matches!(map, Map::Array(_)) {
+        let arr = AyaArray::<_, u64>::try_from(map).ok()?;
+        return arr.get(&0, 0).ok();
+    }
+    None
 }
 
-/// RingBuf 丢事件对账：低频检查内核丢弃计数，有丢失则全量重扫一次
+/// 累计计数差分：只统计新增丢弃量，读取期间继续递增的计数留到下一轮。
+/// current 小于基准说明计数器被重建（重新加载 eBPF），此时只更新基准，不重复对账
+fn drop_delta(seen: &mut u64, current: u64) -> u64 {
+    if current < *seen {
+        *seen = current;
+        return 0;
+    }
+    let delta = current - *seen;
+    *seen = current;
+    delta
+}
+
+/// RingBuf 丢事件对账：低频对比内核累计计数，有新增丢弃则全量重扫一次
 /// 缓存状态由 full_scan 重建，不额外引入心跳或高频 /proc 扫描
 pub fn reconcile(state: &mut EbpfState, cfg: &AppConfig) {
-    let dropped = drop_count_take(&mut state.bpf);
-    if dropped == 0 {
+    let Some(current) = drop_count_read(&mut state.bpf) else {
+        return;
+    };
+    let delta = drop_delta(&mut state.drop_seen, current);
+    if delta == 0 {
         return;
     }
-    DROPPED_TOTAL.fetch_add(dropped, Ordering::Relaxed);
-    eprintln!(
-        "eBPF: RingBuf 丢弃 {} 条事件，执行全量对账扫描",
-        dropped
-    );
+    DROPPED_TOTAL.fetch_add(delta, Ordering::Relaxed);
+    eprintln!("eBPF: RingBuf 丢弃 {} 条事件，执行全量对账扫描", delta);
     full_scan(cfg, state);
 }
 
@@ -694,4 +713,32 @@ mod tests {
         assert_eq!(changed, vec!["com.b".to_string()]);
         assert_eq!(removed, vec!["com.a".to_string()]);
     }
+
+    #[test]
+    fn drop_delta_counts_only_new_drops() {
+        let mut seen = 0u64;
+        assert_eq!(drop_delta(&mut seen, 3), 3);
+        assert_eq!(drop_delta(&mut seen, 7), 4);
+        // 计数没有增长时不重复触发对账
+        assert_eq!(drop_delta(&mut seen, 7), 0);
+        assert_eq!(seen, 7);
+    }
+
+    #[test]
+    fn drop_delta_keeps_increments_during_read() {
+        // 读取后、下一轮之前内核继续累加的部分留到下一轮，不会丢
+        let mut seen = 0u64;
+        assert_eq!(drop_delta(&mut seen, 2), 2);
+        assert_eq!(drop_delta(&mut seen, 5), 3);
+    }
+
+    #[test]
+    fn drop_delta_treats_reset_as_new_baseline() {
+        let mut seen = 10u64;
+        // eBPF 重新加载后计数从头开始，只更新基准，不应把旧值当成一次大丢弃
+        assert_eq!(drop_delta(&mut seen, 1), 0);
+        assert_eq!(seen, 1);
+        assert_eq!(drop_delta(&mut seen, 3), 2);
+    }
+
 }

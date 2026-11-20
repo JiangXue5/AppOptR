@@ -6,7 +6,7 @@
 use aya_ebpf::{
     helpers::{bpf_get_current_comm, bpf_get_current_pid_tgid},
     macros::{map, tracepoint},
-    maps::{Array, HashMap, LruHashMap, RingBuf},
+    maps::{Array, HashMap, LruHashMap, PerCpuArray, RingBuf},
     programs::TracePointContext,
 };
 
@@ -54,9 +54,10 @@ static EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 #[map]
 static OFFSETS_MAP: Array<TracepointOffsets> = Array::with_max_entries(1, 0);
 
-/// RingBuf 满导致的事件丢弃计数，索引 0 累计、用户态读取后清零
+/// RingBuf 满导致的事件丢弃计数。per-CPU 槽位：每个 CPU 只写自己的槽位，
+/// 不需要原子指令，也不会因为多核并发更新丢计数；用户态读取时按 CPU 求和并做差分
 #[map]
-static DROP_COUNT: Array<u64> = Array::with_max_entries(1, 0);
+static DROP_COUNT: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 
 /// 读取偏移，fork_child_pid 为 0 视为未注入返回 None
 #[inline(always)]
@@ -102,8 +103,8 @@ fn submit_event(event: ProcEvent) {
         entry.write(event);
         entry.submit(0);
     } else if let Some(ptr) = DROP_COUNT.get_ptr_mut(0) {
-        // RingBuf 满时只记账，不重试不阻塞；用户态低频读到计数后全量对账
-        unsafe { *ptr += 1 };
+        // 指向本 CPU 的槽位，同一 CPU 不会并发执行本程序，直接自增即可
+        unsafe { *ptr = (*ptr).wrapping_add(1) };
     }
 }
 
