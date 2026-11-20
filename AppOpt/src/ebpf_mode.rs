@@ -56,6 +56,8 @@ pub struct EbpfState {
     pub cache: ProcCache,
     pub wakeup_fd: RawFd,
     pub comm_capacity: u32,
+    /// 本轮生效的逐包规则指纹，用于配置热更新时定位变化的包
+    pub cfg_sig: HashMap<String, u64>,
 }
 
 impl Drop for EbpfState {
@@ -374,6 +376,7 @@ pub fn ebpf_init() -> Option<EbpfState> {
         cache: ProcCache::new(),
         wakeup_fd,
         comm_capacity: capacity,
+        cfg_sig: HashMap::new(),
     })
 }
 
@@ -585,5 +588,110 @@ pub fn full_scan(cfg: &AppConfig, state: &mut EbpfState) {
             });
         }
     });
+    state.cfg_sig = cfg.pkg_sig.clone();
 }
 
+/// 比对两轮逐包指纹，返回（新增或变更、已删除）的包名
+fn cfg_diff(
+    old: &HashMap<String, u64>,
+    new: &HashMap<String, u64>,
+) -> (Vec<String>, Vec<String>) {
+    let mut changed: Vec<String> = Vec::new();
+    for (pkg, sig) in new {
+        match old.get(pkg) {
+            Some(prev) if prev == sig => {}
+            _ => changed.push(pkg.clone()),
+        }
+    }
+    let removed: Vec<String> = old
+        .keys()
+        .filter(|p| !new.contains_key(*p))
+        .cloned()
+        .collect();
+    (changed, removed)
+}
+
+/// 配置变更后的增量重建：只清理并重扫规则发生变化的包，其余包的缓存与亲和性保持不变。
+/// 影响面过大（超过 4 个包）或删除了包时仍走全量，避免漏判导致残留绑定。
+pub fn config_rescan(new: &AppConfig, state: &mut EbpfState) {
+    let (targets, removed) = cfg_diff(&state.cfg_sig, &new.pkg_sig);
+
+    if targets.is_empty() && removed.is_empty() {
+        state.cfg_sig = new.pkg_sig.clone();
+        return;
+    }
+    if targets.len() + removed.len() > 4 {
+        full_scan(new, state);
+        return;
+    }
+
+    for pkg in targets.iter().chain(removed.iter()) {
+        for tid in state.cache.purge_pkg(pkg) {
+            applied_del(&mut state.bpf, tid);
+        }
+    }
+
+    if !targets.is_empty() {
+        let target_set: HashSet<&str> = targets.iter().map(|s| s.as_str()).collect();
+        proc_walk(new, |_| true, |pid, pkg, has_thread_rules| {
+            if !target_set.contains(pkg) {
+                return;
+            }
+            let Some(tids) = task_tids(pid) else { return };
+            for tid in tids {
+                let t_name = if has_thread_rules {
+                    tid_comm(tid).unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                state.cache.task_apply(tid, pid, pkg, &t_name, new, |tid, cpus, dir| {
+                    affinity_apply(tid, cpus, dir, new, &mut state.bpf)
+                });
+            }
+        });
+    }
+
+    state.cfg_sig = new.pkg_sig.clone();
+    println!(
+        "eBPF: 规则增量重建 {} 个应用，移除 {} 个应用的绑定记录",
+        targets.len(),
+        removed.len()
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sig_of(items: &[(&str, u64)]) -> HashMap<String, u64> {
+        items.iter().map(|(p, s)| (p.to_string(), *s)).collect()
+    }
+
+    #[test]
+    fn unchanged_config_has_no_targets() {
+        let old = sig_of(&[("com.a", 1), ("com.b", 2)]);
+        let (changed, removed) = cfg_diff(&old, &old);
+        assert!(changed.is_empty());
+        assert!(removed.is_empty());
+    }
+
+    #[test]
+    fn only_modified_pkg_is_rebuilt() {
+        let old = sig_of(&[("com.a", 1), ("com.b", 2)]);
+        let new = sig_of(&[("com.a", 9), ("com.b", 2)]);
+        let (changed, removed) = cfg_diff(&old, &new);
+        assert_eq!(changed, vec!["com.a".to_string()]);
+        assert!(removed.is_empty());
+    }
+
+    #[test]
+    fn added_and_removed_pkgs_are_reported() {
+        let old = sig_of(&[("com.a", 1)]);
+        let new = sig_of(&[("com.b", 2)]);
+        let (mut changed, mut removed) = cfg_diff(&old, &new);
+        changed.sort();
+        removed.sort();
+        assert_eq!(changed, vec!["com.b".to_string()]);
+        assert_eq!(removed, vec!["com.a".to_string()]);
+    }
+}

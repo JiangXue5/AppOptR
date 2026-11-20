@@ -25,7 +25,7 @@ use crate::config::{config_loader, init_inotify, load_config, CHECK_INTERVAL, CO
 use crate::cpuset::{init_cpu_topo, set_base_cpuset};
 use crate::ebpf_mode::{
     affinity_check, full_scan, event_dispatch, comm_map_init,
-    ebpf_init, reconcile, EbpfState, DROPPED_TOTAL,
+    ebpf_init, config_rescan, reconcile, EbpfState, DROPPED_TOTAL,
 };
 use crate::proc_mode::{cache_sync, ProcScanState};
 use crate::web::{
@@ -338,7 +338,8 @@ fn main() {
             if config_changed {
                 let r = comm_map_init(&mut es.bpf, &cfg.pkgs, es.comm_capacity);
                 if !r {
-                    full_scan(&cfg, es);
+                    // 只重建规则变化的包，未变化的包不重新绑定
+                    config_rescan(&cfg, es);
                 }
                 r
             } else {

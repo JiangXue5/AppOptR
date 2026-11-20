@@ -12,21 +12,22 @@ pub struct AffinityResult {
     pub is_thread_rule: bool,
 }
 
-/// 线程规则 CPU 累加，无线程匹配走包级 fallback，仍无则返回 None
+/// 线程规则 CPU 累加，无线程匹配走包级 fallback，仍无则按 keep/all 语义处理
 pub fn thread_affinity(
     pkg: &str,
     thread: &str,
     cfg: &AppConfig,
 ) -> Option<AffinityResult> {
+    let pkg_rules = cfg.rule_index.get(pkg)?;
+
     let mut cpus = CpuSet::new();
     let mut cpuset_dir = String::new();
     let mut matched = false;
 
     if !thread.is_empty() {
-        for rule in &cfg.rules {
-            if rule.pkg != pkg || rule.thread.is_empty() {
-                continue;
-            }
+        // 只遍历该包的线程规则，不再线性扫描全部规则
+        for &i in &pkg_rules.thread_rules {
+            let rule = &cfg.rules[i];
             if fnmatch_c(&rule.thread_pattern, thread) {
                 cpus.or(&rule.cpus);
                 matched = true;
@@ -41,10 +42,8 @@ pub fn thread_affinity(
 
     if !matched {
         let mut fallback_seen = false;
-        for rule in &cfg.rules {
-            if rule.pkg != pkg || !rule.thread.is_empty() {
-                continue;
-            }
+        for &i in &pkg_rules.pkg_rules {
+            let rule = &cfg.rules[i];
             cpus.or(&rule.cpus);
             if !fallback_seen {
                 cpuset_dir = rule.cpuset_dir.clone();
@@ -56,7 +55,9 @@ pub fn thread_affinity(
     }
 
     if cpus.count() == 0 {
-        if cfg.has_thread_rules.contains(pkg) {
+        // 包内存在线程规则但本线程未命中，且无包级规则：
+        // keep 保持原亲和性不干预，all 沿用旧行为设为全部核心
+        if cfg.has_thread_rules.contains(pkg) && cfg.unmatched_all {
             return Some(AffinityResult {
                 cpus: cfg.topo.present_cpus,
                 cpuset_dir: String::new(),
@@ -165,5 +166,87 @@ mod tests {
         let _ = child.kill();
         let _ = child.wait();
         assert_eq!(got.as_deref(), Some("com.test.applications"));
+    }
+
+    #[test]
+    fn unmatched_thread_keeps_affinity_by_default() {
+        let cfg = cfg_with("keep", "com.test.game {\n  RenderThread=0-1\n}\n");
+        // 未命中任何线程规则，包内也没有包级规则：默认 keep 不返回任何目标
+        assert!(thread_affinity("com.test.game", "Worker-9", &cfg).is_none());
+        assert!(!cfg.unmatched_all);
+    }
+
+    #[test]
+    fn unmatched_all_directive_restores_old_behavior() {
+        let cfg = cfg_with(
+            "all",
+            "@unmatched=all\ncom.test.game {\n  RenderThread=0-1\n}\n",
+        );
+        let got = thread_affinity("com.test.game", "Worker-9", &cfg).expect("all 应返回全部核心");
+        assert!(cfg.unmatched_all);
+        assert_eq!(got.cpus, cfg.topo.present_cpus);
+        assert!(!got.is_thread_rule);
+    }
+
+    #[test]
+    fn unknown_directive_does_not_drop_rules() {
+        // PARSE_FAILS 是进程级全局量，并行测试下不可断言，这里只校验规则仍能加载
+        let cfg = cfg_with("baddir", "@unknown=1\ncom.test.game=0-1\n");
+        assert_eq!(cfg.rules.len(), 1);
+        assert!(!cfg.unmatched_all);
+    }
+
+    #[test]
+    fn rule_index_limits_rules_to_same_pkg() {
+        let cfg = cfg_with(
+            "index",
+            "com.a {\n  RenderThread=0-1\n}\ncom.b {\n  RenderThread=2-3\n}\n",
+        );
+        let a = thread_affinity("com.a", "RenderThread", &cfg).unwrap();
+        assert_eq!(a.cpus.to_range_string(), "0-1");
+        let b = thread_affinity("com.b", "RenderThread", &cfg).unwrap();
+        assert_eq!(b.cpus.to_range_string(), "2-3");
+        assert_eq!(cfg.rule_index["com.a"].thread_rules.len(), 1);
+        assert_eq!(cfg.rule_index["com.a"].pkg_rules.len(), 0);
+    }
+
+    #[test]
+    fn pkg_signature_ignores_rule_order_but_detects_changes() {
+        let cfg1 = cfg_with("sig1", "com.a {\n  A=0-1\n  B=2-3\n}\n");
+        let cfg2 = cfg_with("sig2", "com.a {\n  B=2-3\n  A=0-1\n}\n");
+        let cfg3 = cfg_with("sig3", "com.a {\n  A=0-1\n  B=2-4\n}\n");
+        assert_eq!(cfg1.pkg_sig["com.a"], cfg2.pkg_sig["com.a"]);
+        assert_ne!(cfg1.pkg_sig["com.a"], cfg3.pkg_sig["com.a"]);
+    }
+
+    #[test]
+    #[ignore = "性能测量，手动运行：cargo test bench_rule_decision -- --ignored --nocapture"]
+    fn bench_rule_decision_200_rules() {
+        // 20 个包 × 11 条线程规则 = 220 条
+        let mut conf = String::new();
+        for p in 0..20 {
+            conf.push_str(&format!("com.bench.p{:02} {{\n", p));
+            for t in 0..10 {
+                conf.push_str(&format!("  Thread-{}=0-7\n", t));
+            }
+            conf.push_str("}\n");
+        }
+        let cfg = cfg_with("bench", &conf);
+        assert!(cfg.rules.len() >= 200);
+        const N: u32 = 200_000;
+
+        let t0 = std::time::Instant::now();
+        for _ in 0..N {
+            std::hint::black_box(thread_affinity("com.bench.p10", "Thread-3", &cfg));
+        }
+        let hit = t0.elapsed().as_nanos() as f64 / N as f64;
+
+        let t1 = std::time::Instant::now();
+        for _ in 0..N {
+            std::hint::black_box(thread_affinity("com.bench.p10", "Worker-9", &cfg));
+        }
+        let miss = t1.elapsed().as_nanos() as f64 / N as f64;
+
+        println!("{} 条规则：命中线程 {:.0} ns/次，未命中线程 {:.0} ns/次", cfg.rules.len(), hit, miss);
     }
 }

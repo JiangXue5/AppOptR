@@ -38,6 +38,20 @@ impl ProcCache {
         self.tasks.retain(|_, e| e.pid != pid);
     }
 
+    /// 包规则变更时清理该包全部线程，返回被清理的 tid 供调用方同步内核表
+    pub fn purge_pkg(&mut self, pkg: &str) -> Vec<i32> {
+        let stale: Vec<i32> = self
+            .tasks
+            .iter()
+            .filter(|(_, e)| e.pkg == pkg)
+            .map(|(&tid, _)| tid)
+            .collect();
+        for tid in &stale {
+            self.tasks.remove(tid);
+        }
+        stale
+    }
+
     /// comm 匹配包名，线程名时回退主线程条目
     pub fn pkg_lookup_comm(&self, pid: i32, comm: &str, cfg: &AppConfig) -> Option<String> {
         comm_to_pkg(pid, comm, cfg).or_else(|| self.tasks.get(&pid).map(|e| e.pkg.clone()))

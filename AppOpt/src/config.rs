@@ -1,6 +1,7 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -27,6 +28,13 @@ pub struct AffinityRule {
     pub cpus: CpuSet,
 }
 
+/// 同一包的规则下标，决策时不再遍历全部规则
+#[derive(Default)]
+pub struct PkgRules {
+    pub pkg_rules: Vec<usize>,
+    pub thread_rules: Vec<usize>,
+}
+
 pub struct AppConfig {
     pub rules: Vec<AffinityRule>,
     pub pkgs: HashSet<String>,
@@ -34,7 +42,51 @@ pub struct AppConfig {
     /// 内核 comm 最多 15 字节，长包名只能按前/后 15 字节比较；
     /// 预建键表把 O(包数) 的线性前缀/后缀扫描降到 O(1)
     pub trunc_keys: HashSet<[u8; 15]>,
+    /// 按包索引的规则下标表
+    pub rule_index: HashMap<String, PkgRules>,
+    /// 每个包当前规则的指纹，配置热更新时用于判断哪些包真正发生变化
+    pub pkg_sig: HashMap<String, u64>,
+    /// 线程未命中任何线程规则、且包无包级规则时的行为：
+    /// false（默认 keep）保持原亲和性，true（all）沿用旧行为设为全部核心
+    pub unmatched_all: bool,
     pub topo: CpuTopology,
+}
+
+/// 构建按包索引，保持规则原有顺序即保持原有并集语义
+fn build_rule_index(rules: &[AffinityRule]) -> HashMap<String, PkgRules> {
+    let mut index: HashMap<String, PkgRules> = HashMap::new();
+    for (i, rule) in rules.iter().enumerate() {
+        let entry = index.entry(rule.pkg.clone()).or_default();
+        if rule.thread.is_empty() {
+            entry.pkg_rules.push(i);
+        } else {
+            entry.thread_rules.push(i);
+        }
+    }
+    index
+}
+
+fn rule_hash(rule: &AffinityRule) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    rule.thread.hash(&mut h);
+    rule.cpus.to_range_string().hash(&mut h);
+    h.finish()
+}
+
+/// 逐包指纹：同包规则哈希排序后再哈希，保证与书写顺序无关、重复规则可区分
+fn build_pkg_sig(rules: &[AffinityRule]) -> HashMap<String, u64> {
+    let mut per: HashMap<String, Vec<u64>> = HashMap::new();
+    for rule in rules {
+        per.entry(rule.pkg.clone()).or_default().push(rule_hash(rule));
+    }
+    per.into_iter()
+        .map(|(pkg, mut hashes)| {
+            hashes.sort_unstable();
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            hashes.hash(&mut h);
+            (pkg, h.finish())
+        })
+        .collect()
 }
 
 /// 包名被截断到 15 字节时可能命中的键（前缀 + 后缀），与内核白名单同构
@@ -229,10 +281,33 @@ pub fn load_config(
     let mut cur_pkg = String::new();
     let mut pending_pkg = String::new();
     let mut in_block = false;
+    // 保守默认：未匹配线程保持原有亲和性，不再主动设为全部核心
+    let mut unmatched_all = false;
 
     for line in content.lines() {
         let p = line.trim();
         if p.is_empty() || p.starts_with('#') || p.starts_with("//") {
+            continue;
+        }
+
+        // 指令行：@unmatched=keep|all，与规则行互不影响
+        if let Some(rest) = p.strip_prefix('@') {
+            if in_block {
+                fail_cnt += 1;
+                continue;
+            }
+            let (key, val) = match rest.split_once('=') {
+                Some((k, v)) => (k.trim(), v.trim()),
+                None => {
+                    let mut it = rest.split_whitespace();
+                    (it.next().unwrap_or(""), it.next().unwrap_or(""))
+                }
+            };
+            match (key, val) {
+                ("unmatched", "keep") => unmatched_all = false,
+                ("unmatched", "all") => unmatched_all = true,
+                _ => fail_cnt += 1,
+            }
             continue;
         }
 
@@ -335,10 +410,34 @@ pub fn load_config(
         .collect();
     let num_rules = rules.len();
     let trunc_keys = build_trunc_keys(&pkgs);
+    let rule_index = build_rule_index(&rules);
+    let pkg_sig = build_pkg_sig(&rules);
+
+    // 同一包多条包级规则按并集生效，顺序无关；只提示不改变语义
+    let mut multi: Vec<&str> = rule_index
+        .iter()
+        .filter(|(_, v)| v.pkg_rules.len() > 1)
+        .map(|(k, _)| k.as_str())
+        .collect();
+    if !multi.is_empty() {
+        multi.sort_unstable();
+        let sample = multi.iter().take(3).copied().collect::<Vec<_>>().join(", ");
+        eprintln!(
+            "提示: {} 个应用存在多条包级规则，CPU 集合按并集生效（与书写顺序无关）：{}{}",
+            multi.len(),
+            sample,
+            if multi.len() > 3 { " 等" } else { "" }
+        );
+    }
 
     println!("配置文件解析完成，共加载 {} 条规则", num_rules);
     if fail_cnt > 0 {
         eprintln!("警告: {} 条规则因格式无效被跳过", fail_cnt);
+    }
+    if unmatched_all {
+        println!("未匹配线程: all（沿用旧行为，设为全部核心）");
+    } else {
+        println!("未匹配线程: keep（保持原有亲和性）");
     }
 
     Some(AppConfig {
@@ -346,6 +445,9 @@ pub fn load_config(
         pkgs,
         has_thread_rules,
         trunc_keys,
+        rule_index,
+        pkg_sig,
+        unmatched_all,
         topo: topo.clone(),
     })
 }

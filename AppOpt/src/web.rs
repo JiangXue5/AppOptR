@@ -510,6 +510,7 @@ fn config_json() -> String {
     let stats = lock_ignore_poison(&WEB_STATS).clone();
     let cfg = current_cfg();
     let cpuset_enabled = cfg.as_ref().is_some_and(|c| c.topo.cpuset_enabled);
+    let unmatched = if cfg.as_ref().is_some_and(|c| c.unmatched_all) { "all" } else { "keep" };
     json!({
         "mode": MODE_FORCE.load(Ordering::Relaxed),
         "mode_active": if stats.is_some_and(|s| s.ebpf) { "ebpf" } else { "proc" },
@@ -518,6 +519,7 @@ fn config_json() -> String {
         "cpuset_name": base_cpuset().rsplit('/').next().unwrap_or_default(),
         "config_file": lock_ignore_poison(&CONFIG_FILE).clone(),
         "cpuset_enabled": cpuset_enabled,
+        "unmatched": unmatched,
     })
     .to_string()
 }

@@ -201,6 +201,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div class="card-title">扫描参数</div>
 <div class="field"><input id="c-interval" type="number" min="1" max="3600"><button class="btn" id="c-interval-save">保存</button></div>
 <div class="hint">检查间隔（秒），影响 /proc 扫描与配置轮询频率</div>
+<div class="hint">未匹配线程：<span id="c-unmatched">-</span></div>
 </div>
 <div class="card">
 <div class="card-title">cpuset</div>
@@ -679,6 +680,7 @@ async function loadCfg(){
     $('c-cpuset').value=d.cpuset_name;
     $('c-file').value=d.config_file;
     $('c-cpuset-on').textContent=d.cpuset_enabled?'已启用':'不可用';
+    $('c-unmatched').textContent=d.unmatched==='all'?'all（未命中规则的线程设为全部核心）':'keep（未命中规则的线程保持原亲和性）';
   }catch(e){toast(e.message)}
 }
 document.querySelectorAll('#seg-mode button').forEach(b=>b.onclick=async()=>{
