@@ -279,6 +279,114 @@ struct CoreGroup {
     max_freq: u64,
 }
 
+/// 排序指标：capacity 优先，缺失时整体回退 max_freq。
+/// 一次只用一种指标，避免部分簇的缺失值以 0 参与比较被误判成 e-core。
+#[derive(Clone, Copy)]
+enum RankMetric {
+    Capacity,
+    MaxFreq,
+}
+
+impl RankMetric {
+    /// 只有参与分组的簇全部具备同一指标时才可用，否则返回 None 交由调用方降级
+    fn pick(groups: &[&CoreGroup]) -> Option<Self> {
+        if groups.is_empty() {
+            return None;
+        }
+        if groups.iter().all(|g| g.capacity > 0) {
+            Some(RankMetric::Capacity)
+        } else if groups.iter().all(|g| g.max_freq > 0) {
+            Some(RankMetric::MaxFreq)
+        } else {
+            None
+        }
+    }
+
+    fn key(self, g: &CoreGroup) -> u64 {
+        match self {
+            RankMetric::Capacity => g.capacity,
+            RankMetric::MaxFreq => g.max_freq,
+        }
+    }
+
+    fn source(self) -> &'static str {
+        match self {
+            RankMetric::Capacity => "capacity",
+            RankMetric::MaxFreq => "max_freq",
+        }
+    }
+}
+
+/// 由候选簇推导语义核心集合：指标完整时按单一指标排序分组，
+/// 两种指标都不完整时不猜测分层，直接降级到全部在线 CPU。
+fn classify_cores(
+    entries: &[CoreGroup],
+    online: &CpuSet,
+) -> (CpuSet, CpuSet, CpuSet, &'static str, bool) {
+    // 全部离线的簇不参与分组，其指标缺失也不应牵连整体判定
+    let active: Vec<&CoreGroup> = entries
+        .iter()
+        .filter(|g| g.cpus.iter().any(|&c| online.is_set(c)))
+        .collect();
+    let Some(metric) = RankMetric::pick(&active) else {
+        return (*online, *online, *online, "fallback", true);
+    };
+
+    let mut groups: Vec<(u64, CpuSet)> = Vec::new();
+    for g in active {
+        let key = metric.key(g);
+        let mut set = CpuSet::new();
+        for &c in &g.cpus {
+            if online.is_set(c) {
+                set.set(c);
+            }
+        }
+        if set.count() == 0 {
+            continue;
+        }
+        match groups.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, exist)) => exist.or(&set),
+            None => groups.push((key, set)),
+        }
+    }
+    groups.sort_by_key(|(k, _)| *k);
+
+    map_cores(groups, online, metric.source())
+}
+
+/// 无 cpufreq policy 时按每核 capacity 归并候选簇。
+/// 只有全部在线 CPU 都读得到容量才分组：部分 CPU 缺失时分组会漏掉这些 CPU，
+/// 排名也随之失真，此时返回空由调用方降级到全部在线 CPU。
+fn group_by_cpu_capacity(online: &CpuSet, capacity_of: impl Fn(usize) -> u64) -> Vec<CoreGroup> {
+    let mut by_cap: Vec<(u64, Vec<usize>)> = Vec::new();
+    let mut missing = false;
+    for cpu in 0..CPU_SETSIZE {
+        if !online.is_set(cpu) {
+            continue;
+        }
+        let cap = capacity_of(cpu);
+        if cap == 0 {
+            missing = true;
+            continue;
+        }
+        match by_cap.iter_mut().find(|(c, _)| *c == cap) {
+            Some(g) => g.1.push(cpu),
+            None => by_cap.push((cap, vec![cpu])),
+        }
+    }
+    if missing {
+        return Vec::new();
+    }
+    by_cap
+        .into_iter()
+        .map(|(capacity, cpus)| CoreGroup {
+            cpus,
+            capacity,
+            max_freq: 0,
+        })
+        .collect()
+}
+
 /// CPU 分层检测：优先按 capacity 分组，缺失时回退 cpuinfo_max_freq。
 /// 只纳入在线 CPU；簇数不足 3 时按 e-core → 首簇、hp-core → 末簇、p-core 跟随末簇降级，
 /// 无任何分层信息时三个语义名全部映射到在线 CPU 集合，避免语义规则整体失效。
@@ -308,62 +416,22 @@ fn detect_core_types(online: &CpuSet) -> (CpuSet, CpuSet, CpuSet, &'static str, 
                 .and_then(|s| s.trim().parse().ok())
                 .unwrap_or(0);
             let capacity = cpus.iter().map(|&c| cpu_capacity(c)).max().unwrap_or(0);
-            if max_freq == 0 && capacity == 0 {
-                continue;
-            }
-            entries.push(CoreGroup { cpus, capacity, max_freq });
+            // 指标全缺的簇也要保留：它确实存在，只是无法参与排序，
+            // 由 classify_cores 判定是否整体降级，不能在此静默丢弃
+            entries.push(CoreGroup {
+                cpus,
+                capacity,
+                max_freq,
+            });
         }
     }
 
     // 无 cpufreq（部分内核裁剪）时仍可按每核 capacity 分层
     if entries.is_empty() {
-        let mut by_cap: Vec<(u64, Vec<usize>)> = Vec::new();
-        for cpu in 0..CPU_SETSIZE {
-            if !online.is_set(cpu) {
-                continue;
-            }
-            let cap = cpu_capacity(cpu);
-            if cap == 0 {
-                continue;
-            }
-            match by_cap.iter_mut().find(|(c, _)| *c == cap) {
-                Some(g) => g.1.push(cpu),
-                None => by_cap.push((cap, vec![cpu])),
-            }
-        }
-        entries.extend(by_cap.into_iter().map(|(capacity, cpus)| CoreGroup {
-            cpus,
-            capacity,
-            max_freq: 0,
-        }));
+        entries = group_by_cpu_capacity(online, cpu_capacity);
     }
 
-    if entries.is_empty() {
-        return (*online, *online, *online, "fallback", true);
-    }
-
-    let use_capacity = entries.iter().all(|g| g.capacity > 0);
-    let mut groups: Vec<(u64, CpuSet)> = Vec::new();
-    for g in &entries {
-        let key = if use_capacity { g.capacity } else { g.max_freq };
-        let mut set = CpuSet::new();
-        for &c in &g.cpus {
-            if online.is_set(c) {
-                set.set(c);
-            }
-        }
-        if set.count() == 0 {
-            continue;
-        }
-        match groups.iter_mut().find(|(k, _)| *k == key) {
-            Some((_, exist)) => exist.or(&set),
-            None => groups.push((key, set)),
-        }
-    }
-    groups.sort_by_key(|(k, _)| *k);
-
-    let source = if use_capacity { "capacity" } else { "max_freq" };
-    map_cores(groups, online, source)
+    classify_cores(&entries, online)
 }
 
 /// 核组按 key 升序映射到语义核心名。
@@ -545,5 +613,126 @@ mod tests {
         let present = set(&[0, 2, 4]);
         assert_eq!(parse_cpu_ranges("0-7", Some(&present)), present);
         assert_eq!(parse_cpu_ranges("1-5", Some(&present)), set(&[2, 4]));
+    }
+
+    fn grp(cpus: &[usize], capacity: u64, max_freq: u64) -> CoreGroup {
+        CoreGroup {
+            cpus: cpus.to_vec(),
+            capacity,
+            max_freq,
+        }
+    }
+
+    #[test]
+    fn capacity_complete_ranks_by_capacity_only() {
+        // max_freq 顺序与 capacity 相反：混用指标会把首簇排错
+        let online = set(&[0, 1, 2, 3, 4, 5, 6, 7]);
+        let entries = vec![
+            grp(&[0, 1, 2, 3], 400, 3_000_000),
+            grp(&[4, 5], 700, 2_000_000),
+            grp(&[6, 7], 1024, 1_000_000),
+        ];
+        let (e, p, h, src, degraded) = classify_cores(&entries, &online);
+        assert_eq!(e, set(&[0, 1, 2, 3]));
+        assert_eq!(p, set(&[4, 5]));
+        assert_eq!(h, set(&[6, 7]));
+        assert_eq!(src, "capacity");
+        assert!(!degraded);
+    }
+
+    #[test]
+    fn capacity_partial_switches_whole_ranking_to_max_freq() {
+        // 缺 capacity 的簇不能以 0 参与排序，整体改用 max_freq
+        let online = set(&[0, 1, 2, 3, 4, 5, 6, 7]);
+        let entries = vec![
+            grp(&[0, 1, 2, 3], 0, 1_000_000),
+            grp(&[4, 5], 700, 2_000_000),
+            grp(&[6, 7], 1024, 3_000_000),
+        ];
+        let (e, p, h, src, degraded) = classify_cores(&entries, &online);
+        assert_eq!(e, set(&[0, 1, 2, 3]));
+        assert_eq!(p, set(&[4, 5]));
+        assert_eq!(h, set(&[6, 7]));
+        assert_eq!(src, "max_freq");
+        assert!(!degraded);
+    }
+
+    #[test]
+    fn both_metrics_partial_degrades_to_all_online() {
+        let online = set(&[0, 1, 2, 3]);
+        let entries = vec![grp(&[0, 1], 0, 1_000_000), grp(&[2, 3], 512, 0)];
+        let (e, p, h, src, degraded) = classify_cores(&entries, &online);
+        assert_eq!((e, p, h), (online, online, online));
+        assert_eq!(src, "fallback");
+        assert!(degraded);
+    }
+
+    #[test]
+    fn cluster_without_metrics_is_not_ranked_as_ecore() {
+        // 旧逻辑缺 capacity 时改用 max_freq，该簇 key 落成 0 被排到最前，
+        // 与小核簇合并成 e-core；现在两种指标都不完整，整体降级
+        let online = set(&[0, 1, 2, 3, 4, 5]);
+        let entries = vec![
+            grp(&[0, 1], 512, 0),
+            grp(&[2, 3], 0, 0),
+            grp(&[4, 5], 1024, 0),
+        ];
+        let (e, p, h, src, degraded) = classify_cores(&entries, &online);
+        assert_eq!((e, p, h), (online, online, online));
+        assert_eq!(src, "fallback");
+        assert!(degraded);
+    }
+
+    #[test]
+    fn per_cpu_capacity_groups_when_cpufreq_missing() {
+        let online = set(&[0, 1, 2, 3, 4, 5]);
+        let caps = [400u64, 400, 700, 700, 1024, 1024];
+        let entries = group_by_cpu_capacity(&online, |c| caps[c]);
+        assert_eq!(entries.len(), 3);
+        let (e, p, h, src, degraded) = classify_cores(&entries, &online);
+        assert_eq!(e, set(&[0, 1]));
+        assert_eq!(p, set(&[2, 3]));
+        assert_eq!(h, set(&[4, 5]));
+        assert_eq!(src, "capacity");
+        assert!(!degraded);
+    }
+
+    #[test]
+    fn partial_cpu_capacity_without_cpufreq_degrades() {
+        // 只有一个 CPU 缺容量时不能只给其余 CPU 分组
+        let online = set(&[0, 1, 2, 3]);
+        let caps = [512u64, 512, 512, 0];
+        let entries = group_by_cpu_capacity(&online, |c| caps[c]);
+        assert!(entries.is_empty());
+        let (e, p, h, src, degraded) = classify_cores(&entries, &online);
+        assert_eq!((e, p, h), (online, online, online));
+        assert_eq!(src, "fallback");
+        assert!(degraded);
+    }
+
+    #[test]
+    fn no_metric_degrades_every_semantic_name() {
+        let online = set(&[0, 1]);
+        let (e, p, h, src, degraded) = classify_cores(&[], &online);
+        assert_eq!((e, p, h), (online, online, online));
+        assert_eq!(src, "fallback");
+        assert!(degraded);
+    }
+
+    #[test]
+    fn offline_cluster_metrics_do_not_force_degrade() {
+        // cpu4-7 离线，该簇指标全缺只影响它自己，不应牵连在线簇的分层
+        let online = set(&[0, 1, 2, 3]);
+        let entries = vec![
+            grp(&[0, 1], 512, 0),
+            grp(&[2, 3], 1024, 0),
+            grp(&[4, 5, 6, 7], 0, 0),
+        ];
+        let (e, p, h, src, degraded) = classify_cores(&entries, &online);
+        assert_eq!(e, set(&[0, 1]));
+        assert_eq!(p, set(&[2, 3]));
+        assert_eq!(h, set(&[2, 3]));
+        assert_eq!(src, "capacity");
+        assert!(degraded);
     }
 }
