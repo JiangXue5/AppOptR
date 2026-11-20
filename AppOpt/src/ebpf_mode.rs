@@ -58,6 +58,8 @@ pub struct EbpfState {
     pub comm_capacity: u32,
     /// 本轮生效的逐包规则指纹，用于配置热更新时定位变化的包
     pub cfg_sig: HashMap<String, u64>,
+    /// 本轮生效的全局策略指纹，变化时无法按包增量处理
+    pub cfg_policy_sig: u64,
     /// 上一轮读到的内核累计丢弃数，用于差分求新增丢弃
     pub drop_seen: u64,
 }
@@ -379,6 +381,7 @@ pub fn ebpf_init() -> Option<EbpfState> {
         wakeup_fd,
         comm_capacity: capacity,
         cfg_sig: HashMap::new(),
+        cfg_policy_sig: 0,
         drop_seen: 0,
     })
 }
@@ -608,6 +611,7 @@ pub fn full_scan(cfg: &AppConfig, state: &mut EbpfState) {
         }
     });
     state.cfg_sig = cfg.pkg_sig.clone();
+    state.cfg_policy_sig = cfg.policy_sig;
 }
 
 /// 比对两轮逐包指纹，返回（新增或变更、已删除）的包名
@@ -633,6 +637,11 @@ fn cfg_diff(
 /// 配置变更后的增量重建：只清理并重扫规则发生变化的包，其余包的缓存与亲和性保持不变。
 /// 影响面过大（超过 4 个包）或删除了包时仍走全量，避免漏判导致残留绑定。
 pub fn config_rescan(new: &AppConfig, state: &mut EbpfState) {
+    // 全局策略变化影响所有已缓存线程，逐包增量覆盖不到，直接全量重建
+    if state.cfg_policy_sig != new.policy_sig {
+        full_scan(new, state);
+        return;
+    }
     let (targets, removed) = cfg_diff(&state.cfg_sig, &new.pkg_sig);
 
     if targets.is_empty() && removed.is_empty() {
@@ -741,4 +750,40 @@ mod tests {
         assert_eq!(drop_delta(&mut seen, 3), 2);
     }
 
+    fn cfg_of(name: &str, conf: &str) -> AppConfig {
+        let p = format!("/tmp/appopt_ebpf_test_{}.conf", name);
+        std::fs::write(&p, conf).unwrap();
+        let topo = crate::cpuset::init_cpu_topo();
+        let mut m = -1i64;
+        crate::config::load_config(&p, &topo, &mut m).unwrap()
+    }
+
+    #[test]
+    fn global_policy_change_requires_full_scan() {
+        let keep = cfg_of("policy_keep", "@unmatched=keep\ncom.a=0-1\ncom.b=2-3\n");
+        let all = cfg_of("policy_all", "@unmatched=all\ncom.a=0-1\ncom.b=2-3\n");
+        assert_ne!(keep.policy_sig, all.policy_sig);
+        // 逐包指纹完全一致，说明只靠 cfg_diff 发现不了这次变更
+        let (changed, removed) = cfg_diff(&keep.pkg_sig, &all.pkg_sig);
+        assert!(changed.is_empty(), "逐包指纹不应变化：{:?}", changed);
+        assert!(removed.is_empty());
+    }
+
+    #[test]
+    fn identical_global_policy_keeps_signature() {
+        let a = cfg_of("policy_same_a", "com.a=0-1\n");
+        let b = cfg_of("policy_same_b", "@unmatched=keep\ncom.a=0-1\n");
+        // 缺省值与显式 keep 等价，不应触发全量重建
+        assert_eq!(a.policy_sig, b.policy_sig);
+        assert_eq!(a.pkg_sig, b.pkg_sig);
+    }
+
+    #[test]
+    fn policy_and_rule_change_together() {
+        let old = cfg_of("policy_mix_old", "@unmatched=keep\ncom.a=0-1\n");
+        let new = cfg_of("policy_mix_new", "@unmatched=all\ncom.a=0-2\n");
+        assert_ne!(old.policy_sig, new.policy_sig);
+        let (changed, _) = cfg_diff(&old.pkg_sig, &new.pkg_sig);
+        assert_eq!(changed, vec!["com.a".to_string()]);
+    }
 }

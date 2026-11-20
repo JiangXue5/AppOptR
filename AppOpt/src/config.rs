@@ -46,6 +46,8 @@ pub struct AppConfig {
     pub rule_index: HashMap<String, PkgRules>,
     /// 每个包当前规则的指纹，配置热更新时用于判断哪些包真正发生变化
     pub pkg_sig: HashMap<String, u64>,
+    /// 影响所有包的全局策略指纹（当前为 @unmatched），单独比对才能发现这类变更
+    pub policy_sig: u64,
     /// 线程未命中任何线程规则、且包无包级规则时的行为：
     /// false（默认 keep）保持原亲和性，true（all）沿用旧行为设为全部核心
     pub unmatched_all: bool,
@@ -87,6 +89,14 @@ fn build_pkg_sig(rules: &[AffinityRule]) -> HashMap<String, u64> {
             (pkg, h.finish())
         })
         .collect()
+}
+
+/// 全局策略指纹：逐包指纹只覆盖规则本身，@unmatched 这类影响所有包的开关
+/// 变化不会体现在 pkg_sig 里，必须单独比对，否则已缓存线程不会重新应用
+fn build_policy_sig(unmatched_all: bool) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    unmatched_all.hash(&mut h);
+    h.finish()
 }
 
 /// 包名被截断到 15 字节时可能命中的键（前缀 + 后缀），与内核白名单同构
@@ -412,6 +422,7 @@ pub fn load_config(
     let trunc_keys = build_trunc_keys(&pkgs);
     let rule_index = build_rule_index(&rules);
     let pkg_sig = build_pkg_sig(&rules);
+    let policy_sig = build_policy_sig(unmatched_all);
 
     // 同一包多条包级规则按并集生效，顺序无关；只提示不改变语义
     let mut multi: Vec<&str> = rule_index
@@ -447,6 +458,7 @@ pub fn load_config(
         trunc_keys,
         rule_index,
         pkg_sig,
+        policy_sig,
         unmatched_all,
         topo: topo.clone(),
     })
