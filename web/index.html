@@ -169,6 +169,8 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div class="row" id="s-row-pcore"><span class="label">p-core 中核</span><span class="chip p" id="s-pcore">-</span></div>
 <div class="row"><span class="label">hp-core 大核</span><span class="chip h" id="s-hcore">-</span></div>
 <div class="row"><span class="label">全部核心</span><span class="chip c" id="s-all">-</span></div>
+<div class="row"><span class="label">分层依据</span><span class="value" id="s-topo-src">-</span></div>
+<div class="hint" id="s-topo-deg" hidden style="color:var(--orange)"></div>
 </div>
 <div class="card">
 <div class="card-title">支持</div>
@@ -358,9 +360,12 @@ async function refreshStat(){
     $('s-pcore').textContent=d.p_core||'无';
     $('s-hcore').textContent=d.hp_core||'无';
     $('s-all').textContent=d.all_core||'-';
+    $('s-topo-src').textContent=({capacity:'CPU capacity',max_freq:'cpuinfo_max_freq',fallback:'无分层信息'})[d.topo_source]||'-';
+    $('s-topo-deg').hidden=!d.topo_degraded;
+    $('s-topo-deg').textContent=d.topo_degraded?'簇数不足 3 组：p-core 跟随 hp-core，语义名可能指向同一批核心':'';
     topoCores=topoOf(d);
     const vis=semanticVisible();
-    $('s-card-cores').hidden=!vis.length;
+    $('s-card-cores').hidden=!vis.length&&!d.topo_degraded;
     $('s-row-pcore').hidden=!vis.includes('p-core');
   }catch(e){}
 }

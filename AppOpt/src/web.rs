@@ -234,6 +234,10 @@ fn sys_procs() -> u16 {
 /// CPU 集合转语义名
 fn spec_name(cpus: &CpuSet, topo: &CpuTopology) -> String {
     if cpus.count() > 0 {
+        // 降级拓扑下多个语义名可能指向同一集合，先判全集再判单簇，展示才不误导
+        if *cpus == topo.present_cpus {
+            return "all-core".into();
+        }
         if *cpus == topo.e_core {
             return "e-core".into();
         }
@@ -242,9 +246,6 @@ fn spec_name(cpus: &CpuSet, topo: &CpuTopology) -> String {
         }
         if *cpus == topo.hp_core {
             return "hp-core".into();
-        }
-        if *cpus == topo.present_cpus {
-            return "all-core".into();
         }
     }
     cpus.to_range_string()
@@ -281,6 +282,8 @@ fn status_json() -> String {
         "all_core": topo.map(|t| t.present_str.clone()).unwrap_or_default(),
         "cores": topo.map(|t| t.present_cpus.count()).unwrap_or(0),
         "cpuset_enabled": topo.is_some_and(|t| t.cpuset_enabled),
+        "topo_source": topo.map(|t| t.topo_source).unwrap_or(""),
+        "topo_degraded": topo.is_some_and(|t| t.topo_degraded),
     })
     .to_string()
 }

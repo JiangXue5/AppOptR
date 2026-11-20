@@ -250,14 +250,43 @@ pub struct CpuTopology {
     pub e_core: CpuSet,
     pub p_core: CpuSet,
     pub hp_core: CpuSet,
+    /// 分层依据：capacity / max_freq / fallback
+    pub topo_source: &'static str,
+    /// 簇数不足 3 时语义名做了降级映射，规则生效范围与原意不同
+    pub topo_degraded: bool,
 }
 
-/// 按 cpufreq 策略检测核心分层，按最高频率升序分组：首组为 e-core，末组为 hp-core，中间为 p-core
-fn detect_core_types() -> (CpuSet, CpuSet, CpuSet) {
-    let mut groups: Vec<(u64, Vec<usize>)> = Vec::new();
-    // 读取每个 policy 的 related_cpus 与 cpuinfo_max_freq，按频率合并同组
-    if let Ok(entries) = fs::read_dir("/sys/devices/system/cpu/cpufreq") {
-        for entry in entries.flatten() {
+/// 读取 cpuN/online，节点缺失（如 CPU0）视为在线
+fn cpu_online(cpu: usize) -> bool {
+    match fs::read_to_string(format!("/sys/devices/system/cpu/cpu{}/online", cpu)) {
+        Ok(s) => s.trim() != "0",
+        Err(_) => true,
+    }
+}
+
+/// 读取单核 capacity，部分内核不提供该节点时返回 0
+fn cpu_capacity(cpu: usize) -> u64 {
+    fs::read_to_string(format!("/sys/devices/system/cpu/cpu{}/cpu_capacity", cpu))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// cpufreq policy 或单核 capacity 归并出的候选核组
+struct CoreGroup {
+    cpus: Vec<usize>,
+    capacity: u64,
+    max_freq: u64,
+}
+
+/// CPU 分层检测：优先按 capacity 分组，缺失时回退 cpuinfo_max_freq。
+/// 只纳入在线 CPU；簇数不足 3 时按 e-core → 首簇、hp-core → 末簇、p-core 跟随末簇降级，
+/// 无任何分层信息时三个语义名全部映射到在线 CPU 集合，避免语义规则整体失效。
+fn detect_core_types(online: &CpuSet) -> (CpuSet, CpuSet, CpuSet, &'static str, bool) {
+    let mut entries: Vec<CoreGroup> = Vec::new();
+
+    if let Ok(dirs) = fs::read_dir("/sys/devices/system/cpu/cpufreq") {
+        for entry in dirs.flatten() {
             let path = entry.path();
             if !path
                 .file_name()
@@ -266,67 +295,153 @@ fn detect_core_types() -> (CpuSet, CpuSet, CpuSet) {
             {
                 continue;
             }
-            let freq: u64 = fs::read_to_string(path.join("cpuinfo_max_freq"))
-                .ok()
-                .and_then(|s| s.trim().parse().ok())
-                .unwrap_or(0);
-            if freq == 0 {
-                continue;
-            }
-            let cpus: Vec<usize> = fs::read_to_string(path.join("related_cpus"))
-                .ok()
+            let cpus: Vec<usize> = ["related_cpus", "cpus"]
+                .iter()
+                .find_map(|f| fs::read_to_string(path.join(f)).ok())
                 .map(|s| s.split_whitespace().filter_map(|c| c.parse().ok()).collect())
                 .unwrap_or_default();
             if cpus.is_empty() {
                 continue;
             }
-            if let Some(g) = groups.iter_mut().find(|(f, _)| *f == freq) {
-                g.1.extend(cpus);
-            } else {
-                groups.push((freq, cpus));
+            let max_freq: u64 = fs::read_to_string(path.join("cpuinfo_max_freq"))
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(0);
+            let capacity = cpus.iter().map(|&c| cpu_capacity(c)).max().unwrap_or(0);
+            if max_freq == 0 && capacity == 0 {
+                continue;
+            }
+            entries.push(CoreGroup { cpus, capacity, max_freq });
+        }
+    }
+
+    // 无 cpufreq（部分内核裁剪）时仍可按每核 capacity 分层
+    if entries.is_empty() {
+        let mut by_cap: Vec<(u64, Vec<usize>)> = Vec::new();
+        for cpu in 0..CPU_SETSIZE {
+            if !online.is_set(cpu) {
+                continue;
+            }
+            let cap = cpu_capacity(cpu);
+            if cap == 0 {
+                continue;
+            }
+            match by_cap.iter_mut().find(|(c, _)| *c == cap) {
+                Some(g) => g.1.push(cpu),
+                None => by_cap.push((cap, vec![cpu])),
             }
         }
+        entries.extend(by_cap.into_iter().map(|(capacity, cpus)| CoreGroup {
+            cpus,
+            capacity,
+            max_freq: 0,
+        }));
     }
-    groups.sort_by_key(|(f, _)| *f);
-    let mut e = CpuSet::new();
-    let mut p = CpuSet::new();
-    let mut h = CpuSet::new();
-    let n = groups.len();
-    for (i, (_, cpus)) in groups.iter().enumerate() {
-        let target = if i == 0 {
-            &mut e
-        } else if i == n - 1 {
-            &mut h
-        } else {
-            &mut p
-        };
-        for &cpu in cpus {
-            target.set(cpu);
+
+    if entries.is_empty() {
+        return (*online, *online, *online, "fallback", true);
+    }
+
+    let use_capacity = entries.iter().all(|g| g.capacity > 0);
+    let mut groups: Vec<(u64, CpuSet)> = Vec::new();
+    for g in &entries {
+        let key = if use_capacity { g.capacity } else { g.max_freq };
+        let mut set = CpuSet::new();
+        for &c in &g.cpus {
+            if online.is_set(c) {
+                set.set(c);
+            }
+        }
+        if set.count() == 0 {
+            continue;
+        }
+        match groups.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, exist)) => exist.or(&set),
+            None => groups.push((key, set)),
         }
     }
-    (e, p, h)
+    groups.sort_by_key(|(k, _)| *k);
+
+    let source = if use_capacity { "capacity" } else { "max_freq" };
+    map_cores(groups, online, source)
+}
+
+/// 核组按 key 升序映射到语义核心名。
+/// 1 组：三者同集合；2 组：p-core 跟随末组（避免 p-core 规则被静默丢弃）；
+/// 3 组及以上：首组 e-core、末组 hp-core、中间并集为 p-core。
+fn map_cores(
+    groups: Vec<(u64, CpuSet)>,
+    online: &CpuSet,
+    source: &'static str,
+) -> (CpuSet, CpuSet, CpuSet, &'static str, bool) {
+    let n = groups.len();
+    match n {
+        0 => (*online, *online, *online, "fallback", true),
+        1 => (groups[0].1, groups[0].1, groups[0].1, source, true),
+        2 => (groups[0].1, groups[1].1, groups[1].1, source, true),
+        _ => {
+            let mut p = CpuSet::new();
+            for (_, set) in &groups[1..n - 1] {
+                p.or(set);
+            }
+            let h = groups[n - 1].1;
+            if p.count() == 0 {
+                p = h;
+            }
+            (groups[0].1, p, h, source, false)
+        }
+    }
 }
 
 /// 初始化 CPU 拓扑，检测 cpuset 可用性并创建 BASE_CPUSET 目录
 pub fn init_cpu_topo() -> CpuTopology {
+    let raw = fs::read_to_string("/sys/devices/system/cpu/present")
+        .ok()
+        .or_else(|| fs::read_to_string("/sys/devices/system/cpu/possible").ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let mut present = parse_cpu_ranges(raw.as_deref().unwrap_or(""), None);
+    if present.count() == 0 {
+        let n = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        present = parse_cpu_ranges(&format!("0-{}", n.saturating_sub(1)), None);
+    }
+
+    // 离线 CPU 不进入规则集合与 cpuset 写入集合
+    let mut online = CpuSet::new();
+    for cpu in 0..CPU_SETSIZE {
+        if present.is_set(cpu) && cpu_online(cpu) {
+            online.set(cpu);
+        }
+    }
+    if online.count() == 0 {
+        online = present;
+    }
+
+    let (e, p, h, topo_source, topo_degraded) = detect_core_types(&online);
+
     let mut topo = CpuTopology {
-        present_cpus: CpuSet::new(),
-        present_str: String::new(),
+        present_cpus: online,
+        present_str: online.to_range_string(),
         mems_str: String::new(),
         cpuset_enabled: false,
-        e_core: CpuSet::new(),
-        p_core: CpuSet::new(),
-        hp_core: CpuSet::new(),
+        e_core: e,
+        p_core: p,
+        hp_core: h,
+        topo_source,
+        topo_degraded,
     };
 
-    if let Ok(content) = fs::read_to_string("/sys/devices/system/cpu/present") {
-        topo.present_str = content.trim().to_string();
-    }
-    topo.present_cpus = parse_cpu_ranges(&topo.present_str, None);
-    let (e, p, h) = detect_core_types();
-    topo.e_core = e;
-    topo.p_core = p;
-    topo.hp_core = h;
+    println!(
+        "CPU 拓扑: 在线[{}] e-core[{}] p-core[{}] hp-core[{}] 依据={}{}",
+        topo.present_str,
+        topo.e_core.to_range_string(),
+        topo.p_core.to_range_string(),
+        topo.hp_core.to_range_string(),
+        topo.topo_source,
+        if topo.topo_degraded { "（簇数不足，语义核心已降级映射）" } else { "" }
+    );
 
     let cpuset_path = CString::new("/dev/cpuset").expect("常量字符串无 NUL");
     if unsafe { libc::access(cpuset_path.as_ptr(), libc::F_OK) } != 0 {
@@ -347,4 +462,88 @@ pub fn init_cpu_topo() -> CpuTopology {
     }
 
     topo
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn set(cpus: &[usize]) -> CpuSet {
+        let mut s = CpuSet::new();
+        for &c in cpus {
+            s.set(c);
+        }
+        s
+    }
+
+    #[test]
+    fn three_clusters_map_by_key_order() {
+        let online = set(&[0, 1, 2, 3, 4, 5, 6, 7]);
+        let groups = vec![
+            (400, set(&[0, 1, 2, 3])),
+            (700, set(&[4, 5])),
+            (1024, set(&[6, 7])),
+        ];
+        let (e, p, h, src, degraded) = map_cores(groups, &online, "capacity");
+        assert_eq!(e, set(&[0, 1, 2, 3]));
+        assert_eq!(p, set(&[4, 5]));
+        assert_eq!(h, set(&[6, 7]));
+        assert_eq!(src, "capacity");
+        assert!(!degraded);
+    }
+
+    #[test]
+    fn two_clusters_keep_pcore_rules_alive() {
+        // 两簇设备 p-core 必须落到末簇，否则规则会被 parse 阶段丢弃
+        let online = set(&[0, 1, 2, 3, 4, 5, 6, 7]);
+        let groups = vec![(400, set(&[0, 1, 2, 3])), (1024, set(&[4, 5, 6, 7]))];
+        let (e, p, h, _, degraded) = map_cores(groups, &online, "capacity");
+        assert_eq!(e, set(&[0, 1, 2, 3]));
+        assert_eq!(p, set(&[4, 5, 6, 7]));
+        assert_eq!(h, set(&[4, 5, 6, 7]));
+        assert!(degraded);
+    }
+
+    #[test]
+    fn single_cluster_aliases_every_semantic_name() {
+        let online = set(&[0, 1, 2, 3]);
+        let (e, p, h, src, degraded) = map_cores(vec![(1, online)], &online, "fallback");
+        assert_eq!(e, online);
+        assert_eq!(p, online);
+        assert_eq!(h, online);
+        assert_eq!(src, "fallback");
+        assert!(degraded);
+    }
+
+    #[test]
+    fn no_groups_falls_back_to_all_online() {
+        let online = set(&[0, 1]);
+        let (e, p, h, src, degraded) = map_cores(Vec::new(), &online, "max_freq");
+        assert_eq!((e, p, h), (online, online, online));
+        assert_eq!(src, "fallback");
+        assert!(degraded);
+    }
+
+    #[test]
+    fn four_clusters_merge_middle_into_pcore() {
+        let online = set(&[0, 1, 2, 3, 4, 5, 6, 7]);
+        let groups = vec![
+            (100, set(&[0, 1])),
+            (200, set(&[2, 3])),
+            (300, set(&[4, 5])),
+            (400, set(&[6, 7])),
+        ];
+        let (e, p, h, _, degraded) = map_cores(groups, &online, "max_freq");
+        assert_eq!(e, set(&[0, 1]));
+        assert_eq!(p, set(&[2, 3, 4, 5]));
+        assert_eq!(h, set(&[6, 7]));
+        assert!(!degraded);
+    }
+
+    #[test]
+    fn numeric_ranges_respect_present_mask() {
+        let present = set(&[0, 2, 4]);
+        assert_eq!(parse_cpu_ranges("0-7", Some(&present)), present);
+        assert_eq!(parse_cpu_ranges("1-5", Some(&present)), set(&[2, 4]));
+    }
 }
