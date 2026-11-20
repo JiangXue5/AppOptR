@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::apply_affinity::{read_cmdline, task_tids};
+use crate::apply_affinity::{read_cmdline, reset_cpuset_dir_cache, task_tids};
 use crate::cache::ProcCache;
 use crate::config::{
     config_reload_now, spec_like,
@@ -548,6 +548,8 @@ fn config_set_api(req: &Request) -> (u16, String) {
     }
     if let Some(n) = name {
         crate::cpuset::set_base_cpuset(n);
+        // 目录全部换到新 base 下，旧的“已建”记录必须作废
+        reset_cpuset_dir_cache();
         if let Some(cfg) = current_cfg()
             && cfg.topo.cpuset_enabled {
                 create_cpuset_dir(&base_cpuset(), &cfg.topo.present_str, &cfg.topo.mems_str);

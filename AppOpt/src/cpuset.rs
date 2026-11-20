@@ -241,21 +241,6 @@ pub(crate) fn create_cpuset_dir(path: &str, cpus: &str, mems: &str) -> bool {
     fs::write(&mems_path, mems).is_ok()
 }
 
-/// 按合并后的 CPU 集合确保 cpuset 子目录存在，返回目录名（cpuset 未启用或创建失败返回空串）
-pub fn ensure_cpuset_dir(cpus: &CpuSet, topo: &CpuTopology) -> String {
-    if !topo.cpuset_enabled {
-        return String::new();
-    }
-    let dir_name = cpus.to_range_string();
-    let path = format!("{}/{}", base_cpuset(), dir_name);
-    // create_cpuset_dir 已处理 EEXIST，重复调用幂等
-    if create_cpuset_dir(&path, &dir_name, &topo.mems_str) {
-        dir_name
-    } else {
-        String::new()
-    }
-}
-
 #[derive(Clone)]
 pub struct CpuTopology {
     pub present_cpus: CpuSet,

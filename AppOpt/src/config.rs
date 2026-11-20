@@ -31,7 +31,24 @@ pub struct AppConfig {
     pub rules: Vec<AffinityRule>,
     pub pkgs: HashSet<String>,
     pub has_thread_rules: HashSet<String>,
+    /// 内核 comm 最多 15 字节，长包名只能按前/后 15 字节比较；
+    /// 预建键表把 O(包数) 的线性前缀/后缀扫描降到 O(1)
+    pub trunc_keys: HashSet<[u8; 15]>,
     pub topo: CpuTopology,
+}
+
+/// 包名被截断到 15 字节时可能命中的键（前缀 + 后缀），与内核白名单同构
+fn build_trunc_keys(pkgs: &HashSet<String>) -> HashSet<[u8; 15]> {
+    let mut keys = HashSet::with_capacity(pkgs.len() * 2);
+    for pkg in pkgs {
+        let b = pkg.as_bytes();
+        if b.len() < 15 {
+            continue;
+        }
+        keys.insert(b[..15].try_into().expect("切片长度固定 15"));
+        keys.insert(b[b.len() - 15..].try_into().expect("切片长度固定 15"));
+    }
+    keys
 }
 
 pub static CURRENT_CONFIG: Mutex<Option<Arc<AppConfig>>> = Mutex::new(None);
@@ -317,6 +334,7 @@ pub fn load_config(
         .map(|r| r.pkg.clone())
         .collect();
     let num_rules = rules.len();
+    let trunc_keys = build_trunc_keys(&pkgs);
 
     println!("配置文件解析完成，共加载 {} 条规则", num_rules);
     if fail_cnt > 0 {
@@ -327,6 +345,7 @@ pub fn load_config(
         rules,
         pkgs,
         has_thread_rules,
+        trunc_keys,
         topo: topo.clone(),
     })
 }
