@@ -11,7 +11,8 @@ path = "src/main.rs"
 aya-ebpf = "0.2"
 
 [profile.release]
-opt-level = "s"
+# bpf-linker 0.13 起不再接受 -Os，改用 -O2
+opt-level = 2
 lto = true
 debug = false
 codegen-units = 1

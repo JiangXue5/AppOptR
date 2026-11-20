@@ -501,7 +501,7 @@ fn inotify_handle(interval: u64, last_mtime: &mut i64) {
 fn inotify_rewatch(inotify_fd: i32) -> bool {
     let inotify_wd = INOTIFY_WD.load(Ordering::Acquire);
     unsafe {
-        libc::inotify_rm_watch(inotify_fd, inotify_wd as u32);
+        libc::inotify_rm_watch(inotify_fd, inotify_wd);
     }
     let cfg_cstr = match CString::new(lock_ignore_poison(&CONFIG_FILE).clone()) {
         Ok(c) => c,

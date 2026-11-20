@@ -22,7 +22,7 @@ use crate::rule_edit::{rule_delete, rule_delete_pkg, rule_rename, rule_upsert, R
 use crate::{lock_ignore_poison, EBPF_GAVE_UP, MAX_PKG_LEN, MAX_THREAD_LEN};
 
 pub const WEB_PORT: u16 = 8889;
-const INDEX_HTML: &str = include_str!("../web/index.html");
+const INDEX_HTML: &str = include_str!("../../web/index.html");
 
 pub static MODE_FORCE: AtomicU8 = AtomicU8::new(0);
 pub static WEB_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -45,13 +45,13 @@ pub fn cache_stats(cache: &ProcCache) -> (usize, usize) {
     (cache.tasks.len(), pkgs.len())
 }
 
-/// 启动 web 前端
-pub fn web_start() {
+/// 启动 web 前端，监听成功返回 true
+pub fn web_start() -> bool {
     let listener = match TcpListener::bind(("127.0.0.1", WEB_PORT)) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("Web: 监听 127.0.0.1:{} 失败 ({})", WEB_PORT, e);
-            return;
+            return false;
         }
     };
     WEB_ENABLED.store(true, Ordering::Release);
@@ -61,6 +61,7 @@ pub fn web_start() {
             thread::spawn(move || conn_handle(stream));
         }
     });
+    true
 }
 
 struct Request {

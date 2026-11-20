@@ -201,9 +201,13 @@ fn main() {
     init_inotify(&config_file);
 
     if web_enable {
-        web_start();
-        // -w 或设置恢复启用后落盘，重启保持开启
-        settings_save();
+        // 绑定失败时不落盘，否则会把 web_enable 写成 false，一次端口冲突永久关闭 Web
+        if web_start() {
+            // -w 或设置恢复启用后落盘，重启保持开启
+            settings_save();
+        } else {
+            eprintln!("Web: 启动失败，保留原有 web_enable 设置");
+        }
     }
 
     // 守护进程模式，保存 JoinHandle 用于 panic 恢复检测

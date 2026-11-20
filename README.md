@@ -23,6 +23,20 @@ http://appopt.suto.top
 | `appopt-ebpf` | eBPF 内核态 |
 
 
+### 构建
+
+```sh
+./build.sh                 # 当前主机架构
+./build.sh -a arm64        # 需要 aarch64 交叉链接器（NDK clang）
+./build.sh -a x64          # 需要 x86_64 交叉链接器
+./build.sh -a all          # 两个架构
+```
+
+- 模块脚本源码在 `module/`，产物打包到 `dist/AppOpt-<版本>-<ABI>.zip`，不覆盖 `modules_update/` 下的发布包。
+- 用户态仅需稳定版 Rust；eBPF 需要 `nightly` + `rust-src` + `bpf-linker`，缺失时脚本会直接报错并给出安装命令。
+- 交叉编译目标可用 `APPOPT_ARM64_TRIPLE` / `APPOPT_X64_TRIPLE` 覆盖，链接器用 `CARGO_TARGET_<TRIPLE>_LINKER` 指定。
+
+
 ### 命令行参数
 
 | 参数 | 说明 | 默认值 |
