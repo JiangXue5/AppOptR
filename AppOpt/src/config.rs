@@ -51,6 +51,8 @@ pub struct AppConfig {
     /// 线程未命中任何线程规则、且包无包级规则时的行为：
     /// false（默认 keep）保持原亲和性，true（all）沿用旧行为设为全部核心
     pub unmatched_all: bool,
+    /// 跨簇规则统计，仅用于展示 S7 的潜在作用面
+    pub sched_scope: SchedScope,
     pub topo: CpuTopology,
 }
 
@@ -97,6 +99,55 @@ fn build_policy_sig(unmatched_all: bool) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     unmatched_all.hash(&mut h);
     h.finish()
+}
+
+/// S7 收益面统计：动态分配只在「一条规则的允许集合横跨多个核心层」时才有作用面。
+/// 解析期一次性计算，不参与运行期决策，也不产生系统调用。
+#[derive(Clone, Copy, Default)]
+pub struct SchedScope {
+    /// 去重后的实际核心层数：降级拓扑下 e/p/hp 会指向同一集合，按语义名数会虚高
+    pub levels: usize,
+    /// 允许集合横跨两层及以上的规则数
+    pub rules: usize,
+    /// 上述规则涉及的包数，比规则条数更接近实际收益面
+    pub pkgs: usize,
+}
+
+/// 两个 CPU 集合是否有交集
+fn intersects(a: &CpuSet, b: &CpuSet) -> bool {
+    a.bits.iter().zip(b.bits.iter()).any(|(x, y)| x & y != 0)
+}
+
+/// 统计跨簇规则。等于在线全集的规则视为「不限制」，不计入：
+/// 写 0-7 的用户本来就没打算指定核心层，动态分配对他没有信息可加。
+fn sched_scope(rules: &[AffinityRule], topo: &CpuTopology) -> SchedScope {
+    let mut levels: Vec<CpuSet> = Vec::new();
+    for s in [topo.e_core, topo.p_core, topo.hp_core] {
+        if s.count() > 0 && !levels.contains(&s) {
+            levels.push(s);
+        }
+    }
+    let mut scope = SchedScope {
+        levels: levels.len(),
+        ..SchedScope::default()
+    };
+    if levels.len() < 2 {
+        return scope;
+    }
+
+    let mut pkgs: HashSet<&str> = HashSet::new();
+    for r in rules {
+        if r.cpus.count() == 0 || r.cpus == topo.present_cpus {
+            continue;
+        }
+        let hit = levels.iter().filter(|l| intersects(&r.cpus, l)).count();
+        if hit > 1 {
+            scope.rules += 1;
+            pkgs.insert(r.pkg.as_str());
+        }
+    }
+    scope.pkgs = pkgs.len();
+    scope
 }
 
 /// 包名被截断到 15 字节时可能命中的键（前缀 + 后缀），与内核白名单同构
@@ -450,6 +501,15 @@ pub fn load_config(
     } else {
         println!("未匹配线程: keep（保持原有亲和性）");
     }
+    let scope = sched_scope(&rules, topo);
+    if scope.levels < 2 {
+        println!("跨簇规则: 不适用（当前识别为 {} 个核心层）", scope.levels);
+    } else {
+        println!(
+            "跨簇规则: {} / {} 条，涉及 {} 个包（核心层级 {}）",
+            scope.rules, num_rules, scope.pkgs, scope.levels
+        );
+    }
 
     Some(AppConfig {
         rules,
@@ -460,6 +520,7 @@ pub fn load_config(
         pkg_sig,
         policy_sig,
         unmatched_all,
+        sched_scope: scope,
         topo: topo.clone(),
     })
 }
@@ -658,4 +719,85 @@ fn inotify_rewatch(inotify_fd: i32) -> bool {
     }
     INOTIFY_WD.store(new_wd, Ordering::Release);
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn set(cpus: &[usize]) -> CpuSet {
+        let mut s = CpuSet::new();
+        for &c in cpus {
+            s.set(c);
+        }
+        s
+    }
+
+    fn topo_of(e: &[usize], p: &[usize], h: &[usize]) -> CpuTopology {
+        let mut present = CpuSet::new();
+        for group in [e, p, h] {
+            present.or(&set(group));
+        }
+        CpuTopology {
+            present_cpus: present,
+            present_str: present.to_range_string(),
+            mems_str: "0".to_string(),
+            cpuset_enabled: false,
+            e_core: set(e),
+            p_core: set(p),
+            hp_core: set(h),
+            topo_source: "capacity",
+            topo_degraded: false,
+        }
+    }
+
+    fn scope_of(name: &str, conf: &str, topo: &CpuTopology) -> SchedScope {
+        let path = format!("/tmp/appopt_scope_{}.conf", name);
+        fs::write(&path, conf).unwrap();
+        let mut mtime = -1i64;
+        let cfg = load_config(&path, topo, &mut mtime).expect("配置应能加载");
+        let _ = fs::remove_file(&path);
+        cfg.sched_scope
+    }
+
+    #[test]
+    fn full_set_rule_is_not_cross_cluster() {
+        // 写 0-7 表示不限制，不代表跨簇意图
+        let topo = topo_of(&[0, 1, 2, 3], &[4, 5], &[6, 7]);
+        let s = scope_of("full", "com.a=0-7\n", &topo);
+        assert_eq!((s.levels, s.rules, s.pkgs), (3, 0, 0));
+    }
+
+    #[test]
+    fn rule_spanning_two_layers_is_counted() {
+        let topo = topo_of(&[0, 1, 2, 3], &[4, 5], &[6, 7]);
+        let conf = "com.a {\n  RenderThread=2-5\n}\ncom.b=6-7\n";
+        let s = scope_of("span", conf, &topo);
+        // 2-5 同时命中 e-core 与 p-core；6-7 只在 hp-core
+        assert_eq!((s.levels, s.rules, s.pkgs), (3, 1, 1));
+    }
+
+    #[test]
+    fn cross_pkgs_dedups_rules_in_same_package() {
+        let topo = topo_of(&[0, 1, 2, 3], &[4, 5], &[6, 7]);
+        let conf = "com.a {\n  A=2-5\n  B=3-6\n}\n";
+        let s = scope_of("dedup", conf, &topo);
+        assert_eq!((s.levels, s.rules, s.pkgs), (3, 2, 1));
+    }
+
+    #[test]
+    fn two_cluster_topo_merges_pcore_and_hpcore() {
+        // 两簇设备 p-core 与 hp-core 是同一批核，跨它俩没有收益面
+        let topo = topo_of(&[0, 1, 2, 3], &[4, 5, 6, 7], &[4, 5, 6, 7]);
+        let s = scope_of("two", "com.a {\n  A=p-core,hp-core\n}\n", &topo);
+        assert_eq!((s.levels, s.rules, s.pkgs), (2, 0, 0));
+    }
+
+    #[test]
+    fn degraded_topo_reports_no_scope() {
+        // 单簇/降级拓扑下三个语义名同集合，动态分配无意义
+        let topo = topo_of(&[0, 1, 2, 3], &[0, 1, 2, 3], &[0, 1, 2, 3]);
+        let s = scope_of("degraded", "com.a=0-1\n", &topo);
+        assert_eq!((s.levels, s.rules, s.pkgs), (1, 0, 0));
+    }
 }

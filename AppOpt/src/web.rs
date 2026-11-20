@@ -511,6 +511,8 @@ fn config_json() -> String {
     let cfg = current_cfg();
     let cpuset_enabled = cfg.as_ref().is_some_and(|c| c.topo.cpuset_enabled);
     let unmatched = if cfg.as_ref().is_some_and(|c| c.unmatched_all) { "all" } else { "keep" };
+    let scope = cfg.as_ref().map(|c| c.sched_scope).unwrap_or_default();
+    let rules_total = cfg.as_ref().map(|c| c.rules.len()).unwrap_or(0);
     json!({
         "mode": MODE_FORCE.load(Ordering::Relaxed),
         "mode_active": if stats.is_some_and(|s| s.ebpf) { "ebpf" } else { "proc" },
@@ -520,6 +522,10 @@ fn config_json() -> String {
         "config_file": lock_ignore_poison(&CONFIG_FILE).clone(),
         "cpuset_enabled": cpuset_enabled,
         "unmatched": unmatched,
+        "cluster_levels": scope.levels,
+        "cross_rules": scope.rules,
+        "cross_pkgs": scope.pkgs,
+        "rules_total": rules_total,
     })
     .to_string()
 }
