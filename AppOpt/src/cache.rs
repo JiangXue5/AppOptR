@@ -33,6 +33,11 @@ impl ProcCache {
         self.tasks.remove(&tid);
     }
 
+    /// 进程退出时清理其全部线程
+    pub fn purge_pid(&mut self, pid: i32) {
+        self.tasks.retain(|_, e| e.pid != pid);
+    }
+
     /// comm 匹配包名，线程名时回退主线程条目
     pub fn pkg_lookup_comm(&self, pid: i32, comm: &str, cfg: &AppConfig) -> Option<String> {
         comm_to_pkg(pid, comm, cfg).or_else(|| self.tasks.get(&pid).map(|e| e.pkg.clone()))

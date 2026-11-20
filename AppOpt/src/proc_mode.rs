@@ -1,106 +1,165 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::time::{Duration, Instant};
 
-use crate::apply_affinity::{proc_walk, task_tids, tid_comm};
+use crate::apply_affinity::{proc_walk, read_cmdline, task_tids, tid_comm};
 use crate::cache::ProcCache;
 use crate::config::AppConfig;
 
+/// 全量校验周期：兜底 PID 复用、tid 复用与差分漏检
+const FULL_CHECK: Duration = Duration::from_secs(60);
+
 pub struct ProcScanState {
     pub cache: ProcCache,
-    pub last_proc_count: i32,
-    pub scan_all_proc: bool,
-    pub tracked_pids: HashSet<i32>,
-    pub last_proc_total: i32,
+    /// 被管理 pid 到包名，用于增量线程发现与进程退出清理
+    pub tracked_pids: HashMap<i32, String>,
+    /// 上一轮 /proc PID 快照，用于差分
+    pub known_pids: HashSet<i32>,
+    /// 已评估过的 tid 及其归属 pid，避免每轮重复读取 comm 与重复决策
+    pub known_tids: HashMap<i32, i32>,
     pub force_affinity: bool,
+    /// 请求一次全量重建（配置变更、模式切换、eBPF 回退）
+    pub rescan_all: bool,
+    last_full: Instant,
 }
 
 impl ProcScanState {
     pub fn new() -> Self {
         Self {
             cache: ProcCache::new(),
-            last_proc_count: 0,
-            scan_all_proc: false,
-            tracked_pids: HashSet::new(),
-            last_proc_total: 0,
-            force_affinity: false,
+            tracked_pids: HashMap::new(),
+            known_pids: HashSet::new(),
+            known_tids: HashMap::new(),
+            force_affinity: true,
+            rescan_all: true,
+            last_full: Instant::now(),
         }
+    }
+
+    pub fn request_full_scan(&mut self) {
+        self.rescan_all = true;
+        self.force_affinity = true;
     }
 }
 
-pub fn proc_scan(cfg: &AppConfig, state: &mut ProcScanState) -> usize {
-    state.cache.clear();
+/// 单轮扫描。全量校验走完整 /proc；其余轮次只处理新增 PID 与已跟踪进程的新线程，
+/// 不再用系统线程总数变化推测新进程（该字段是线程数，轻量进程会被漏掉）
+pub fn cache_sync(cfg: &AppConfig, state: &mut ProcScanState) {
+    if state.rescan_all || state.last_full.elapsed() >= FULL_CHECK {
+        proc_scan(cfg, state);
+        return;
+    }
 
-    let (count, current_proc_total) = proc_walk(
-        cfg,
-        |pid| state.scan_all_proc || state.tracked_pids.contains(&pid),
-        |pid, pkg, has_thread_rules| {
-            proc_tasks(pid, pkg, has_thread_rules, cfg, &mut state.cache);
-        },
-    );
+    let current = read_pid_set();
 
-    state.scan_all_proc = current_proc_total > state.last_proc_total;
-    state.last_proc_total = current_proc_total;
+    let new_pids: Vec<i32> = current
+        .iter()
+        .filter(|pid| !state.known_pids.contains(pid))
+        .copied()
+        .collect();
+    let gone_pids: Vec<i32> = state
+        .known_pids
+        .iter()
+        .filter(|pid| !current.contains(pid))
+        .copied()
+        .collect();
 
-    count
-}
-
-/// sysinfo 进程数变化或 kill(pid,0) 失败时触发 proc_scan
-pub fn cache_sync(state: &mut ProcScanState, cfg: &AppConfig) {
-    let mut need_reload = state.scan_all_proc;
-
-    let mut info: libc::sysinfo = unsafe { std::mem::zeroed() };
-    if unsafe { libc::sysinfo(&mut info) } != 0 {
-        need_reload = true;
-    } else {
-        let current_proc_count = info.procs as i32;
-        if current_proc_count > state.last_proc_count + 11 {
-            need_reload = true;
-        } else if current_proc_count > state.last_proc_count {
+    // 只有新增 PID 需要读 cmdline，未变化的进程不再解析包名
+    for pid in new_pids {
+        let Some(pkg) = read_cmdline(pid).or_else(|| tid_comm(pid)) else {
+            continue;
+        };
+        if !cfg.pkgs.contains(&pkg) {
+            continue;
+        }
+        let has_thread_rules = cfg.has_thread_rules.contains(&pkg);
+        state.tracked_pids.insert(pid, pkg.clone());
+        if proc_tasks(pid, &pkg, has_thread_rules, cfg, state) > 0 {
             state.force_affinity = true;
         }
-        state.last_proc_count = current_proc_count;
     }
 
-    if !need_reload {
-        for &pid in state.tracked_pids.iter() {
-            if unsafe { libc::kill(pid, 0) } != 0 {
-                need_reload = true;
-                break;
+    for pid in gone_pids {
+        state.tracked_pids.remove(&pid);
+        state.cache.purge_pid(pid);
+        state.known_tids.retain(|_, owner| *owner != pid);
+    }
+
+    // 已跟踪进程的新线程：新线程会在创建后立刻命名，需在下一个周期内纳入管理
+    let targets: Vec<i32> = state
+        .tracked_pids
+        .iter()
+        .filter(|(_, pkg)| cfg.has_thread_rules.contains(pkg.as_str()))
+        .map(|(&pid, _)| pid)
+        .collect();
+    for pid in targets {
+        let Some(pkg) = state.tracked_pids.get(&pid).cloned() else {
+            continue;
+        };
+        if proc_tasks(pid, &pkg, true, cfg, state) > 0 {
+            state.force_affinity = true;
+        }
+    }
+
+    state.known_pids = current;
+}
+
+/// 全量重建：清空缓存与跟踪状态后遍历 /proc
+fn proc_scan(cfg: &AppConfig, state: &mut ProcScanState) {
+    let current = read_pid_set();
+    state.cache.clear();
+    state.tracked_pids.clear();
+    state.known_tids.clear();
+
+    let _ = proc_walk(cfg, |_| true, |pid, pkg, has_thread_rules| {
+        state.tracked_pids.insert(pid, pkg.to_string());
+        proc_tasks(pid, pkg, has_thread_rules, cfg, state);
+    });
+
+    state.known_pids = current;
+    state.rescan_all = false;
+    state.last_full = Instant::now();
+    state.force_affinity = true;
+}
+
+fn read_pid_set() -> HashSet<i32> {
+    let mut set = HashSet::new();
+    if let Ok(entries) = fs::read_dir("/proc") {
+        for entry in entries.flatten() {
+            if let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() {
+                set.insert(pid);
             }
         }
     }
-
-    if need_reload {
-        let new_count = proc_scan(cfg, state);
-
-        state.tracked_pids.clear();
-        state.tracked_pids.reserve(new_count);
-        state
-            .tracked_pids
-            .extend(state.cache.tasks.values().map(|t| t.pid));
-
-        state.force_affinity = true;
-    }
+    set
 }
 
-/// 扫描 task 下全部 tid 仅填充缓存，返回 true 表示至少一个 tid 插入成功
+/// 扫描 task 下 tid 仅填充缓存，返回新纳入的 tid 数
+/// 已评估过的 tid 直接跳过，避免每轮重复读取 comm 与重复规则决策
 fn proc_tasks(
     pid: i32,
     pkg: &str,
     has_thread_rules: bool,
     cfg: &AppConfig,
-    cache: &mut ProcCache,
-) -> bool {
-    let Some(tids) = task_tids(pid) else { return false };
-    let mut any_inserted = false;
+    state: &mut ProcScanState,
+) -> usize {
+    let Some(tids) = task_tids(pid) else { return 0 };
+    let mut added = 0;
     for tid in tids {
+        if state.known_tids.insert(tid, pid).is_some() {
+            continue;
+        }
         let thread_name = if has_thread_rules {
             tid_comm(tid).unwrap_or_default()
         } else {
             String::new()
         };
-
-        let inserted = cache.task_apply(tid, pid, pkg, &thread_name, cfg, |_, _, _| false);
-        any_inserted |= inserted;
+        if state
+            .cache
+            .task_apply(tid, pid, pkg, &thread_name, cfg, |_, _, _| false)
+        {
+            added += 1;
+        }
     }
-    any_inserted
+    added
 }

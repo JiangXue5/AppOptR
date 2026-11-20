@@ -304,9 +304,7 @@ fn main() {
             println!("工作模式切换: /proc 轮询");
             ebpf_state = None;
             let cache = proc_state.get_or_insert_with(ProcScanState::new);
-            cache.scan_all_proc = true;
-            cache.last_proc_count = 0;
-            cache.force_affinity = true;
+            cache.request_full_scan();
             affinity_deadline = Instant::now();
         }
 
@@ -390,10 +388,9 @@ fn main() {
         } else {
             let cache = proc_state.get_or_insert_with(ProcScanState::new);
             if config_changed {
-                cache.scan_all_proc = true;
-                cache.last_proc_count = 0;
+                cache.request_full_scan();
             }
-            cache_sync(cache, &cfg);
+            cache_sync(&cfg, cache);
             if affinity_deadline.elapsed() >= Duration::from_secs(5 * interval) || cache.force_affinity {
                 cache.cache.affinity_sync(&cfg.topo);
                 affinity_deadline = Instant::now();
@@ -406,9 +403,7 @@ fn main() {
             eprintln!("eBPF: 事件通道断开，回退到 /proc 轮询");
             ebpf_state = None;
             let cache = proc_state.get_or_insert_with(ProcScanState::new);
-            cache.scan_all_proc = true;
-            cache.last_proc_count = 0;
-            cache.force_affinity = true;
+            cache.request_full_scan();
             affinity_deadline = Instant::now();
         }
 
