@@ -270,10 +270,19 @@ fn line_remove(lines: &mut Vec<String>, pkg: &str, loc: &ThreadLoc) {
 }
 
 fn file_write(path: &str, lines: &[String]) -> RuleEdit {
+    use std::os::unix::fs::OpenOptionsExt;
+
     let mut out = lines.join("\n");
     out.push('\n');
     let tmp = format!("{}.tmp", path);
-    let res = fs::File::create(&tmp)
+    // 配置目录可能位于共享存储，临时文件用 O_NOFOLLOW 打开，
+    // 防止预先放置的同名符号链接把这次写入引到白名单之外
+    let res = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&tmp)
         .and_then(|mut f| {
             f.write_all(out.as_bytes())?;
             f.sync_all()
@@ -460,4 +469,28 @@ pub fn rule_rename(path: &str, old: &str, new: &str) -> RuleEdit {
         }
     }
     file_write(path, &lines)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tmp_symlink_does_not_redirect_write() {
+        let dir = format!("/tmp/appopt_edit_{}", std::process::id());
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let conf = format!("{}/applist.conf", dir);
+        let victim = format!("{}/victim.conf", dir);
+        fs::write(&victim, "original\n").unwrap();
+        std::os::unix::fs::symlink(&victim, format!("{}.tmp", conf)).unwrap();
+
+        // 临时文件被换成指向外部文件的符号链接时，写入必须失败且不碰目标
+        assert!(matches!(
+            rule_upsert(&conf, "com.test.app", "", "0-1"),
+            RuleEdit::IoErr
+        ));
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "original\n");
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

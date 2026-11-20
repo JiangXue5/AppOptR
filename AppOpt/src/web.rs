@@ -567,8 +567,11 @@ fn config_set_api(req: &Request) -> (u16, String) {
         FORCE_RELOAD.store(true, Ordering::Release);
     }
     if let Some(p) = path {
-        if std::fs::metadata(p).is_err() {
-            let _ = std::fs::write(p, "# 规则编写与使用说明请参考 http://AppOpt.suto.top\n\n");
+        if std::fs::metadata(p).is_err()
+            && let Err(e) = create_config_file(p)
+        {
+            eprintln!("Web: 创建配置文件 {} 失败: {}", p, e);
+            return err_json(400, "配置文件无法创建");
         }
         *lock_ignore_poison(&CONFIG_FILE) = p.to_string();
         FORCE_RELOAD.store(true, Ordering::Release);
@@ -611,9 +614,13 @@ fn valid_path(s: &str) -> bool {
     !s.is_empty() && s.len() < 256 && !s.bytes().any(|b| b < 0x20 || b == 0x7f)
 }
 
+/// 新建配置文件时写入的初始内容
+const CONFIG_HEADER: &str = "# 规则编写与使用说明请参考 http://AppOpt.suto.top\n\n";
+
 /// Web 端只能把配置文件指到固定白名单目录内，避免 root 权限下被诱导写入任意路径。
 /// 目录白名单：模块（可执行文件）目录、当前配置所在目录、/data/adb、/data/local/tmp、/sdcard。
-/// 路径先拒绝 `..` 组件，再规范化父目录后比较前缀，符号链接指向外部同样被拒绝。
+/// 路径先拒绝 `..` 组件，再规范化父目录后比较前缀；最终目标本身是符号链接时直接拒绝，
+/// 否则按路径打开会跟随链接落到白名单之外。真正的写入由 create_config_file 用 openat 兜底。
 fn path_allowed(p: &str) -> bool {
     use std::path::{Component, Path, PathBuf};
 
@@ -630,6 +637,13 @@ fn path_allowed(p: &str) -> bool {
     let Ok(dir) = fs::canonicalize(parent) else {
         return false;
     };
+    // 已存在的路径：符号链接（含指向白名单内部的）一律不接，避免被换链绕过；
+    // 普通文件再规范化一次，确认它确实落在白名单目录下
+    if let Ok(md) = fs::symlink_metadata(path)
+        && (md.file_type().is_symlink() || fs::canonicalize(path).is_err())
+    {
+        return false;
+    }
 
     let mut roots: Vec<PathBuf> = vec![
         PathBuf::from("/data/adb"),
@@ -658,6 +672,40 @@ fn path_allowed(p: &str) -> bool {
             .map(|root| dir.starts_with(&root))
             .unwrap_or(false)
     })
+}
+
+/// 在白名单目录内新建配置文件。
+/// 字符串校验与实际创建之间存在窗口，因此这里用父目录句柄 + openat 打开：
+/// O_NOFOLLOW 拒绝最终名是符号链接，O_EXCL 拒绝覆盖已存在文件，两者都不跟随链接。
+fn create_config_file(path: &str) -> std::io::Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let p = std::path::Path::new(path);
+    let name = p
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let parent = p
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let dir = fs::File::open(parent)?;
+    let cname = std::ffi::CString::new(name)
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            cname.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o644,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut f = unsafe { fs::File::from_raw_fd(fd) };
+    f.write_all(CONFIG_HEADER.as_bytes())?;
+    f.sync_all()
 }
 
 impl Settings {
@@ -787,5 +835,71 @@ mod tests {
     #[test]
     fn nonexistent_parent_is_rejected() {
         assert!(!path_allowed("/data/adb/not_exist_dir/x.conf"));
+    }
+
+    /// 测试专用文件名，带进程号避免并行用例互相删除
+    fn tmp_name(tag: &str) -> String {
+        format!(
+            "{}/appopt_test_{}_{}.conf",
+            exe_dir().display(),
+            tag,
+            std::process::id()
+        )
+    }
+
+    #[test]
+    fn target_file_symlink_is_rejected() {
+        let link = tmp_name("link_out");
+        let victim = format!("/tmp/appopt_victim_{}", std::process::id());
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_file(&victim);
+        std::fs::write(&victim, "keep").unwrap();
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        // 父目录在白名单内，但最终目标是外部文件的符号链接
+        assert!(!path_allowed(&link));
+        // 即使直接调用创建逻辑也必须拒绝，且不能动到链接指向的文件
+        assert!(create_config_file(&link).is_err());
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_file(&victim);
+    }
+
+    #[test]
+    fn dangling_symlink_is_rejected() {
+        let link = tmp_name("link_dangling");
+        let victim = format!("/tmp/appopt_missing_{}", std::process::id());
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_file(&victim);
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        assert!(!path_allowed(&link));
+        assert!(create_config_file(&link).is_err());
+        assert!(!std::path::Path::new(&victim).exists());
+        let _ = std::fs::remove_file(&link);
+    }
+
+    #[test]
+    fn parent_symlink_inside_whitelist_is_accepted() {
+        let dir = format!("{}/appopt_dir_{}", exe_dir().display(), std::process::id());
+        let link = format!("{}/appopt_dir_link_{}", exe_dir().display(), std::process::id());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&link);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        let p = format!("{}/rules.conf", link);
+        assert!(path_allowed(&p));
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn create_config_file_is_exclusive() {
+        let p = tmp_name("create");
+        let _ = std::fs::remove_file(&p);
+        create_config_file(&p).unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), CONFIG_HEADER);
+        // 已存在时不得截断
+        assert!(create_config_file(&p).is_err());
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), CONFIG_HEADER);
+        let _ = std::fs::remove_file(&p);
     }
 }
