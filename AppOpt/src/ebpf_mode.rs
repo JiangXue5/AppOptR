@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::fs;
 use std::os::unix::io::{AsRawFd, RawFd};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread;
 
@@ -27,6 +28,9 @@ pub const EBPF_EVENT_FORK: u32 = 1;
 pub const EBPF_EVENT_EXEC: u32 = 2;
 pub const EBPF_EVENT_RENAME: u32 = 3;
 pub const EBPF_EVENT_EXIT: u32 = 4;
+
+/// 运行期累计的 RingBuf 丢弃事件数，供 Web 状态展示
+pub static DROPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// 用户态注入内核的 tracepoint 字段偏移，布局需与内核态 TracepointOffsets 一致
 #[repr(C)]
@@ -463,6 +467,33 @@ fn applied_clear(bpf: &mut Ebpf) {
     }
 }
 
+/// 读取并清零内核侧丢弃计数，返回本次丢弃的事件数
+/// 旧版 AppOpt-ebpf 无此 Map，读不到时按 0 处理
+fn drop_count_take(bpf: &mut Ebpf) -> u64 {
+    let Some(map) = bpf.map_mut("DROP_COUNT") else { return 0 };
+    let Ok(mut arr) = AyaArray::<_, u64>::try_from(map) else { return 0 };
+    let dropped = arr.get(&0, 0).unwrap_or(0);
+    if dropped > 0 {
+        let _ = arr.set(0, 0, 0);
+    }
+    dropped
+}
+
+/// RingBuf 丢事件对账：低频检查内核丢弃计数，有丢失则全量重扫一次
+/// 缓存状态由 full_scan 重建，不额外引入心跳或高频 /proc 扫描
+pub fn reconcile(state: &mut EbpfState, cfg: &AppConfig) {
+    let dropped = drop_count_take(&mut state.bpf);
+    if dropped == 0 {
+        return;
+    }
+    DROPPED_TOTAL.fetch_add(dropped, Ordering::Relaxed);
+    eprintln!(
+        "eBPF: RingBuf 丢弃 {} 条事件，执行全量对账扫描",
+        dropped
+    );
+    full_scan(cfg, state);
+}
+
 /// 应用亲和性并写 APPLIED_MAP，返回 true 表示 tid 已退出
 fn affinity_apply(
     tid: i32,
@@ -497,8 +528,9 @@ pub fn event_dispatch(event: &EbpfProcEvent, cfg: &AppConfig, state: &mut EbpfSt
             }
 
         EBPF_EVENT_FORK => {
-            // 子线程继承父线程亲和性与 cpuset
-            // 内核态已插入 APPLIED_MAP 占位，RENAME 时触发完整处理
+            // 内核已不再下发 FORK 事件：子线程创建即继承父线程 affinity 与 cpuset，
+            // 用户态无需动作；APPLIED_MAP 占位由内核侧完成，EXIT 仍会上报。
+            // 此分支仅用于兼容旧版 AppOpt-ebpf 二进制，收到事件同样不做处理。
         }
 
         EBPF_EVENT_RENAME => {
@@ -554,3 +586,4 @@ pub fn full_scan(cfg: &AppConfig, state: &mut EbpfState) {
         }
     });
 }
+

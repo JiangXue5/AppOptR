@@ -10,6 +10,8 @@ use aya_ebpf::{
     programs::TracePointContext,
 };
 
+/// 事件类型与用户态 EbpfProcEvent.event_type 一致
+/// FORK 已不再下发事件（子线程继承父线程亲和性，用户态无事可做），编号保留以固定 ABI
 const EVENT_FORK: u32 = 1;
 const EVENT_EXEC: u32 = 2;
 const EVENT_RENAME: u32 = 3;
@@ -51,6 +53,10 @@ static EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 /// 用户态注入的 tracepoint 字段偏移单条 Array 索引 0
 #[map]
 static OFFSETS_MAP: Array<TracepointOffsets> = Array::with_max_entries(1, 0);
+
+/// RingBuf 满导致的事件丢弃计数，索引 0 累计、用户态读取后清零
+#[map]
+static DROP_COUNT: Array<u64> = Array::with_max_entries(1, 0);
 
 /// 读取偏移，fork_child_pid 为 0 视为未注入返回 None
 #[inline(always)]
@@ -95,6 +101,9 @@ fn submit_event(event: ProcEvent) {
     if let Some(mut entry) = EVENTS.reserve(0) {
         entry.write(event);
         entry.submit(0);
+    } else if let Some(ptr) = DROP_COUNT.get_ptr_mut(0) {
+        // RingBuf 满时只记账，不重试不阻塞；用户态低频读到计数后全量对账
+        unsafe { *ptr += 1 };
     }
 }
 
@@ -128,50 +137,48 @@ fn exec_parse() -> EventMeta {
     }
 }
 
-/// FORK 检查已管理线程的父线程，EXEC 检查自身，均以白名单兜底
-/// FORK 通过时立即占位 APPLIED_MAP[child_tid]=0，防 RENAME 竞态过滤
+/// FORK 不提交事件：子线程创建时继承父线程的 affinity 与 cpuset 归属，用户态没有可做的事。
+/// 这里只在内核侧占位 APPLIED_MAP[child_tid]=0，保留两点原有语义：
+/// 1) RENAME 时该 tid 视为已管理，不依赖新线程名命中白名单；
+/// 2) EXIT 时该 tid 能被上报，用户态缓存得以清理。
 #[inline(always)]
-fn report_named_event(ctx: &TracePointContext, event_type: u32) -> u32 {
-    let meta = if event_type == EVENT_FORK {
-        let Some(offsets) = offsets_load() else {
-            return 0;
-        };
-        fork_parse(ctx, &offsets)
-    } else {
-        exec_parse()
+fn fork_track(ctx: &TracePointContext) -> u32 {
+    let Some(offsets) = offsets_load() else {
+        return 0;
     };
-
-    let is_tracked = if event_type == EVENT_FORK {
-        applied_lookup(meta.parent_tid)
-    } else {
-        applied_lookup(meta.tid as u32)
-    };
-
+    let meta = fork_parse(ctx, &offsets);
+    let is_tracked = applied_lookup(meta.parent_tid);
     if !is_tracked && !whitelist_matched(&meta.comm) {
         return 0;
     }
+    let _ = APPLIED_MAP.insert(meta.tid as u32, 0, 0);
+    0
+}
 
-    if event_type == EVENT_FORK && is_tracked {
-        let _ = APPLIED_MAP.insert(meta.tid as u32, 0, 0);
+/// EXEC 检查自身是否已管理，否则以白名单兜底
+#[inline(always)]
+fn report_exec() -> u32 {
+    let meta = exec_parse();
+    if !applied_lookup(meta.tid as u32) && !whitelist_matched(&meta.comm) {
+        return 0;
     }
-
     submit_event(ProcEvent {
         pid: meta.pid,
         tid: meta.tid,
         comm: meta.comm,
-        event_type,
+        event_type: EVENT_EXEC,
     });
     0
 }
 
 #[tracepoint(name = "sched_process_fork", category = "sched")]
 fn sched_process_fork(ctx: TracePointContext) -> u32 {
-    report_named_event(&ctx, EVENT_FORK)
+    fork_track(&ctx)
 }
 
 #[tracepoint(name = "sched_process_exec", category = "sched")]
-fn sched_process_exec(ctx: TracePointContext) -> u32 {
-    report_named_event(&ctx, EVENT_EXEC)
+fn sched_process_exec(_ctx: TracePointContext) -> u32 {
+    report_exec()
 }
 
 /// 捕获线程改名，已管理线程直接放行否则白名单匹配

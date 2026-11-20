@@ -37,6 +37,8 @@ pub struct WebStats {
     pub threads: usize,
     pub ebpf: bool,
     pub uptime: u64,
+    /// 运行期累计的 RingBuf 丢弃事件数
+    pub dropped: u64,
 }
 
 /// 缓存统计
@@ -259,6 +261,7 @@ fn status_json() -> String {
         threads: 0,
         ebpf: false,
         uptime: 0,
+        dropped: 0,
     });
     json!({
         "version": env!("CARGO_PKG_VERSION"),
@@ -269,6 +272,7 @@ fn status_json() -> String {
         "parse_fail": PARSE_FAILS.load(Ordering::Relaxed),
         "hit_pkgs": s.hit_pkgs,
         "threads": s.threads,
+        "dropped": s.dropped,
         "total_procs": sys_procs(),
         "interval": CHECK_INTERVAL.load(Ordering::Relaxed).max(1),
         "e_core": topo.map(|t| t.e_core.to_range_string()).unwrap_or_default(),
@@ -502,6 +506,7 @@ fn suggest_threads(pkg: &str, q: &str) -> Vec<(String, usize)> {
 fn config_json() -> String {
     let stats = lock_ignore_poison(&WEB_STATS).clone();
     let cfg = current_cfg();
+    let cpuset_enabled = cfg.as_ref().is_some_and(|c| c.topo.cpuset_enabled);
     json!({
         "mode": MODE_FORCE.load(Ordering::Relaxed),
         "mode_active": if stats.is_some_and(|s| s.ebpf) { "ebpf" } else { "proc" },
@@ -509,7 +514,7 @@ fn config_json() -> String {
         "interval": CHECK_INTERVAL.load(Ordering::Relaxed).max(1),
         "cpuset_name": base_cpuset().rsplit('/').next().unwrap_or_default(),
         "config_file": lock_ignore_poison(&CONFIG_FILE).clone(),
-        "cpuset_enabled": cfg.is_some_and(|c| c.topo.cpuset_enabled),
+        "cpuset_enabled": cpuset_enabled,
     })
     .to_string()
 }
@@ -601,6 +606,7 @@ fn valid_path(s: &str) -> bool {
     !s.is_empty() && s.len() < 256 && !s.bytes().any(|b| b < 0x20 || b == 0x7f)
 }
 
+
 impl Settings {
     fn from_json(v: &Value) -> Self {
         let d = Settings::default();
@@ -682,3 +688,4 @@ pub fn settings_save() {
     }
     .save(SETTINGS_FILE);
 }
+

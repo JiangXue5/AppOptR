@@ -161,6 +161,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div class="stat"><div class="num" id="s-procs">0</div><div class="lbl">系统进程</div></div>
 <div class="stat"><div class="num" id="s-cores">0</div><div class="lbl">CPU 核心</div></div>
 </div>
+<div class="hint" id="s-drop" hidden style="color:var(--orange)"></div>
 </div>
 <div class="card" id="s-card-cores">
 <div class="card-title">核心分层</div>
@@ -350,6 +351,9 @@ async function refreshStat(){
     $('s-threads').textContent=d.threads;
     $('s-procs').textContent=d.total_procs;
     $('s-cores').textContent=d.cores;
+    const dp=+d.dropped||0;
+    $('s-drop').hidden=!dp;
+    $('s-drop').textContent=dp?('eBPF 事件累计丢弃 '+dp+' 条，已自动全量对账'):'';
     $('s-ecore').textContent=d.e_core||'无';
     $('s-pcore').textContent=d.p_core||'无';
     $('s-hcore').textContent=d.hp_core||'无';

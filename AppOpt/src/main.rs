@@ -25,7 +25,7 @@ use crate::config::{config_loader, init_inotify, load_config, CHECK_INTERVAL, CO
 use crate::cpuset::{init_cpu_topo, set_base_cpuset};
 use crate::ebpf_mode::{
     affinity_check, full_scan, event_dispatch, comm_map_init,
-    ebpf_init, EbpfState,
+    ebpf_init, reconcile, EbpfState, DROPPED_TOTAL,
 };
 use crate::proc_mode::{cache_sync, ProcScanState};
 use crate::web::{
@@ -266,6 +266,8 @@ fn main() {
     let mut affinity_deadline = Instant::now();
     let prog_start = Instant::now();
     let mut web_stats_deadline = Instant::now();
+    // 事件丢弃对账周期，只读一次内核计数器，不产生额外轮询
+    let mut reconcile_deadline = Instant::now();
     // 预支 60 秒使首次重试立即到期
     let mut ebpf_retry_at = Instant::now()
         .checked_sub(Duration::from_secs(60))
@@ -379,6 +381,12 @@ fn main() {
                 affinity_check(es, &cfg);
                 affinity_deadline = Instant::now();
             }
+
+            // RingBuf 满时事件会静默丢失，60 秒对账一次，命中丢失即全量重扫
+            if reconcile_deadline.elapsed() >= Duration::from_secs(60) {
+                reconcile_deadline = Instant::now();
+                reconcile(es, &cfg);
+            }
         } else {
             let cache = proc_state.get_or_insert_with(ProcScanState::new);
             if config_changed {
@@ -421,6 +429,7 @@ fn main() {
                 threads,
                 ebpf: ebpf_state.is_some(),
                 uptime: prog_start.elapsed().as_secs(),
+                dropped: DROPPED_TOTAL.load(Ordering::Relaxed),
             });
         }
     }
