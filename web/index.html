@@ -79,6 +79,16 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 .field input{flex:1;min-width:0}
 .field .btn{flex-shrink:0}
 .hint{font-size:12px;color:var(--sub);margin-top:8px;line-height:1.5;word-break:break-all}
+.rt-row{border-top:1px solid var(--border);padding:10px 0}
+.rt-row:first-child{border-top:none}
+.rt-top{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+.rt-pkg{font-size:13px;font-weight:500;word-break:break-all}
+.rt-n{font-size:12px;color:var(--sub);flex-shrink:0;margin-left:8px}
+.rt-ctl{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+.rt-ctl select,.rt-ctl input{background:var(--bg);border:1px solid transparent;border-radius:8px;padding:6px 8px;font-size:12px;font-family:inherit;color:var(--fg);outline:none}
+.rt-ctl input.rt-pat{flex:1;min-width:90px}
+.rt-ctl input.rt-max{width:46px;flex:none}
+.rt-ctl .btn{padding:6px 10px;font-size:12px}
 @keyframes fadeIn{from{opacity:0}to{opacity:1}}
 @keyframes popIn{from{opacity:0;transform:scale(.94) translateY(8px)}to{opacity:1;transform:none}}
 .modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.35);display:flex;align-items:center;justify-content:center;z-index:100;animation:fadeIn .12s}
@@ -205,6 +215,19 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div class="hint">可跨簇调度的规则：<span id="c-cross">-</span></div>
 <div class="hint">S7 动态分配：<span id="c-sched">-</span></div>
 <div class="hint">RT 调度：<span id="c-rt">-</span></div>
+</div>
+<div class="card">
+<div class="card-title">RT 实时调度</div>
+<div class="seg" id="seg-rt">
+<button data-rt="off">关闭</button>
+<button data-rt="global">全部应用</button>
+<button data-rt="per_app">分应用</button>
+</div>
+<div class="hint" id="c-rt-state">-</div>
+<div class="field"><input id="c-rt-max" type="number" min="1" max="8"><input id="c-rt-ts" type="number" min="1" max="100"><button class="btn" id="c-rt-save">保存</button></div>
+<div class="hint">每应用线程上限 / RR 时间片（ms）。时间片是全局内核参数，仅在至少一个应用启用时写入，全部关闭后还原</div>
+<div id="c-rt-apps"></div>
+<div class="field"><input id="c-rt-add" placeholder="应用包名"><button class="btn" id="c-rt-add-btn">＋ 应用</button></div>
 </div>
 <div class="card">
 <div class="card-title">cpuset</div>
@@ -697,6 +720,7 @@ async function loadCfg(){
       return m+' · '+d.sched_state+' · 本可迁移 '+d.sched_would+' 次 · 已迁移 '+d.sched_moved+' 次 · e/p/hp '+(load||'-');
     })();
     $('c-rt').textContent=d.rt||'off';
+    loadRt();
   }catch(e){toast(e.message)}
 }
 document.querySelectorAll('#seg-mode button').forEach(b=>b.onclick=async()=>{
@@ -710,6 +734,98 @@ async function saveField(body){
 $('c-interval-save').onclick=()=>saveField({interval:Math.max(1,+$('c-interval').value||0)});
 $('c-cpuset-save').onclick=()=>saveField({cpuset_name:$('c-cpuset').value.trim()});
 $('c-file-save').onclick=()=>saveField({config_file:$('c-file').value.trim()});
+
+let rtCache=null;
+async function loadRt(){
+  try{
+    const d=await api('/api/rt');rtCache=d;
+    document.querySelectorAll('#seg-rt button').forEach(b=>b.classList.toggle('on',b.dataset.rt===d.mode));
+    const cur=d.timeslice_current==null?'不可读':d.timeslice_current+' ms';
+    $('c-rt-state').textContent='当前 RT 线程 '+(d.threads||[]).length+' · 内核时间片 '+cur
+      +(d.timeslice_applied==null?'（未改写）':'（已改写为 '+d.timeslice_applied+' ms）');
+    $('c-rt-max').value=d.max;$('c-rt-ts').value=d.timeslice;
+    renderRtApps(d);
+  }catch(e){toast(e.message)}
+}
+
+function renderRtApps(d){
+  const box=$('c-rt-apps');box.textContent='';
+  const counts={};
+  (d.threads||[]).forEach(t=>counts[t.pkg]=(counts[t.pkg]||0)+1);
+  const list=[...new Set([...(d.apps||[]).map(a=>a.pkg),...Object.keys(counts)])].sort();
+  if(!list.length){
+    const h=document.createElement('div');h.className='hint';h.textContent='尚未配置任何应用';box.appendChild(h);return;
+  }
+  list.forEach(pkg=>{
+    const a=(d.apps||[]).find(x=>x.pkg===pkg)||{pkg,enabled:false,mode:'auto',patterns:[],max:d.max};
+    box.appendChild(rtRow(a,counts[pkg]||0));
+  });
+}
+
+function rtRow(a,n){
+  const row=document.createElement('div');row.className='rt-row';
+  const top=document.createElement('div');top.className='rt-top';
+  const nm=document.createElement('span');nm.className='rt-pkg';nm.textContent=a.pkg;
+  const cnt=document.createElement('span');cnt.className='rt-n';
+  cnt.textContent=a.enabled?'RT '+n+' 线程':'未启用';
+  top.append(nm,cnt);row.appendChild(top);
+  const ctl=document.createElement('div');ctl.className='rt-ctl';
+  const sel=document.createElement('select');
+  [['auto','自动'],['names','名字']].forEach(([v,t])=>{
+    const o=document.createElement('option');o.value=v;o.textContent=t;sel.appendChild(o);
+  });
+  sel.value=a.mode;
+  const pat=document.createElement('input');pat.className='rt-pat';
+  pat.placeholder='线程名，逗号分隔';pat.value=(a.patterns||[]).join(',');
+  pat.disabled=a.mode!=='names';
+  sel.onchange=()=>{pat.disabled=sel.value!=='names'};
+  const mx=document.createElement('input');mx.className='rt-max';
+  mx.type='number';mx.min=1;mx.max=8;mx.value=a.max;
+  const save=document.createElement('button');save.className='btn';save.textContent='保存';
+  save.onclick=async()=>{
+    try{
+      await api('/api/rt/app',{pkg:a.pkg,enabled:true,mode:sel.value,
+        patterns:pat.value.split(',').map(s=>s.trim()).filter(Boolean),max:+mx.value});
+      toast('已保存');loadRt();loadCfg();
+    }catch(e){toast(e.message)}
+  };
+  const off=document.createElement('button');off.className='btn-outline';off.textContent='关闭';
+  off.onclick=async()=>{
+    // 回传当前模式，关闭时保留配置，下次打开不必重填
+    const mode=sel.value==='names'&&!pat.value.trim()?'auto':sel.value;
+    try{
+      await api('/api/rt/app',{pkg:a.pkg,enabled:false,mode,
+        patterns:pat.value.split(',').map(s=>s.trim()).filter(Boolean),max:+mx.value});
+      toast('已关闭');loadRt();loadCfg();
+    }catch(e){toast(e.message)}
+  };
+  ctl.append(sel,pat,mx,save,off);
+  row.appendChild(ctl);
+  return row;
+}
+
+document.querySelectorAll('#seg-rt button').forEach(b=>b.onclick=async()=>{
+  try{
+    await api('/api/rt',{mode:b.dataset.rt,
+      max:+$('c-rt-max').value||undefined,timeslice:+$('c-rt-ts').value||undefined});
+    toast('已切换');loadRt();loadCfg();
+  }catch(e){toast(e.message)}
+});
+$('c-rt-save').onclick=async()=>{
+  const m=(rtCache&&rtCache.mode)||'off';
+  try{
+    await api('/api/rt',{mode:m,max:+$('c-rt-max').value,timeslice:+$('c-rt-ts').value});
+    toast('已保存');loadRt();loadCfg();
+  }catch(e){toast(e.message)}
+};
+$('c-rt-add-btn').onclick=async()=>{
+  const pkg=$('c-rt-add').value.trim();
+  if(!pkg)return;
+  try{
+    await api('/api/rt/app',{pkg,enabled:true,mode:'auto',max:+$('c-rt-max').value});
+    toast('已添加');$('c-rt-add').value='';loadRt();loadCfg();
+  }catch(e){toast(e.message)}
+};
 
 $('c-about').onclick=async()=>{
   $('page-about').classList.add('show');

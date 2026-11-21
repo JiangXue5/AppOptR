@@ -471,6 +471,119 @@ pub fn rule_rename(path: &str, old: &str, new: &str) -> RuleEdit {
     file_write(path, &lines)
 }
 
+/// 指令行的键与值：`@rt=off` 与 `@rt off` 两种写法都认
+fn directive_parts(line: &str) -> Option<(&str, &str)> {
+    let t = line.trim();
+    let rest = t.strip_prefix('@')?;
+    match rest.split_once('=') {
+        Some((k, v)) => Some((k.trim(), v.trim())),
+        None => {
+            let mut it = rest.splitn(2, char::is_whitespace);
+            Some((it.next()?.trim(), it.next().unwrap_or("").trim()))
+        }
+    }
+}
+
+/// `@rt.app=<包名> ...` 的包名
+fn rt_app_pkg(line: &str) -> Option<&str> {
+    match directive_parts(line) {
+        Some(("rt.app", v)) => v.split_whitespace().next(),
+        _ => None,
+    }
+}
+
+/// 在最后一条指令行之后插入，保持指令区聚集在文件头部
+fn insert_directive(lines: &mut Vec<String>, line: String) {
+    let pos = lines
+        .iter()
+        .rposition(|l| l.trim_start().starts_with('@'))
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    lines.insert(pos, line);
+}
+
+/// 替换或删除指定键的指令行。`value` 为 None 表示删除。
+/// 重复行只保留第一条，其余删除；返回是否命中过
+fn directive_put(lines: &mut Vec<String>, key: &str, value: Option<&str>) -> bool {
+    let mut hit = false;
+    let mut i = 0;
+    while i < lines.len() {
+        if matches!(directive_parts(&lines[i]), Some((k, _)) if k == key) {
+            match value {
+                Some(v) if !hit => {
+                    lines[i] = with_comment(&format!("@{}={}", key, v), &lines[i]);
+                    hit = true;
+                }
+                _ => {
+                    lines.remove(i);
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    if !hit && let Some(v) = value {
+        insert_directive(lines, format!("@{}={}", key, v));
+    }
+    hit
+}
+
+/// 一次性写入 RT 的全局指令。分三次写会产生三个中间状态，
+/// 配置线程可能读到只改了一半的文件
+pub fn rt_configure(path: &str, mode: &str, max: Option<u8>, timeslice: Option<u32>) -> RuleEdit {
+    let _guard = crate::lock_ignore_poison(&WRITE_LOCK);
+    let mut lines = read_lines(path);
+    directive_put(&mut lines, "rt", Some(mode));
+    if let Some(m) = max {
+        directive_put(&mut lines, "rt.max", Some(&m.to_string()));
+    }
+    if let Some(t) = timeslice {
+        directive_put(&mut lines, "rt.timeslice", Some(&t.to_string()));
+    }
+    file_write(path, &lines)
+}
+
+fn read_lines(path: &str) -> Vec<String> {
+    fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(String::from)
+        .collect()
+}
+
+/// 写或删除 `@rt.app=<包名> ...`。`spec` 为空表示删除该条目
+pub fn rt_app_set(path: &str, pkg: &str, spec: &str) -> RuleEdit {
+    let _guard = crate::lock_ignore_poison(&WRITE_LOCK);
+    let mut lines = read_lines(path);
+    let new_line = if spec.is_empty() {
+        None
+    } else {
+        Some(format!("@rt.app={} {}", pkg, spec))
+    };
+
+    let mut found = false;
+    let mut i = 0;
+    while i < lines.len() {
+        if rt_app_pkg(&lines[i]) == Some(pkg) {
+            match &new_line {
+                Some(l) if !found => {
+                    lines[i] = with_comment(l, &lines[i]);
+                    found = true;
+                }
+                _ => {
+                    lines.remove(i);
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    if !found && let Some(l) = new_line {
+        insert_directive(&mut lines, l);
+    }
+    file_write(path, &lines)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -491,6 +604,52 @@ mod tests {
             RuleEdit::IoErr
         ));
         assert_eq!(fs::read_to_string(&victim).unwrap(), "original\n");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rt_directives_write_update_and_delete() {
+        let dir = format!("/tmp/appopt_rt_edit_{}", std::process::id());
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let conf = format!("{}/applist.conf", dir);
+        fs::write(&conf, "@unmatched=keep\ncom.a=0-1\n").unwrap();
+
+        assert!(matches!(
+            rt_configure(&conf, "per_app", Some(2), Some(3)),
+            RuleEdit::Ok
+        ));
+        let s = fs::read_to_string(&conf).unwrap();
+        assert!(s.contains("@rt=per_app"));
+        assert!(s.contains("@rt.max=2"));
+        assert!(s.contains("@rt.timeslice=3"));
+        assert!(s.contains("com.a=0-1"));
+
+        // 条目追加后重复写入应就地更新，而不是堆积多行
+        assert!(matches!(rt_app_set(&conf, "com.a", "auto 2"), RuleEdit::Ok));
+        assert!(matches!(
+            rt_app_set(&conf, "com.a", "names:RenderThread 1"),
+            RuleEdit::Ok
+        ));
+        let s = fs::read_to_string(&conf).unwrap();
+        assert_eq!(s.matches("@rt.app=com.a").count(), 1);
+        assert!(s.contains("@rt.app=com.a names:RenderThread 1"));
+
+        // 模式切换时旧值被替换，全局指令不重复
+        assert!(matches!(
+            rt_configure(&conf, "global", None, None),
+            RuleEdit::Ok
+        ));
+        let s = fs::read_to_string(&conf).unwrap();
+        assert_eq!(s.matches("@rt=").count(), 1);
+        assert!(s.contains("@rt=global"));
+        assert!(s.contains("@rt.max=2"));
+
+        // 空 spec 表示删除条目
+        assert!(matches!(rt_app_set(&conf, "com.a", ""), RuleEdit::Ok));
+        let s = fs::read_to_string(&conf).unwrap();
+        assert!(!s.contains("@rt.app=com.a"));
+
         let _ = fs::remove_dir_all(&dir);
     }
 }

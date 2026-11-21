@@ -18,7 +18,11 @@ use crate::config::{
 };
 use crate::cpuset::{base_cpuset, create_cpuset_dir, parse_cpu_spec, CpuSet, CpuTopology, DEFAULT_CPUSET_NAME};
 use crate::ebpf_mode::ebpf_probe;
-use crate::rule_edit::{rule_delete, rule_delete_pkg, rule_rename, rule_upsert, RuleEdit};
+use crate::config::{RtMatch, RtScope};
+use crate::rt;
+use crate::rule_edit::{
+    rt_app_set, rt_configure, rule_delete, rule_delete_pkg, rule_rename, rule_upsert, RuleEdit,
+};
 use crate::sched::SCHED_SNAPSHOT;
 use crate::{lock_ignore_poison, EBPF_GAVE_UP, MAX_PKG_LEN, MAX_THREAD_LEN};
 
@@ -275,10 +279,13 @@ fn dispatch(out: &mut TcpStream, req: &Request) {
         ("GET", "/api/status") => (200, status_json()),
         ("GET", "/api/rules") => (200, rules_json()),
         ("GET", "/api/config") => (200, config_json()),
+        ("GET", "/api/rt") => (200, rt_json()),
         ("POST", "/api/rule") => rule_api(req),
         ("POST", "/api/rule/del") => rule_del_api(req),
         ("POST", "/api/rule/rename") => rule_rename_api(req),
         ("POST", "/api/config") => config_set_api(req),
+        ("POST", "/api/rt") => rt_api(req),
+        ("POST", "/api/rt/app") => rt_app_api(req),
         ("POST", "/api/suggest") => suggest_api(req),
         _ => err_json(404, "not found"),
     };
@@ -626,6 +633,178 @@ fn config_json() -> String {
         "sched_last": s_last,
     })
     .to_string()
+}
+
+fn rt_scope_str(s: RtScope) -> &'static str {
+    match s {
+        RtScope::Off => "off",
+        RtScope::Global => "global",
+        RtScope::PerApp => "per_app",
+    }
+}
+
+fn rt_match_parts(m: &RtMatch) -> (&'static str, Vec<String>) {
+    match m {
+        RtMatch::Auto => ("auto", Vec::new()),
+        RtMatch::Names(v) => ("names", v.clone()),
+    }
+}
+
+/// RT 配置 + 运行期状态。配置回答「谁有资格」，threads 回答「当前实际提升了谁」，
+/// 两者分开才能看出配置了但没生效的情况
+fn rt_json() -> String {
+    let cfg = current_cfg();
+    let snap = rt::snapshot();
+    let mut mode = "off";
+    let mut max = crate::config::RT_DEFAULT_MAX;
+    let mut ts = crate::config::RT_DEFAULT_TIMESLICE;
+    let mut apps: Vec<Value> = Vec::new();
+
+    if let Some(c) = &cfg {
+        mode = rt_scope_str(c.rt.scope);
+        max = c.rt.max_per_app;
+        ts = c.rt.timeslice_ms;
+        let mut pkgs: Vec<&String> = c.rt.apps.keys().collect();
+        pkgs.sort();
+        for p in pkgs {
+            let a = &c.rt.apps[p];
+            let (m, pat) = rt_match_parts(&a.mode);
+            apps.push(json!({
+                "pkg": p,
+                "enabled": a.enabled,
+                "mode": m,
+                "patterns": pat,
+                "max": a.max_threads,
+            }));
+        }
+    }
+
+    let threads: Vec<Value> = snap
+        .threads
+        .iter()
+        .map(|(pkg, tid, comm)| json!({ "pkg": pkg, "tid": tid, "comm": comm }))
+        .collect();
+
+    json!({
+        "mode": mode,
+        "max": max,
+        "timeslice": ts,
+        "timeslice_current": snap.timeslice_current,
+        "timeslice_applied": snap.timeslice_applied,
+        "gate_open": snap.enabled,
+        "demoted": snap.demoted,
+        "apps": apps,
+        "threads": threads,
+        "default_max": crate::config::RT_DEFAULT_MAX,
+        "default_timeslice": crate::config::RT_DEFAULT_TIMESLICE,
+    })
+    .to_string()
+}
+
+/// 切换全局 RT 模式，可同时改每应用上限与时间片
+fn rt_api(req: &Request) -> (u16, String) {
+    let Ok(v) = serde_json::from_slice::<Value>(&req.body) else {
+        return err_json(400, "请求体不是合法 JSON");
+    };
+    let Some(mode) = v["mode"].as_str() else {
+        return err_json(400, "缺少 mode 字段");
+    };
+    if !matches!(mode, "off" | "global" | "per_app") {
+        return err_json(400, "无效的 RT 模式");
+    }
+    let max = match v["max"].as_u64() {
+        Some(n) if (1..=8).contains(&n) => Some(n as u8),
+        Some(_) => return err_json(400, "每应用上限需在 1-8 之间"),
+        None => None,
+    };
+    let ts = match v["timeslice"].as_u64() {
+        Some(n) if (1..=100).contains(&n) => Some(n as u32),
+        Some(_) => return err_json(400, "时间片需在 1-100 ms 之间"),
+        None => None,
+    };
+
+    let file = lock_ignore_poison(&CONFIG_FILE).clone();
+    match rt_configure(&file, mode, max, ts) {
+        RuleEdit::Ok => {
+            config_reload_now();
+            (200, json!({ "ok": true }).to_string())
+        }
+        RuleEdit::Malformed => err_json(409, "配置文件存在未闭合块，请修复后重试"),
+        _ => err_json(500, "配置文件写入失败"),
+    }
+}
+
+/// 单个应用的 RT 开关与规则。关闭等同于删除该条目，保持配置文件干净
+fn rt_app_api(req: &Request) -> (u16, String) {
+    let Ok(v) = serde_json::from_slice::<Value>(&req.body) else {
+        return err_json(400, "请求体不是合法 JSON");
+    };
+    let Some(pkg) = v["pkg"].as_str().map(str::trim) else {
+        return err_json(400, "缺少 pkg 字段");
+    };
+    // 空白会破坏 `@rt.app=<包名> <模式>` 的分词
+    if !token_ok(pkg, MAX_PKG_LEN) || pkg.chars().any(char::is_whitespace) {
+        return err_json(400, "包名含有非法字符");
+    }
+
+    // 整条替换语义：未提供的字段取默认值。前端始终回传当前行，
+    // 因此「关闭」会写成 `off <原模式> <原上限>`，再打开不必重填
+    let enabled = v["enabled"].as_bool().unwrap_or(true);
+    let has_mode = v["mode"].is_string();
+    let spec = if !enabled && !has_mode {
+        "off".to_string()
+    } else {
+        let part = match v["mode"].as_str().unwrap_or("auto") {
+            "auto" => "auto".to_string(),
+            "names" => {
+                let pats: Vec<String> = v["patterns"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if pats.is_empty() {
+                    return err_json(400, "names 模式需要至少一个线程名");
+                }
+                // 逗号是条目内的分隔符，单个模式里出现会破坏语法
+                if pats.iter().any(|p| {
+                    !token_ok(p, MAX_THREAD_LEN)
+                        || p.contains(',')
+                        || p.chars().any(char::is_whitespace)
+                }) {
+                    return err_json(400, "线程名含有非法字符");
+                }
+                format!("names:{}", pats.join(","))
+            }
+            _ => return err_json(400, "无效的匹配方式"),
+        };
+        let max = match v["max"].as_u64() {
+            Some(n) if (1..=8).contains(&n) => n,
+            Some(_) => return err_json(400, "每应用上限需在 1-8 之间"),
+            None => 0,
+        };
+        let state = if enabled { "on" } else { "off" };
+        if max == 0 {
+            format!("{} {}", state, part)
+        } else {
+            format!("{} {} {}", state, part, max)
+        }
+    };
+
+    let file = lock_ignore_poison(&CONFIG_FILE).clone();
+    match rt_app_set(&file, pkg, &spec) {
+        RuleEdit::Ok => {
+            config_reload_now();
+            (200, json!({ "ok": true }).to_string())
+        }
+        RuleEdit::Malformed => err_json(409, "配置文件存在未闭合块，请修复后重试"),
+        _ => err_json(500, "配置文件写入失败"),
+    }
 }
 
 fn config_set_api(req: &Request) -> (u16, String) {
