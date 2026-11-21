@@ -1,5 +1,35 @@
 # AppOptR 变更记录
 
+## 2.3.2（2026-11-21）
+
+RT 所有权收尾：修正 TID 复用时的误降级。
+
+### 修复
+
+- `RtState::note()` 的执行顺序调整。此前顺序是「查 `cfg.rt.policy` → 无策略直接
+  `drop_threads` → 核对 `Owned.pid`」，TID 被复用后新线程所属包若没有 RT 策略，
+  会在身份核对之前被降级，等于替别的进程改调度策略。
+- 现在 `Owned.pid` 核对提到最前：pid 不符只 `own.remove`，不调用 `demote()`、
+  不调用 `sched_setscheduler(SCHED_OTHER)`；随后按新线程当前所属包的策略走——
+  有策略且符合条件正常提升，已是 RR/FIFO 走 `Foreign` 分支不接管不记录，
+  无策略直接跳过。
+- `note()` 四条退出路径（闸门关闭 / pid 不符 / 无策略 / `action` 各分支）全部核对过，
+  所有 `drop_threads` 调用点现在都在 pid 核对之后。
+
+### 测试
+
+- 新增 `rt::tests::note_drops_stale_record_before_policy_check`：真实线程 + 假 pid
+  （旧记录 pid=100，新线程 pid=200，新包无 RT 策略）。断言旧记录被清除、不残留
+  pid=100 的记录、`demoted == 0`、内核策略仍为 `SCHED_OTHER`。
+  用例不依赖 `CAP_SYS_NICE`（CFS→CFS 的 `sched_setscheduler` 无需特权），
+  且有红→绿证据：改代码前 `demoted == 1`。
+- `cargo test`：124 passed / 0 failed / 1 ignored；clippy 零告警；双架构 musl 静态构建通过。
+
+### 已知边界
+
+- 同一 pid 内 tid 被复用时，`Owned.pid` 无法区分新旧线程，仍可能按旧记录降级。
+  这是 pid 核对机制本身的天花板，需要 TID 代际或线程启动时间才能解决，未在本版处理。
+
 ## 2.3.1（2026-11-21）
 
 RT 从「设置页手填包名」改为「规则页一键开关」，参数不再暴露。
