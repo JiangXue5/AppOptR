@@ -80,17 +80,23 @@
 
 ### RT 调度
 
-- 新增配置指令 `@rt=off|auto|名字列表`，默认 `off`，与 `@sched` 独立开关、独立回滚。
-- 使用 `SCHED_RR | SCHED_RESET_ON_FORK`、优先级 1。`RESET_ON_FORK` 保证子线程不继承 RT，
-  避免每建一个线程就多一个不可抢占线程。
-- **只改 `sched_rr_timeslice_ms`（100 → 3 ms），不改 `sched_rt_runtime_us` / `sched_rt_period_us`**。
-  改 RT 预算是整机行为，音频与显示合成的 RT 线程会一起受影响，收益与代价不在本模块可控范围内。
-- 原值写入可执行文件同目录的 `.AppOpt.rt.bak`，下次启动先恢复再改写；
-  `kill -9` 或断电后不会留下永久 3 ms 的时间片。
-- 三重闸门：首次 `sched_setscheduler` 失败即全局关闭且只打一行日志；单进程最多 2 个 RT 线程；
-  已经是 RR/FIFO 的线程直接跳过并记账，避免每轮重复 `sched_getscheduler`。
-- `auto` 只提升角色为 `Critical` 且允许集合不超过 2 核的线程。规则切回 `@rt=off` 时把已提升线程
-  放回 `SCHED_OTHER` 并恢复时间片。
+- 新增三种模式 `@rt=off|global|per_app`，默认 `off`。`global` 只作用于**已管理**应用
+  （在亲和性规则中出现过的包），不是对系统全部应用提权；`per_app` 只认 `@rt.app` 里显式启用的条目。
+- 新增分应用配置 `@rt.app=<包名> [on|off] [auto|names:<列表>] [上限]`，省略的字段按 `auto`
+  与 `@rt.max` 补齐；写 `off` 时保留模式，再次打开不必重填。
+- 新增 `@rt.max`（每应用线程上限，1–8，默认 2）与 `@rt.timeslice`（RR 时间片，1–100 ms，默认 3）。
+  时间片是全局内核参数，只在至少一个应用启用时写入，全部关闭后还原，不伪装成按应用独立生效。
+- 兼容旧写法：`@rt=auto` 与 `@rt=RenderThread,RHI*` 等价于 global 模式的 auto / names。
+- **修复**：外部模块或系统设置的 RR/FIFO 线程不再进入自有集合。旧实现把它们加入 `applied`
+  以避免重复查询，代价是关闭 RT 时会把别人的实时线程降级。
+- **修复**：线程退出立即释放配额。配额改为从自有线程表派生，不再维护独立计数器，
+  杜绝「线程已退出但计数不减」；进程退出清空该 PID 的全部记录。`Owned` 持久化 TID→PID 对应关系。
+- **修复**：`global ↔ per_app`、`auto ↔ names`、应用级开关互不影响都能热切换。配置变更时遍历
+  自有线程按新规则复核，符合的保留 RT，不符合的降为 `SCHED_OTHER`，不做降级再提升的无谓往返。
+- **修复**：时间片原值只在第一次改写时备份，后续热更新与多应用启停不再覆盖它；
+  SIGTERM/SIGINT 正常退出时还原，异常退出仍靠下次启动的备份还原。
+- `SCHED_RR | SCHED_RESET_ON_FORK`、优先级 1 保持不变；只改 `sched_rr_timeslice_ms`，
+  不动 `sched_rt_runtime_us` / `sched_rt_period_us`——改 RT 预算是整机行为。
 
 ### Web
 
@@ -105,6 +111,9 @@
 - 设置页新增「S7 动态分配」与「RT 调度」两行：展示模式、当前状态、本可迁移/已迁移次数与三簇负载；
   `/api/config` 增加 `sched_mode` / `sched_state` / `sched_ticks` / `sched_would` / `sched_moved` /
   `sched_blocked` / `sched_load` / `sched_last` / `rt` 九个字段，便于写 A/B 记录脚本。
+- 设置页新增「RT 实时调度」卡片：全局模式分段选择、每应用上限与时间片、应用列表
+  （开关 / auto 或 names / 上限 / 当前 RT 线程数 / 内核时间片当前值），支持直接添加应用。
+  新增 `GET /api/rt`、`POST /api/rt`、`POST /api/rt/app`，写入落到配置文件的 `@rt*` 指令行并触发热加载。
 - 适配 KernelSU 的 WebUI 入口：页面由 `https://mui.kernelsu.org` 加载，相对路径会被解析到该域，
   前端在非 8889 端口时改用绝对地址 `http://127.0.0.1:8889`；后端补 OPTIONS 预检与
   `Access-Control-Allow-Private-Network`。来源白名单只放行该域与回环地址，其他跨站 Origin 仍返回 403，
@@ -117,4 +126,9 @@
 - S7 与 RT 同样未在真机验证。沙箱拓扑降级为单簇，端到端只覆盖了「不适用」路径与 Web 字段；
   采样、判定与迁移由单元测试用注入的簇负载覆盖，`sched_setaffinity` 与 `sched_setscheduler` 的
   实际成功率、厂商调度器是否拉回、SELinux 是否放行均需真机确认。
+- RT 的**成功路径**在沙箱内完全走不到：容器内 `/proc/sys/kernel/sched_rr_timeslice_ms` 只读、
+  `sched_setscheduler(SCHED_RR)` 返回 `EPERM`。已验证的是配置解析、状态所有权、配额释放、
+  热切换判定与 Web 读写，以及「时间片写入失败即全局关闭」这一失败路径。
+- RT 异常退出（`kill -9`、断电）只能还原时间片，被提升的线程会保持 RR 直到进程退出——
+  跨进程无法记录状态，属固有限制。
 - `-Os`→`-O2` 为 bpf-linker 0.13 的强制要求，eBPF 目标文件体积略有增加。
