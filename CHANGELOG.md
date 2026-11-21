@@ -60,6 +60,38 @@
   已缓存线程与新线程采用同一策略；普通规则修改仍按包增量。
 - 加载阶段提示同包多条包级规则（并集生效，与顺序无关），不改语义。
 
+### 动态调度（S7）
+
+- 新增配置指令 `@sched=off|shadow|on`，默认 `off`。默认配置下不读 `/proc/stat`、不产生任何系统调用，
+  行为与纯静态规则一致。
+- `shadow` 只采样与判定，把「本可迁移」计入 `sched_would` 并保留最近 8 条决策文本，不改亲和性；
+  `on` 在全部约束满足时才提交 `sched_setaffinity`。
+- 搬迁范围严格限制在规则给出的允许集合内部：目标簇与允许集合取交集，绝不扩大集合。
+  只对 `Worker` / `Background` 角色生效，`Critical` / `Latency` / 未知角色一律不动。
+- 五个防抖参数固定为常量：1 s 采样、连续 3 次确认、15 个百分点负载差、10 s 同线程冷却、
+  单轮最多 2 次迁移；单轮最多检查 64 个线程，游标轮转保证公平。
+- 簇负载取 `/proc/stat` 按核差分后的千分比；`Δtotal == 0`、计数回绕、离核一律记 -1（不可用），
+  不参与排序，不把缺失值当 0。
+- 无活跃进程（pid 的 utime+stime 未增长）时不决策：后台挂起的游戏没有迁移收益。
+- 核心层少于 2 时状态固定为「不适用」，不做采样也不做决策。
+- `@sched` 纳入 `policy_sig`：改配置会触发全量重建，`on → off` 能真正回滚已迁移线程，
+  不会停在「半 S7」状态。
+- 迁移后同步更新缓存里的 CPU 集合，否则 `affinity_sync` 会在数秒后把线程拉回规则值。
+
+### RT 调度
+
+- 新增配置指令 `@rt=off|auto|名字列表`，默认 `off`，与 `@sched` 独立开关、独立回滚。
+- 使用 `SCHED_RR | SCHED_RESET_ON_FORK`、优先级 1。`RESET_ON_FORK` 保证子线程不继承 RT，
+  避免每建一个线程就多一个不可抢占线程。
+- **只改 `sched_rr_timeslice_ms`（100 → 3 ms），不改 `sched_rt_runtime_us` / `sched_rt_period_us`**。
+  改 RT 预算是整机行为，音频与显示合成的 RT 线程会一起受影响，收益与代价不在本模块可控范围内。
+- 原值写入可执行文件同目录的 `.AppOpt.rt.bak`，下次启动先恢复再改写；
+  `kill -9` 或断电后不会留下永久 3 ms 的时间片。
+- 三重闸门：首次 `sched_setscheduler` 失败即全局关闭且只打一行日志；单进程最多 2 个 RT 线程；
+  已经是 RR/FIFO 的线程直接跳过并记账，避免每轮重复 `sched_getscheduler`。
+- `auto` 只提升角色为 `Critical` 且允许集合不超过 2 核的线程。规则切回 `@rt=off` 时把已提升线程
+  放回 `SCHED_OTHER` 并恢复时间片。
+
 ### Web
 
 - **行为变化**：`/api/config` 的 `config_file` 只允许指向模块目录、当前配置目录、`/data/adb`、
@@ -70,6 +102,9 @@
   符号链接无法再把 root 写入引到白名单外。
 - 设置页新增「可跨簇调度的规则」统计：解析期按去重后的核心层判定哪些规则的允许集合横跨多层，
   同时写一行启动日志。该数字仅用于评估动态调度的作用面，不参与任何决策。
+- 设置页新增「S7 动态分配」与「RT 调度」两行：展示模式、当前状态、本可迁移/已迁移次数与三簇负载；
+  `/api/config` 增加 `sched_mode` / `sched_state` / `sched_ticks` / `sched_would` / `sched_moved` /
+  `sched_blocked` / `sched_load` / `sched_last` / `rt` 九个字段，便于写 A/B 记录脚本。
 - 适配 KernelSU 的 WebUI 入口：页面由 `https://mui.kernelsu.org` 加载，相对路径会被解析到该域，
   前端在非 8889 端口时改用绝对地址 `http://127.0.0.1:8889`；后端补 OPTIONS 预检与
   `Access-Control-Allow-Private-Network`。来源白名单只放行该域与回环地址，其他跨站 Origin 仍返回 403，
@@ -79,4 +114,7 @@
 
 - eBPF 加载、RingBuf 压力对账、Android cgroupfs/cpuset 行为未在真机验证，仅完成编译、Map 布局校验与
   x86_64 沙箱内的 Proc 路径实测。
+- S7 与 RT 同样未在真机验证。沙箱拓扑降级为单簇，端到端只覆盖了「不适用」路径与 Web 字段；
+  采样、判定与迁移由单元测试用注入的簇负载覆盖，`sched_setaffinity` 与 `sched_setscheduler` 的
+  实际成功率、厂商调度器是否拉回、SELinux 是否放行均需真机确认。
 - `-Os`→`-O2` 为 bpf-linker 0.13 的强制要求，eBPF 目标文件体积略有增加。
