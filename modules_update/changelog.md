@@ -1,3 +1,10 @@
+### v2.3.3更新日志
+- 修正内置的 AsoulOpt 游戏表：包名由 324 补到 333，补上 PUBG、Albion Online、
+  Heaven Burns Red、Mini World、Dumb Nation 以及 Supercell 的荒野乱斗 / 部落冲突 / squad 等 9 个
+- 线程规则改为按 AsoulOpt 二进制里的 29 个分组逐组还原，每个应用只写它所在组实际列出的
+  线程名，规则数由 9870 降到 926；warframe 那条指向配置路径的无效规则已丢弃
+- 该配置仍不随安装自动启用，需在设置页把「规则配置文件」指向 applist.asoulopt.conf
+
 ### v2.3.2更新日志
 - 修复 TID 复用导致的误降级：`note()` 原先先查 RT 策略、无策略时直接降级，之后才核对记录里的 pid。
   旧线程退出、tid 被新线程复用且新线程所属包没有 RT 策略时，新线程会被当成旧记录降级。

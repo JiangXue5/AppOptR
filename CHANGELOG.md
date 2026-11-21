@@ -1,5 +1,39 @@
 # AppOptR 变更记录
 
+## 2.3.3（2026-11-21）
+
+修正 AsoulOpt 内置表的迁移结果。
+
+### 包名
+
+- 旧清单 324 条漏了 9 个真实条目：`ahf.dummynation`、`com.albiononline`、
+  `com.heavenburnsred`、`com.pubg`、`minitech.miniworld`、`Nekootan.kfkj`、
+  `supercell.brawlstars`、`supercell.clashofclans`、`supercell.squad`。
+- 其中 4 个曾被误判为「死字符串」的（`com.netease.wotb`、`net.wargaming.wot.blitz`、
+  `com.supercell.clashroyale`、`com.tencent.tmgp.supercell.clash`）实际在栈上临时
+  数组里被引用，属真实成员，予以保留。
+- 现在 333 个包位：数据区指针 316 + 栈表 4 + 代码内联 13，与「全部形似包名的
+  字符串 337 个减 4 个非包名」互相验证。
+
+### 规则
+
+- `--full` 不再对所有应用套同一份 30 条名单，改为按二进制里的 29 个分组逐组还原。
+  每个应用只写它所在组实际列出的线程名（1–4 条），规则数 9870 → 926。
+- 组内 `count=0` 的条目视为「不处理」，跳过。
+- `com.digitalextremes.warframemobile` 那组第 2 条指向 `/data/adb/naki/asopt.conf`
+  自身路径，不可能是线程名，按无效项丢弃。
+
+### 已知差异
+
+- 线程名集合与分组逐字节还原；分配策略仍是静态近似——AsoulOpt 按 schedstat
+  挑最闲线程上大核，AppOpt 只做固定簇映射。
+
+### 验证
+
+- `cargo test`：124 passed / 0 failed / 1 ignored。
+- 配置实测加载 926 条规则，333 个规则块与清单完全对应。
+- `--full` 在缺少分组数据时退回旧清单路径，输出仍为 333 个应用。
+
 ## 2.3.2（2026-11-21）
 
 RT 所有权收尾：修正 TID 复用时的误降级。
