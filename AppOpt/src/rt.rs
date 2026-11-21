@@ -17,7 +17,7 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 
-use crate::cache::ProcCache;
+use crate::cache::{ProcCache, TaskEntry};
 use crate::config::{AppConfig, RtMatch};
 use crate::cpuset::CpuSet;
 use crate::roles::role_of;
@@ -36,7 +36,8 @@ struct Owned {
 }
 
 pub struct RtState {
-    /// 全局闸门，任何一次失败都会永久置 false，直到重载配置
+    /// 全局闸门。权限类失败会触发熔断并清理残留，本次进程内不再尝试：
+    /// 配置重载也不会自动重置，避免每次热更新都重试一遍必然失败的调用
     enabled: bool,
     /// tid -> 归属信息。配额直接从这张表统计，避免计数器与集合不同步
     own: HashMap<i32, Owned>,
@@ -142,6 +143,11 @@ impl RtState {
         // 1) 记录里的线程是否还在按 RT 运行（退出后 tid 复用 / 外部改回 CFS）
         // 2) 还没接管的线程是否已被系统或其他模块设成 RR/FIFO
         let realtime = is_realtime(tid);
+        // pid 对不上说明 tid 已被别的进程复用：旧记录与新线程无关，
+        // 直接丢弃。否则新线程会被当成「已提升」，关 RT 时被误降级
+        if self.own.get(&tid).is_some_and(|a| a.pid != pid) {
+            self.own.remove(&tid);
+        }
         let mut owned = self.own.contains_key(&tid);
         if owned && !realtime {
             // 记录已经失效。直接丢弃，避免把复用了该 tid 的新线程当成自己提升过的
@@ -192,22 +198,19 @@ impl RtState {
         if self.own.is_empty() {
             return;
         }
-        let drop: Vec<i32> = self
-            .own
-            .iter()
-            .filter(|(tid, a)| match cache.tasks.get(tid) {
-                Some(e) => {
-                    e.pkg != a.pkg
-                        || !cfg
-                            .rt
-                            .policy(&e.pkg)
-                            .is_some_and(|(mode, _)| eligible(mode, &e.comm, &e.cpus))
-                }
-                None => true,
-            })
-            .map(|(&tid, _)| tid)
-            .collect();
-        let n = self.drop_threads(&drop);
+        let mut demote: Vec<i32> = Vec::new();
+        let mut forget: Vec<i32> = Vec::new();
+        for (&tid, a) in &self.own {
+            match plan(cfg, a, cache.tasks.get(&tid)) {
+                Plan::Keep => {}
+                Plan::Demote => demote.push(tid),
+                Plan::Forget => forget.push(tid),
+            }
+        }
+        for tid in forget {
+            self.own.remove(&tid);
+        }
+        let n = self.drop_threads(&demote);
         if n > 0 {
             println!("RT: 全量重扫后回滚 {} 个不再符合条件的线程", n);
         }
@@ -227,6 +230,16 @@ impl RtState {
 
     /// 进程正常退出：线程降级并把时间片写回原值
     pub fn shutdown(&mut self) {
+        self.demote_all();
+        self.restore_timeslice();
+    }
+
+    /// 环境不再支持 RT 时的统一退出路径：先把自己提升的线程放回 CFS，
+    /// 再按所有权检查恢复时间片，最后关闸门。只关闸门不清理会留下
+    /// 「功能已停用、线程还是 RR、整机时间片还是 3 ms」的残留
+    fn fuse(&mut self, why: &str) {
+        eprintln!("RT: {}，RT 已全局关闭", why);
+        self.enabled = false;
         self.demote_all();
         self.restore_timeslice();
     }
@@ -257,17 +270,20 @@ impl RtState {
             unsafe { libc::sched_setscheduler(tid, libc::SCHED_RR | SCHED_RESET_ON_FORK, &param) };
         if ret != 0 {
             let e = io::Error::last_os_error();
-            // 线程在取到 tid 之后、调用之前退出：正常的竞态，不是环境不支持，
-            // 不能因此关闭全局闸门（否则 RT 会莫名其妙整体失效）
-            if e.raw_os_error() == Some(libc::ESRCH) {
-                return false;
+            match e.raw_os_error() {
+                // 线程在取到 tid 之后、调用之前退出：正常的竞态，不是环境不支持，
+                // 只跳过这一个线程（否则 RT 会莫名其妙整体失效）
+                Some(libc::ESRCH) => {}
+                // 权限 / 安全策略拒绝：本进程后面每一次都会失败，熔断并清理
+                Some(libc::EPERM) | Some(libc::EACCES) => {
+                    self.fuse(&format!("sched_setscheduler({}) 被拒绝（{}）", tid, e));
+                }
+                // 其余（EINVAL 等）多半是单个线程的参数或状态问题，
+                // 不能据此认定整个环境不可用：记录 errno，跳过该线程
+                _ => {
+                    eprintln!("RT: sched_setscheduler({}) 失败（{}），跳过该线程", tid, e);
+                }
             }
-            // EPERM / SELinux 拒绝：继续尝试只会每次热更新刷日志，直接全局关闭
-            self.enabled = false;
-            eprintln!(
-                "RT: sched_setscheduler({}) 失败（{}），RT 已全局关闭",
-                tid, e
-            );
             return false;
         }
         self.own.insert(
@@ -303,8 +319,7 @@ impl RtState {
             }
             // 原值只在第一次保存，这里只改当前值；失败则放弃后续尝试
             if fs::write(RR_TIMESLICE_PATH, format!("{}\n", ms)).is_err() {
-                self.enabled = false;
-                eprintln!("RT: 写入 {} 失败，RT 已全局关闭", RR_TIMESLICE_PATH);
+                self.fuse(&format!("写入 {} 失败", RR_TIMESLICE_PATH));
                 return;
             }
             self.applied_ms = Some(ms);
@@ -316,29 +331,25 @@ impl RtState {
             return;
         }
         let Some(path) = backup_path() else {
-            self.enabled = false;
-            eprintln!("RT: 无法定位可执行文件目录，跳过 RT（时间片无法保证恢复）");
+            self.fuse("无法定位可执行文件目录，时间片无法保证恢复");
             return;
         };
         let Ok(old) = fs::read_to_string(RR_TIMESLICE_PATH) else {
-            self.enabled = false;
-            eprintln!("RT: 读取 {} 失败，RT 关闭", RR_TIMESLICE_PATH);
+            self.fuse(&format!("读取 {} 失败", RR_TIMESLICE_PATH));
             return;
         };
         let old = old.trim().to_string();
         // 先落盘再改：顺序反了会留下一个「内核已改、备份没写」的窗口
         if fs::write(&path, format!("{}\n", old)).is_err() {
-            self.enabled = false;
-            eprintln!(
-                "RT: 无法写入备份 {}，RT 关闭（避免卸载后时间片残留）",
+            self.fuse(&format!(
+                "无法写入备份 {}，避免卸载后时间片残留",
                 path.display()
-            );
+            ));
             return;
         }
         if fs::write(RR_TIMESLICE_PATH, format!("{}\n", ms)).is_err() {
             let _ = fs::remove_file(&path);
-            self.enabled = false;
-            eprintln!("RT: 写入 {} 失败，RT 关闭", RR_TIMESLICE_PATH);
+            self.fuse(&format!("写入 {} 失败", RR_TIMESLICE_PATH));
             return;
         }
         self.pending_restore = Some(old.clone());
@@ -415,6 +426,33 @@ fn eligible(mode: &RtMatch, comm: &str, allowed: &CpuSet) -> bool {
     match mode {
         RtMatch::Auto => allowed.count() <= 2 && role_of(comm).rt_candidate(),
         RtMatch::Names(patterns) => patterns.iter().any(|p| fnmatch(p, comm)),
+    }
+}
+
+/// 对账时一条自有记录的三种去向
+enum Plan {
+    Keep,
+    /// 还是我们设的 RT，但已不符合策略：放回 CFS
+    Demote,
+    /// 记录对应的线程已经不在了（tid 被别的进程复用）：只丢记录，不碰现承租人
+    Forget,
+}
+
+/// `None` 说明缓存里没有这个 tid：多数是线程已退出（`demote` 拿到 ESRCH 无害），
+/// 也可能是包被移出配置导致不再进缓存，这种情况必须真的撤销，所以按撤销处理。
+/// 只有 pid 对不上时才走 `Forget`——那是别人的线程，不能对它调 `sched_setscheduler`
+fn plan(cfg: &AppConfig, a: &Owned, entry: Option<&TaskEntry>) -> Plan {
+    match entry {
+        Some(e) if e.pid != a.pid => Plan::Forget,
+        Some(e) => {
+            let ok = e.pkg == a.pkg
+                && cfg
+                    .rt
+                    .policy(&e.pkg)
+                    .is_some_and(|(mode, _)| eligible(mode, &e.comm, &e.cpus));
+            if ok { Plan::Keep } else { Plan::Demote }
+        }
+        None => Plan::Demote,
     }
 }
 
@@ -801,8 +839,9 @@ mod tests {
         assert!(s.count(100) < 2);
     }
 
+    /// 上限下调：真实走一遍 prune，验证最终所有权表
     #[test]
-    fn prune_respects_lowered_quota() {
+    fn prune_enforces_lowered_quota() {
         let mut rt = RtConfig {
             scope: RtScope::Global,
             ..RtConfig::default()
@@ -811,16 +850,34 @@ mod tests {
         let cfg = cfg_of(rt, &["com.a"]);
         let mut s = state();
         adopt(&mut s, 10, 100, "com.a", "RenderThread", cpus(2));
-        adopt(&mut s, 11, 100, "com.a", "GLThread", cpus(2));
-        let Some((_, max)) = cfg.rt.policy("com.a") else {
-            panic!("global 模式应给出策略");
-        };
-        assert_eq!(max, 1);
-        // prune 内部按 tid 升序保留前 max 个
-        let mut tids = vec![10, 11];
-        tids.sort_unstable();
-        assert_eq!(tids.split_off(1), vec![11]);
-        assert_eq!(s.count(100), 2);
+        adopt(&mut s, 11, 100, "com.a", "RHIThread", cpus(2));
+        adopt(&mut s, 12, 200, "com.a", "RenderThread", cpus(2));
+
+        s.prune(&cfg);
+        // 每个 pid 各留 1 个，pid 100 按 tid 升序保留 10
+        assert_eq!(s.count(100), 1);
+        assert!(s.own.contains_key(&10));
+        assert!(!s.own.contains_key(&11));
+        // 另一个 pid 的线程不受影响
+        assert!(s.own.contains_key(&12));
+        assert_eq!(s.count(200), 1);
+    }
+
+    /// 配额没变时 prune 不能顺手降级
+    #[test]
+    fn prune_keeps_compliant_threads() {
+        let cfg = cfg_of(
+            RtConfig {
+                scope: RtScope::Global,
+                ..RtConfig::default()
+            },
+            &["com.a"],
+        );
+        let mut s = state();
+        adopt(&mut s, 10, 100, "com.a", "RenderThread", cpus(2));
+        s.prune(&cfg);
+        assert!(s.own.contains_key(&10));
+        assert_eq!(s.count(100), 1);
     }
 
     #[test]
@@ -932,7 +989,7 @@ mod tests {
         assert!(s.own.is_empty());
     }
 
-    /// 线程退出后 tid 被复用：新线程继承的是 CFS，不能被当成自己提升过的
+    /// tid 被别的进程复用：记录作废，新线程不继承旧所有权
     #[test]
     fn reused_tid_does_not_inherit_ownership() {
         let cfg = cfg_of(
@@ -943,12 +1000,51 @@ mod tests {
             &["com.a"],
         );
         let mut s = state();
-        // 旧记录存在，但 GHOST2 在内核里不是 RR（不存在或已复用为普通线程）
         adopt(&mut s, GHOST2, 100, "com.a", "RenderThread", cpus(2));
-        let ok = s.note(GHOST2, 100, "com.a", "RenderThread", &cpus(2), &cfg);
-        // 记录作废后按新线程走一遍提升流程，失败（线程不存在）不改写状态
+        // 同一个 tid，现在属于 pid 200
+        let ok = s.note(GHOST2, 200, "com.a", "RenderThread", &cpus(2), &cfg);
+        // 记录作废后按新线程走提升流程，线程不存在时失败，且不留下旧记录
         assert!(!ok);
-        assert!(s.own.is_empty(), "失效记录必须先丢弃，不能继续算作已提升");
+        assert!(s.own.is_empty(), "旧 tid 的所有权不能交给新线程");
+    }
+
+    /// 对账时 pid 对不上：走 Forget，不对现承租人调 sched_setscheduler
+    #[test]
+    fn reconcile_forgets_reused_tid() {
+        let cfg = cfg_of(
+            RtConfig {
+                scope: RtScope::Global,
+                ..RtConfig::default()
+            },
+            &["com.a"],
+        );
+        let mut s = state();
+        adopt(&mut s, 10, 100, "com.a", "RenderThread", cpus(2));
+        let mut cache = ProcCache::new();
+        // 同一个 tid 现在属于 pid 200，包与线程名仍然符合规则
+        cache
+            .tasks
+            .insert(10, entry(200, "com.a", "RenderThread", 2));
+
+        let p = plan(&cfg, s.own.get(&10).unwrap(), cache.tasks.get(&10));
+        assert!(matches!(p, Plan::Forget));
+
+        s.reconcile(&cfg, &cache);
+        assert!(s.own.is_empty());
+    }
+
+    /// 缓存缺失仍按撤销处理：包被移出配置时必须真的降级
+    #[test]
+    fn reconcile_demotes_when_entry_missing() {
+        let cfg = cfg_of(RtConfig::default(), &[]);
+        let mut s = state();
+        adopt(&mut s, 10, 100, "com.a", "RenderThread", cpus(2));
+        let p = plan(
+            &cfg,
+            s.own.get(&10).unwrap(),
+            Some(&entry(100, "com.a", "RenderThread", 2)),
+        );
+        assert!(matches!(p, Plan::Demote));
     }
 
     /// 起一个真实线程并命名。RT 的成败取决于进程权限，用例按实际结果分支断言，
@@ -1000,6 +1096,31 @@ mod tests {
 
         handle.thread().unpark();
         handle.join().unwrap();
+    }
+
+    /// EPERM / EACCES 触发熔断时，自有记录必须一起清掉；
+    /// 其他 errno 只跳过当前线程。两种环境的断言都成立
+    #[test]
+    fn promotion_failure_clears_or_keeps_by_errno() {
+        let tid = unsafe { libc::syscall(libc::SYS_gettid) as i32 };
+        let mut s = state();
+        // 熔断前已经提升过一个线程：熔断必须把它放回 CFS。用不存在的 tid，
+        // 避免测试真去改沙箱里 pid 1 的调度策略
+        adopt(&mut s, GHOST, 100, "com.a", "RenderThread", cpus(2));
+
+        let ok = s.apply(tid, 200, "com.a", "RenderThread", &cpus(2));
+        if ok {
+            // 有 CAP_SYS_NICE 的环境：用例不适用，把自己改回去
+            s.demote_all();
+            return;
+        }
+        if s.enabled {
+            // 非权限类错误：只跳过该线程，不动已有所有权
+            assert!(s.own.contains_key(&GHOST));
+        } else {
+            // 熔断：闸门关闭且残留清零
+            assert!(s.own.is_empty(), "熔断必须回滚已提升的线程");
+        }
     }
 
     /// 只有内核值仍是自己写的才恢复，外部改过就保留现值

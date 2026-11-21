@@ -128,6 +128,15 @@
 - **整理**：资格判定收敛为单个 `eligible(mode, comm, allowed)`。`note` 之前直接用
   `matches()`，与 `prune` / `reconcile` 走的 `eligible()` 是两条路径，文档却写着
   「共用」。现在三处都取一次 `cfg.rt.policy(pkg)` 再调同一个函数。
+- **修复**：tid 被别的进程复用时，所有权记录不会交接给新线程。`note` 发现记录里的
+  pid 与当前 pid 不一致就丢弃；`reconcile` 把这类记录归为「只丢记录、不降级」
+  （`Plan::Forget`），不会对现承租人调 `sched_setscheduler` 把别人的 RR 线程降掉。
+- **修复**：熔断时清理残留。旧实现只在 `apply()` 里置 `enabled = false`，已提升的
+  线程还是 RR、整机时间片还是配置值，后续 `prepare()` 又因为 `enabled` 为 false
+  直接返回。现在统一走 `fuse()`：先降级自有线程、再按所有权检查恢复时间片、最后
+  关闸门；时间片写入/备份失败同样走这条路。
+- **修复**：`sched_setscheduler` 的错误分类。ESRCH 只跳过该线程；EPERM / EACCES
+  触发熔断；其余 errno 记录后跳过当前线程，不再不加区分地永久关闭整个 RT。
 - `SCHED_RR | SCHED_RESET_ON_FORK`、优先级 1 保持不变；只改 `sched_rr_timeslice_ms`，
   不动 `sched_rt_runtime_us` / `sched_rt_period_us`——改 RT 预算是整机行为。
 
