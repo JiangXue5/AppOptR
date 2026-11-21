@@ -1,0 +1,877 @@
+//! S7 负载感知分配：采样、判定与受限让位。
+//!
+//! 设计见 `docs/S7_负载感知调度策略设计.md`。三档模式：
+//!
+//! - `off`（默认）：`tick` 立即返回，不读 `/proc/stat`、不产生系统调用。
+//! - `shadow`：照常采样与判定，只把「本可迁移」记进计数与环形缓冲，不改亲和性。
+//! - `on`：全部约束满足时才返回一次 `Move`，由调用方提交 `sched_setaffinity`。
+//!
+//! 边界：只在规则给出的允许集合**内部**换簇，不扩大集合；只动 `Worker` / `Background`；
+//! 不写 cpuset 目录；采样依附主循环，不新增线程。
+
+use std::collections::{HashMap, VecDeque};
+use std::fs;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+use crate::cache::ProcCache;
+use crate::config::{AppConfig, SchedMode};
+use crate::cpuset::{CpuSet, CpuTopology};
+use crate::lock_ignore_poison;
+use crate::roles::role_of;
+use crate::rule_match::thread_affinity;
+
+/// 采样周期。与 eBPF 主循环的 `recv_timeout(1s)` 同源
+const SAMPLE_PERIOD: Duration = Duration::from_secs(1);
+/// 同一方向连续确认次数，抑制单次采样抖动
+const CONFIRM_TICKS: u8 = 3;
+/// 线程进入候选池后的最小观察时间
+const MIN_DWELL: Duration = Duration::from_secs(2);
+/// 同一线程两次迁移之间的冷却
+const COOLDOWN: Duration = Duration::from_secs(10);
+/// 目标簇相对基准的负载差门槛，千分比（15 个百分点）
+const LOAD_GAP: i32 = 150;
+/// 单轮迁移上限，限制突发影响
+const MAX_MOVES: usize = 2;
+/// 单轮最多检查的线程数，超出部分由游标轮转覆盖
+const MAX_PROBE: usize = 64;
+/// 活跃判定最多读取的进程数，避免一次 tick 打爆 /proc
+const MAX_ACTIVE_PIDS: usize = 8;
+/// 决策环形缓冲保留条数
+const RING_CAP: usize = 8;
+/// 目标集合最小核数。1 核簇（常见于单超大核机型）也允许进入：
+/// 迁入后该簇负载上升，后续线程自然被 LOAD_GAP 拦住，无需额外配额
+const MIN_TARGET_CORES: usize = 1;
+
+const CLUSTER_NAME: [&str; 3] = ["e-core", "p-core", "hp-core"];
+
+/// 单核累计时间，单位 jiffies
+#[derive(Clone, Copy, Default)]
+struct CpuStat {
+    busy: u64,
+    total: u64,
+}
+
+#[derive(Clone, Copy, Default)]
+struct ClusterTimes {
+    busy: u64,
+    total: u64,
+}
+
+/// 线程的 S7 视角状态
+struct ThreadState {
+    /// 上次判定的落点，`None` 表示从未迁移
+    cur: Option<u8>,
+    /// 是否由 `on` 模式真正写入过亲和性。只有真写过才允许判定「被规则重扫拉回」
+    own: bool,
+    /// 上次写入的集合，用于识别外部改写
+    applied: CpuSet,
+    /// 连续同向确认次数
+    streak: u8,
+    last_move: Option<Instant>,
+    /// 最小驻留起点
+    first_seen: Instant,
+}
+
+impl ThreadState {
+    fn new(now: Instant) -> Self {
+        Self {
+            cur: None,
+            own: false,
+            applied: CpuSet::new(),
+            streak: 0,
+            last_move: None,
+            first_seen: now,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.cur = None;
+        self.own = false;
+        self.applied = CpuSet::new();
+        self.streak = 0;
+        self.last_move = None;
+    }
+}
+
+/// 待提交的迁移。`tick` 只产出不执行，避免与缓存借用纠缠。
+#[derive(Clone)]
+pub struct Move {
+    pub tid: i32,
+    pub cpus: CpuSet,
+}
+
+/// 供 Web 与日志读取的只读快照
+#[derive(Clone, Default)]
+pub struct SchedSnapshot {
+    /// 0=off 1=shadow 2=on
+    pub mode: u8,
+    pub state: &'static str,
+    pub ticks: u64,
+    /// shadow 下「本可迁移」累计次数
+    pub would: u64,
+    /// on 下实际提交次数
+    pub moved: u64,
+    /// 因角色、目标簇核数等约束被拒的线程次
+    pub blocked: u64,
+    /// 三簇负载千分比，-1 为不可用
+    pub load: [i32; 3],
+    pub last: String,
+}
+
+/// 全局快照，由主循环低频更新，Web 侧直接读
+pub static SCHED_SNAPSHOT: Mutex<Option<SchedSnapshot>> = Mutex::new(None);
+
+pub struct SchedState {
+    mode: SchedMode,
+    ticks: u64,
+    would: u64,
+    moved: u64,
+    blocked: u64,
+    threads: HashMap<i32, ThreadState>,
+    /// 上一轮每簇累计时间，用于差分
+    prev: Option<[ClusterTimes; 3]>,
+    /// 上一轮簇负载
+    load: [i32; 3],
+    /// pid -> utime+stime，用于活跃判定
+    active: HashMap<i32, u64>,
+    ring: VecDeque<String>,
+    /// 轮转游标，保证线程数超过 MAX_PROBE 时仍能全覆盖
+    cursor: usize,
+    state: &'static str,
+}
+
+impl Default for SchedState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SchedState {
+    pub fn new() -> Self {
+        Self {
+            mode: SchedMode::Off,
+            ticks: 0,
+            would: 0,
+            moved: 0,
+            blocked: 0,
+            threads: HashMap::new(),
+            prev: None,
+            load: [-1; 3],
+            active: HashMap::new(),
+            ring: VecDeque::new(),
+            cursor: 0,
+            state: "off",
+        }
+    }
+
+    /// 模式切换时清空状态：`on -> off` 必须让已迁移线程重新按规则落地，
+    /// 否则线程停在上次的落点，回滚不彻底
+    pub fn set_mode(&mut self, mode: SchedMode) {
+        if self.mode == mode {
+            return;
+        }
+        self.mode = mode;
+        self.threads.clear();
+        self.prev = None;
+        self.load = [-1; 3];
+        self.active.clear();
+        self.state = match mode {
+            SchedMode::Off => "off",
+            _ => "采样预热",
+        };
+    }
+
+    /// 主循环每轮调用。off 模式零开销直接返回。
+    pub fn tick(&mut self, cfg: &AppConfig, cache: &ProcCache) -> Vec<Move> {
+        if self.mode == SchedMode::Off {
+            self.state = "off";
+            return Vec::new();
+        }
+        // 单簇或降级拓扑下没有换簇的余地，明确「不适用」而不是假装工作
+        if cfg.sched_scope.levels < 2 {
+            self.state = "不适用";
+            return Vec::new();
+        }
+        if cache.tasks.is_empty() {
+            self.state = "等待被管理进程";
+            self.prev = None;
+            return Vec::new();
+        }
+
+        let Some(cur) = read_cluster_times(&cfg.topo) else {
+            self.state = "采样预热";
+            return Vec::new();
+        };
+        let Some(prev) = self.prev.replace(cur) else {
+            self.state = "采样预热";
+            return Vec::new();
+        };
+
+        let load = diff_load(&prev, &cur);
+        if !self.any_active(cache) {
+            self.state = "无活跃进程";
+            self.load = load;
+            return Vec::new();
+        }
+        self.state = "运行中";
+        self.tick_at(cfg, cache, load, Instant::now())
+    }
+
+    /// 用给定负载推进一轮判定。测试直接调用，生产由 `tick` 采样后转发。
+    pub fn tick_at(
+        &mut self,
+        cfg: &AppConfig,
+        cache: &ProcCache,
+        load: [i32; 3],
+        now: Instant,
+    ) -> Vec<Move> {
+        self.ticks += 1;
+        self.load = load;
+        self.decide(cfg, cache, load, now)
+    }
+
+    pub fn forget(&mut self, tid: i32) {
+        self.threads.remove(&tid);
+    }
+
+    pub fn snapshot(&self) -> SchedSnapshot {
+        SchedSnapshot {
+            mode: self.mode as u8,
+            state: self.state,
+            ticks: self.ticks,
+            would: self.would,
+            moved: self.moved,
+            blocked: self.blocked,
+            load: self.load,
+            last: self.ring.back().cloned().unwrap_or_default(),
+        }
+    }
+
+    pub fn publish(&self) {
+        *lock_ignore_poison(&SCHED_SNAPSHOT) = Some(self.snapshot());
+    }
+
+    fn decide(
+        &mut self,
+        cfg: &AppConfig,
+        cache: &ProcCache,
+        load: [i32; 3],
+        now: Instant,
+    ) -> Vec<Move> {
+        let mut tids: Vec<i32> = cache.tasks.keys().copied().collect();
+        if tids.is_empty() {
+            return Vec::new();
+        }
+        // HashMap 顺序不稳定，排序后游标才能保证公平轮转
+        tids.sort_unstable();
+        let total = tids.len();
+        let start = self.cursor % total;
+        self.cursor = (start + MAX_PROBE) % total;
+
+        let mut out = Vec::new();
+        for k in 0..total.min(MAX_PROBE) {
+            if out.len() >= MAX_MOVES {
+                break;
+            }
+            let tid = tids[(start + k) % total];
+            let Some(entry) = cache.tasks.get(&tid) else {
+                continue;
+            };
+
+            // 允许集合必须按规则重算：entry.cpus 已被上次迁移改写成目标簇，
+            // 用它算「与几个簇相交」只会得到 1，线程被误判成非跨簇
+            let name = if cfg.has_thread_rules.contains(&entry.pkg) {
+                entry.comm.as_str()
+            } else {
+                ""
+            };
+            let Some(home) = thread_affinity(&entry.pkg, name, cfg) else {
+                continue;
+            };
+            let allow = cluster_mask(&home.cpus, &cfg.topo);
+            if allow.iter().filter(|x| **x).count() < 2 {
+                continue;
+            }
+
+            let role = role_of(&entry.comm);
+            if !role.movable() {
+                self.blocked += 1;
+                continue;
+            }
+
+            let st = self
+                .threads
+                .entry(tid)
+                .or_insert_with(|| ThreadState::new(now));
+            // 只有真写过才能用「缓存里的集合与上次写入不一致」判定被规则重扫拉回
+            if st.own && entry.cpus != st.applied {
+                st.reset();
+            }
+
+            let base = if st.own {
+                st.cur.map(|c| load[c as usize]).unwrap_or(-1)
+            } else {
+                weighted_avg(&load, &allow, &cfg.topo)
+            };
+            if base < 0 {
+                continue;
+            }
+
+            let Some(target) = pick_target(&load, &allow, st.cur) else {
+                continue;
+            };
+            if Some(target) == st.cur {
+                st.streak = 0;
+                continue;
+            }
+            if base - load[target as usize] < LOAD_GAP {
+                st.streak = 0;
+                continue;
+            }
+            if !target_ok(target, &load, &allow, &home.cpus, &cfg.topo) {
+                self.blocked += 1;
+                continue;
+            }
+            if st.first_seen.elapsed() < MIN_DWELL {
+                continue;
+            }
+            if st
+                .last_move
+                .is_some_and(|t| now.duration_since(t) < COOLDOWN)
+            {
+                continue;
+            }
+
+            st.streak = st.streak.saturating_add(1);
+            if st.streak < CONFIRM_TICKS {
+                continue;
+            }
+            st.streak = 0;
+
+            let Some(cpus) = target_cpus(target, &home.cpus, &cfg.topo) else {
+                continue;
+            };
+
+            let prev = st.cur;
+            st.cur = Some(target);
+            st.last_move = Some(now);
+            if self.mode == SchedMode::On {
+                st.own = true;
+                st.applied = cpus;
+                self.moved += 1;
+            } else {
+                self.would += 1;
+            }
+
+            let line = format!(
+                "S7: {}({}) {} → {}（负载 {}‰ → {}‰）",
+                entry.comm,
+                tid,
+                prev.map(cluster_label).unwrap_or("允许集合"),
+                CLUSTER_NAME[target as usize],
+                prev.map(|c| load[c as usize]).unwrap_or(base),
+                load[target as usize]
+            );
+            // 同一线程受 10s 冷却限制，不会刷屏；shadow 只计数不打日志
+            if self.mode == SchedMode::On {
+                println!("{}", line);
+            }
+            if self.ring.len() >= RING_CAP {
+                self.ring.pop_front();
+            }
+            self.ring.push_back(line);
+
+            out.push(Move { tid, cpus });
+        }
+
+        // 缓存里已消失的线程不再保留状态
+        if self.threads.len() > cache.tasks.len() + 64 {
+            self.threads.retain(|tid, _| cache.tasks.contains_key(tid));
+        }
+        out
+    }
+
+    /// 有 pid 的 utime+stime 增长才算活跃。无活跃进程时不做决策：
+    /// 后台挂着不动的游戏没有迁移收益，只会白白产生系统调用
+    fn any_active(&mut self, cache: &ProcCache) -> bool {
+        let mut pids: Vec<i32> = cache.tasks.values().map(|e| e.pid).collect();
+        pids.sort_unstable();
+        pids.dedup();
+        pids.truncate(MAX_ACTIVE_PIDS);
+
+        let mut next = HashMap::with_capacity(pids.len());
+        let mut active = false;
+        for pid in pids {
+            let Some(t) = pid_ticks(pid) else { continue };
+            if self.active.get(&pid).is_some_and(|prev| t > *prev) {
+                active = true;
+            }
+            next.insert(pid, t);
+        }
+        self.active = next;
+        active
+    }
+}
+
+/// 读取 `/proc/stat` 每个在线核的累计时间。汇总行 `cpu ` 的序号为空，自然被跳过。
+fn parse_stat(content: &str) -> Vec<(usize, CpuStat)> {
+    let mut out = Vec::new();
+    for line in content.lines() {
+        let Some(rest) = line.strip_prefix("cpu") else {
+            continue;
+        };
+        let Some((idx, rest)) = rest.split_once(' ') else {
+            continue;
+        };
+        let Ok(idx) = idx.parse::<usize>() else {
+            continue;
+        };
+        let mut it = rest
+            .split_whitespace()
+            .map(|v| v.parse::<u64>().unwrap_or(0));
+        let user = it.next().unwrap_or(0);
+        let nice = it.next().unwrap_or(0);
+        let system = it.next().unwrap_or(0);
+        let idle = it.next().unwrap_or(0);
+        let iowait = it.next().unwrap_or(0);
+        let irq = it.next().unwrap_or(0);
+        let softirq = it.next().unwrap_or(0);
+        let steal = it.next().unwrap_or(0);
+        // guest/guest_nice 已包含在 user/nice 中，不重复计入
+        let busy = user + nice + system + irq + softirq + steal;
+        let total = busy + idle + iowait;
+        out.push((idx, CpuStat { busy, total }));
+    }
+    out
+}
+
+fn read_cluster_times(topo: &CpuTopology) -> Option<[ClusterTimes; 3]> {
+    let content = fs::read_to_string("/proc/stat").ok()?;
+    let stats = parse_stat(&content);
+    if stats.is_empty() {
+        return None;
+    }
+    Some(cluster_times(&stats, topo))
+}
+
+fn cluster_times(stats: &[(usize, CpuStat)], topo: &CpuTopology) -> [ClusterTimes; 3] {
+    let mut out = [ClusterTimes::default(); 3];
+    let sets = [topo.e_core, topo.p_core, topo.hp_core];
+    for (cpu, st) in stats {
+        for (i, set) in sets.iter().enumerate() {
+            if set.is_set(*cpu) {
+                out[i].busy += st.busy;
+                out[i].total += st.total;
+            }
+        }
+    }
+    out
+}
+
+/// 千分比差分。计数回绕、离核或 Δtotal 为 0 一律记 -1（不可用），
+/// 绝不把缺失值当 0 参与排序
+fn diff_load(prev: &[ClusterTimes; 3], cur: &[ClusterTimes; 3]) -> [i32; 3] {
+    let mut out = [-1i32; 3];
+    for i in 0..3 {
+        if cur[i].busy < prev[i].busy || cur[i].total < prev[i].total {
+            continue;
+        }
+        let db = cur[i].busy - prev[i].busy;
+        let dt = cur[i].total - prev[i].total;
+        if dt == 0 || db > dt {
+            continue;
+        }
+        out[i] = (db * 1000 / dt) as i32;
+    }
+    out
+}
+
+fn cluster_mask(cpus: &CpuSet, topo: &CpuTopology) -> [bool; 3] {
+    let mut m = [false; 3];
+    for (i, set) in [topo.e_core, topo.p_core, topo.hp_core].iter().enumerate() {
+        m[i] = set.count() > 0
+            && cpus
+                .bits
+                .iter()
+                .zip(set.bits.iter())
+                .any(|(a, b)| a & b != 0);
+    }
+    m
+}
+
+fn cluster_cores(i: usize, topo: &CpuTopology) -> usize {
+    match i {
+        0 => topo.e_core.count(),
+        1 => topo.p_core.count(),
+        _ => topo.hp_core.count(),
+    }
+}
+
+/// 未迁移时用在线核数加权平均衡量线程处境：
+/// 规则 `p-core,hp-core` 让线程在 4 个核上浮动，拿单一簇当基准会失真
+fn weighted_avg(load: &[i32; 3], allow: &[bool; 3], topo: &CpuTopology) -> i32 {
+    let mut sb = 0i64;
+    let mut sc = 0i64;
+    for i in 0..3 {
+        if !allow[i] || load[i] < 0 {
+            continue;
+        }
+        let c = cluster_cores(i, topo) as i64;
+        if c == 0 {
+            continue;
+        }
+        sb += load[i] as i64 * c;
+        sc += c;
+    }
+    if sc == 0 { -1 } else { (sb / sc) as i32 }
+}
+
+/// 负载最低的可用簇。当前簇已是最低时保持不动，避免同负载下来回跳。
+fn pick_target(load: &[i32; 3], allow: &[bool; 3], cur: Option<u8>) -> Option<u8> {
+    let mut best: Option<(i32, u8)> = None;
+    for i in 0..3 {
+        if !allow[i] || load[i] < 0 {
+            continue;
+        }
+        match best {
+            Some((b, _)) if load[i] >= b => {}
+            _ => best = Some((load[i], i as u8)),
+        }
+    }
+    let (min, idx) = best?;
+    if let Some(c) = cur
+        && allow[c as usize]
+        && load[c as usize] == min
+    {
+        return Some(c);
+    }
+    Some(idx)
+}
+
+/// P1 硬约束：目标必须落在允许集合内、至少两个核、且只能是 p-core / hp-core。
+/// 不允许往下迁（e-core 已经是兜底，再降没有收益），也不允许钉死单核超大核。
+fn target_ok(
+    target: u8,
+    load: &[i32; 3],
+    allow: &[bool; 3],
+    allowed_cpus: &CpuSet,
+    topo: &CpuTopology,
+) -> bool {
+    let t = target as usize;
+    if t == 0 || !allow[t] || load[t] < 0 {
+        return false;
+    }
+    let mut set = match t {
+        1 => topo.p_core,
+        _ => topo.hp_core,
+    };
+    set.and(allowed_cpus);
+    set.count() >= MIN_TARGET_CORES
+}
+
+/// 目标簇与规则允许集合的交集。绝不能直接用簇全集，否则会越过规则给出的范围
+fn target_cpus(target: u8, allowed: &CpuSet, topo: &CpuTopology) -> Option<CpuSet> {
+    let mut set = match target {
+        0 => topo.e_core,
+        1 => topo.p_core,
+        _ => topo.hp_core,
+    };
+    set.and(allowed);
+    (set.count() > 0).then_some(set)
+}
+
+fn cluster_label(i: u8) -> &'static str {
+    CLUSTER_NAME.get(i as usize).copied().unwrap_or("?")
+}
+
+/// 读 `/proc/<pid>/stat` 的 utime+stime。comm 可含空格与括号，从最后一个 `)` 之后解析。
+fn pid_ticks(pid: i32) -> Option<u64> {
+    let s = fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
+    let rest = &s[s.rfind(')')? + 1..];
+    let mut it = rest.split_whitespace();
+    // 第一个 token 是 state（字段 3），utime 是字段 14，即再取第 12 个
+    let utime = it.nth(11)?.parse::<u64>().ok()?;
+    let stime = it.next()?.parse::<u64>().ok()?;
+    Some(utime + stime)
+}
+
+/// 采样周期常量对外暴露，供主循环决定 tick 频率
+pub const fn sample_period() -> Duration {
+    SAMPLE_PERIOD
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::SchedScope;
+
+    fn topo() -> CpuTopology {
+        let mut e = CpuSet::new();
+        for i in 0..4 {
+            e.set(i);
+        }
+        let mut p = CpuSet::new();
+        for i in 4..7 {
+            p.set(i);
+        }
+        let mut h = CpuSet::new();
+        h.set(7);
+        let mut all = CpuSet::new();
+        for i in 0..8 {
+            all.set(i);
+        }
+        CpuTopology {
+            present_cpus: all,
+            present_str: "0-7".into(),
+            mems_str: "0".into(),
+            cpuset_enabled: false,
+            e_core: e,
+            p_core: p,
+            hp_core: h,
+            topo_source: "capacity",
+            topo_degraded: false,
+        }
+    }
+
+    fn cfg_with(name: &str, conf: &str) -> AppConfig {
+        let p = format!("/tmp/appopt_sched_{}.conf", name);
+        std::fs::write(&p, conf).unwrap();
+        let t = topo();
+        let mut m = -1i64;
+        let mut cfg = crate::config::load_config(&p, &t, &mut m).unwrap();
+        cfg.topo = t;
+        cfg.sched_scope = SchedScope {
+            levels: 3,
+            rules: 1,
+            pkgs: 1,
+        };
+        cfg
+    }
+
+    fn task(pkg: &str, comm: &str, cpus: CpuSet) -> crate::cache::TaskEntry {
+        crate::cache::TaskEntry {
+            pid: 100,
+            pkg: pkg.to_string(),
+            cpus,
+            cpuset_dir: String::new(),
+            is_thread_rule: false,
+            comm: comm.to_string(),
+        }
+    }
+
+    fn cache_with(pkg: &str, comm: &str, cpus: CpuSet) -> ProcCache {
+        let mut c = ProcCache::new();
+        c.tasks.insert(1001, task(pkg, comm, cpus));
+        c
+    }
+
+    #[test]
+    fn parse_stat_skips_summary_and_keeps_online() {
+        let s = "cpu  100 0 100 800 0 0 0 0 0 0\ncpu0 10 0 10 80 0 0 0 0 0 0\ncpu1 20 0 20 160 0 0 0 0 0 0\nintr 1\n";
+        let rows = parse_stat(s);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, 0);
+        assert_eq!(rows[0].1.busy, 20);
+        assert_eq!(rows[0].1.total, 100);
+    }
+
+    #[test]
+    fn diff_load_reports_thousandths() {
+        let prev = [ClusterTimes {
+            busy: 100,
+            total: 1000,
+        }; 3];
+        let cur = [ClusterTimes {
+            busy: 200,
+            total: 1200,
+        }; 3];
+        // Δbusy=100 Δtotal=200 → 500‰
+        assert_eq!(diff_load(&prev, &cur), [500, 500, 500]);
+    }
+
+    #[test]
+    fn diff_load_zero_total_is_unavailable() {
+        let prev = [ClusterTimes {
+            busy: 100,
+            total: 1000,
+        }; 3];
+        let cur = [ClusterTimes {
+            busy: 100,
+            total: 1000,
+        }; 3];
+        assert_eq!(diff_load(&prev, &cur), [-1, -1, -1]);
+    }
+
+    #[test]
+    fn diff_load_wraparound_is_unavailable() {
+        let prev = [ClusterTimes {
+            busy: 900,
+            total: 1000,
+        }; 3];
+        let cur = [ClusterTimes {
+            busy: 10,
+            total: 50,
+        }; 3];
+        assert_eq!(diff_load(&prev, &cur), [-1, -1, -1]);
+    }
+
+    #[test]
+    fn pick_target_ignores_unavailable_and_prefers_idle() {
+        let allow = [true, true, true];
+        assert_eq!(pick_target(&[500, 200, 300], &allow, None), Some(1));
+        assert_eq!(pick_target(&[-1, 400, 300], &allow, None), Some(2));
+        assert_eq!(pick_target(&[-1, -1, -1], &allow, None), None);
+    }
+
+    #[test]
+    fn pick_target_keeps_current_when_tied() {
+        let allow = [false, true, true];
+        // 当前在 hp，与 p 同负载时保持不动
+        assert_eq!(pick_target(&[-1, 300, 300], &allow, Some(2)), Some(2));
+    }
+
+    #[test]
+    fn weighted_avg_counts_cores() {
+        let allow = [false, true, true];
+        // p 有 3 核负载 400，hp 有 1 核负载 800 → (1200+800)/4 = 500
+        assert_eq!(weighted_avg(&[-1, 400, 800], &allow, &topo()), 500);
+        assert_eq!(weighted_avg(&[-1, -1, -1], &allow, &topo()), -1);
+    }
+
+    #[test]
+    fn target_rejects_e_core_and_empty_intersection() {
+        let t = topo();
+        let allow = [true, true, true];
+        let load = [100, 300, 200];
+        // e-core 已经是最低层，再往下没有收益
+        assert!(!target_ok(0, &load, &allow, &t.present_cpus, &t));
+        // hp 单核允许进入，靠负载反馈自限
+        assert!(target_ok(2, &load, &allow, &t.present_cpus, &t));
+        assert!(target_ok(1, &load, &allow, &t.present_cpus, &t));
+        // 交集为空
+        let empty = CpuSet::new();
+        assert!(!target_ok(1, &load, &allow, &empty, &t));
+    }
+
+    #[test]
+    fn target_cpus_never_exceeds_allow_set() {
+        let t = topo();
+        let mut allowed = CpuSet::new();
+        allowed.set(5);
+        let got = target_cpus(1, &allowed, &t).unwrap();
+        assert_eq!(got.count(), 1);
+        assert!(got.is_set(5));
+        assert_eq!(target_cpus(2, &allowed, &t), None);
+    }
+
+    #[test]
+    fn judge_needs_three_confirms() {
+        let cfg = cfg_with("judge", "com.test.game=p-core,hp-core\n");
+        let t = topo();
+        let mut cpus = CpuSet::new();
+        cpus.or(&t.p_core);
+        cpus.or(&t.hp_core);
+        let cache = cache_with("com.test.game", "Thread-7", cpus);
+
+        let mut st = SchedState::new();
+        st.set_mode(SchedMode::On);
+        let now = Instant::now();
+        // 起始时刻设为过去，绕开 2s 最小驻留
+        st.threads.insert(
+            1001,
+            ThreadState {
+                first_seen: now - Duration::from_secs(5),
+                ..ThreadState::new(now)
+            },
+        );
+        let load = [-1, 600, 200];
+        assert!(st.tick_at(&cfg, &cache, load, now).is_empty());
+        assert!(st.tick_at(&cfg, &cache, load, now).is_empty());
+        let mv = st.tick_at(&cfg, &cache, load, now);
+        assert_eq!(mv.len(), 1);
+        assert_eq!(mv[0].cpus.to_range_string(), "7");
+    }
+
+    #[test]
+    fn shadow_counts_would_once() {
+        let cfg = cfg_with("shadow", "com.test.game=p-core,hp-core\n");
+        let t = topo();
+        let mut cpus = CpuSet::new();
+        cpus.or(&t.p_core);
+        cpus.or(&t.hp_core);
+        let cache = cache_with("com.test.game", "Thread-7", cpus);
+
+        let mut st = SchedState::new();
+        st.set_mode(SchedMode::Shadow);
+        let now = Instant::now();
+        st.threads.insert(
+            1001,
+            ThreadState {
+                first_seen: now - Duration::from_secs(5),
+                ..ThreadState::new(now)
+            },
+        );
+        let load = [-1, 600, 300];
+        for _ in 0..6 {
+            st.tick_at(&cfg, &cache, load, now);
+        }
+        // shadow 不产生 Move，但 would 只累计一次
+        assert_eq!(st.would, 1);
+        assert_eq!(st.moved, 0);
+    }
+
+    #[test]
+    fn rule_rescan_resets_state() {
+        let cfg = cfg_with("rescan", "com.test.game=p-core,hp-core\n");
+        let t = topo();
+        let mut cpus = CpuSet::new();
+        cpus.or(&t.p_core);
+        cpus.or(&t.hp_core);
+        let mut cache = cache_with("com.test.game", "Thread-7", cpus);
+
+        let mut st = SchedState::new();
+        st.set_mode(SchedMode::On);
+        let now = Instant::now();
+        st.threads.insert(
+            1001,
+            ThreadState {
+                cur: Some(2),
+                own: true,
+                applied: {
+                    let mut s = CpuSet::new();
+                    s.set(7);
+                    s
+                },
+                streak: 0,
+                last_move: Some(now),
+                first_seen: now - Duration::from_secs(5),
+            },
+        );
+        // 模拟规则重扫：缓存里的集合被改回允许集合
+        cache.tasks.get_mut(&1001).unwrap().cpus = cpus;
+        st.tick_at(&cfg, &cache, [-1, 600, 200], now);
+        let state = st.threads.get(&1001).unwrap();
+        assert!(!state.own);
+        assert_eq!(state.cur, None);
+    }
+
+    #[test]
+    fn critical_thread_is_blocked() {
+        let cfg = cfg_with("critical", "com.test.game=p-core,hp-core\n");
+        let t = topo();
+        let mut cpus = CpuSet::new();
+        cpus.or(&t.p_core);
+        cpus.or(&t.hp_core);
+        let cache = cache_with("com.test.game", "RenderThread", cpus);
+
+        let mut st = SchedState::new();
+        st.set_mode(SchedMode::On);
+        let now = Instant::now();
+        for _ in 0..4 {
+            st.tick_at(&cfg, &cache, [-1, 600, 200], now);
+        }
+        assert_eq!(st.moved, 0);
+        assert!(st.blocked >= 1);
+    }
+}

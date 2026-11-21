@@ -8,8 +8,11 @@ mod config;
 mod cpuset;
 mod ebpf_mode;
 mod proc_mode;
+mod roles;
+mod rt;
 mod rule_edit;
 mod rule_match;
+mod sched;
 mod web;
 
 use std::env;
@@ -21,13 +24,15 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::config::{config_loader, init_inotify, load_config, CHECK_INTERVAL, CONFIG_FILE, CURRENT_CONFIG};
+use crate::apply_affinity::affinity_set;
+use crate::config::{config_loader, init_inotify, load_config, AppConfig, CHECK_INTERVAL, CONFIG_FILE, CURRENT_CONFIG};
 use crate::cpuset::{init_cpu_topo, set_base_cpuset};
 use crate::ebpf_mode::{
     affinity_check, full_scan, event_dispatch, comm_map_init,
     ebpf_init, config_rescan, reconcile, EbpfState, DROPPED_TOTAL,
 };
 use crate::proc_mode::{cache_sync, ProcScanState};
+use crate::sched::SchedState;
 use crate::web::{
     cache_stats, settings_load, settings_save, web_start, WebStats,
     WEB_ENABLED, WEB_STATS, MODE_FORCE, SETTINGS_FILE,
@@ -214,6 +219,9 @@ fn main() {
     // 单实例锁贯穿整个运行生命周期，先于 cpuset 初始化，避免重复建目录与双份绑核
     let _instance = instance_lock(&cpuset_name);
 
+    // 锁内先恢复上次异常退出留下的 RT 时间片，避免多实例互相覆盖备份
+    rt::init();
+
     // 先设置 cpuset 路径再初始化拓扑，init_cpu_topo 会创建 BASE_CPUSET 目录
     set_base_cpuset(&cpuset_name);
     let topo = init_cpu_topo();
@@ -247,6 +255,11 @@ fn main() {
     }
     CONFIG_UPDATED.store(true, Ordering::Release);
 
+    // RT 全局参数只在这里改一次，配置热更新走循环里的 prepare
+    if let Some(cfg) = lock_ignore_poison(&CURRENT_CONFIG).clone() {
+        rt::prepare(&cfg);
+    }
+
     init_inotify(&config_file);
 
     if web_enable {
@@ -273,6 +286,10 @@ fn main() {
         .checked_sub(Duration::from_secs(60))
         .unwrap_or_else(Instant::now);
 
+    // S7 状态。模式由配置驱动，off 时 tick 立即返回，不读 /proc/stat
+    let mut sched_state = SchedState::new();
+    let mut sched_deadline = Instant::now();
+
     println!("启动AppOpt服务 v{}", env!("CARGO_PKG_VERSION"));
 
     // 恢复的强制 proc 模式无需 eBPF 初始化
@@ -292,6 +309,13 @@ fn main() {
         };
         let interval = CHECK_INTERVAL.load(Ordering::Relaxed).max(1);
         let mode = MODE_FORCE.load(Ordering::Relaxed);
+
+        // 模式切换必须立即生效：`on -> off` 依赖 policy_sig 变化触发全量重扫，
+        // 这里同时清空 S7 状态，让已迁移线程按规则重新落地
+        if config_changed {
+            sched_state.set_mode(cfg.sched);
+            rt::prepare(&cfg);
+        }
 
         // 配置加载线程 panic 恢复
         if config_handle.is_finished() {
@@ -408,6 +432,41 @@ fn main() {
             affinity_deadline = Instant::now();
         }
 
+        // S7 采样与迁移。off 时 tick 立即返回，只刷新一次快照供 Web 显示
+        if sched_deadline.elapsed() >= sched::sample_period() {
+            sched_deadline = Instant::now();
+            sched_state.set_mode(cfg.sched);
+            let moves = match (&ebpf_state, &proc_state) {
+                (Some(es), _) => sched_state.tick(&cfg, &es.cache),
+                (None, Some(ps)) => sched_state.tick(&cfg, &ps.cache),
+                _ => Vec::new(),
+            };
+            if !moves.is_empty() {
+                let mut dead: Vec<i32> = Vec::new();
+                match (&mut ebpf_state, &mut proc_state) {
+                    (Some(es), _) => {
+                        for m in &moves {
+                            if apply_move_ebpf(es, &cfg, m) {
+                                dead.push(m.tid);
+                            }
+                        }
+                    }
+                    (None, Some(ps)) => {
+                        for m in &moves {
+                            if apply_move_proc(ps, &cfg, m) {
+                                dead.push(m.tid);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                for tid in dead {
+                    sched_state.forget(tid);
+                }
+            }
+            sched_state.publish();
+        }
+
         // web 状态统计，低频更新避免高频事件循环下的额外开销
         if WEB_ENABLED.load(Ordering::Relaxed)
             && web_stats_deadline.elapsed() >= Duration::from_secs(2)
@@ -429,4 +488,42 @@ fn main() {
             });
         }
     }
+}
+
+/// S7 迁移执行（eBPF 模式）：只改亲和性，不写 cpuset 目录，保持原有归属。
+/// 返回 true 表示线程已退出，调用方需要清 S7 状态。
+fn apply_move_ebpf(es: &mut EbpfState, cfg: &AppConfig, m: &sched::Move) -> bool {
+    let dir = es
+        .cache
+        .tasks
+        .get(&m.tid)
+        .map(|e| e.cpuset_dir.clone())
+        .unwrap_or_default();
+    if affinity_set(m.tid, &m.cpus, &dir, &cfg.topo) {
+        es.cache.task_del(m.tid);
+        return true;
+    }
+    // 同步缓存：affinity_sync 每 3*interval 秒会按 entry.cpus 重设，
+    // 不改这里，迁移结果几秒后就被拉回规则值
+    if let Some(e) = es.cache.tasks.get_mut(&m.tid) {
+        e.cpus = m.cpus;
+    }
+    false
+}
+
+fn apply_move_proc(ps: &mut ProcScanState, cfg: &AppConfig, m: &sched::Move) -> bool {
+    let dir = ps
+        .cache
+        .tasks
+        .get(&m.tid)
+        .map(|e| e.cpuset_dir.clone())
+        .unwrap_or_default();
+    if affinity_set(m.tid, &m.cpus, &dir, &cfg.topo) {
+        ps.cache.task_del(m.tid);
+        return true;
+    }
+    if let Some(e) = ps.cache.tasks.get_mut(&m.tid) {
+        e.cpus = m.cpus;
+    }
+    false
 }

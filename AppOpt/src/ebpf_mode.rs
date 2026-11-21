@@ -13,6 +13,7 @@ use crate::apply_affinity::{affinity_set, proc_walk, task_tids, tid_comm};
 use crate::cache::ProcCache;
 use crate::config::{AppConfig, CURRENT_CONFIG};
 use crate::cpuset::CpuSet;
+use crate::rt;
 
 /// eBPF 进程事件，布局需与内核态 ProcEvent 一致
 #[repr(C)]
@@ -544,6 +545,7 @@ pub fn event_dispatch(event: &EbpfProcEvent, cfg: &AppConfig, state: &mut EbpfSt
         EBPF_EVENT_EXIT => {
             // 内核态已在 sched_process_exit 里删除 APPLIED_MAP[tid]，此处不再重复删除
             state.cache.task_del(tid);
+            rt::forget(tid);
         }
 
         EBPF_EVENT_EXEC
@@ -579,9 +581,14 @@ fn event_apply(
         return false;
     };
 
-    cache.task_apply(tid, pid, &pkg, comm, cfg, |t, c, d| {
+    let ok = cache.task_apply(tid, pid, &pkg, comm, cfg, |t, c, d| {
         affinity_apply(t, c, d, cfg, bpf)
-    })
+    });
+    // 规则命中且亲和性写入成功后再考虑 RT，避免把没被管理的线程提升
+    if ok && let Some(e) = cache.tasks.get(&tid) {
+        rt::note(tid, pid, &e.comm, &e.cpus, cfg);
+    }
+    ok
 }
 
 /// 定期纠正 affinity_sync 清死亡 tid
@@ -605,9 +612,12 @@ pub fn full_scan(cfg: &AppConfig, state: &mut EbpfState) {
             } else {
                 String::new()
             };
-            state.cache.task_apply(tid, pid, pkg, &t_name, cfg, |tid, cpus, cpuset_dir| {
+            let ok = state.cache.task_apply(tid, pid, pkg, &t_name, cfg, |tid, cpus, cpuset_dir| {
                 affinity_apply(tid, cpus, cpuset_dir, cfg, &mut state.bpf)
             });
+            if ok && let Some(e) = state.cache.tasks.get(&tid) {
+                rt::note(tid, pid, &e.comm, &e.cpus, cfg);
+            }
         }
     });
     state.cfg_sig = cfg.pkg_sig.clone();
@@ -672,9 +682,12 @@ pub fn config_rescan(new: &AppConfig, state: &mut EbpfState) {
                 } else {
                     String::new()
                 };
-                state.cache.task_apply(tid, pid, pkg, &t_name, new, |tid, cpus, dir| {
+                let ok = state.cache.task_apply(tid, pid, pkg, &t_name, new, |tid, cpus, dir| {
                     affinity_apply(tid, cpus, dir, new, &mut state.bpf)
                 });
+                if ok && let Some(e) = state.cache.tasks.get(&tid) {
+                    rt::note(tid, pid, &e.comm, &e.cpus, new);
+                }
             }
         });
     }

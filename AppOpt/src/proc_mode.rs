@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use crate::apply_affinity::{proc_walk, read_cmdline, task_tids, tid_comm};
 use crate::cache::ProcCache;
 use crate::config::AppConfig;
+use crate::rt;
 
 /// 全量校验周期：兜底 PID 复用、tid 复用与差分漏检
 const FULL_CHECK: Duration = Duration::from_secs(60);
@@ -83,6 +84,7 @@ pub fn cache_sync(cfg: &AppConfig, state: &mut ProcScanState) {
         state.tracked_pids.remove(&pid);
         state.cache.purge_pid(pid);
         state.known_tids.retain(|_, owner| *owner != pid);
+        rt::release_pid(pid);
     }
 
     // 已跟踪进程的新线程：新线程会在创建后立刻命名，需在下一个周期内纳入管理
@@ -111,10 +113,14 @@ fn proc_scan(cfg: &AppConfig, state: &mut ProcScanState) {
     state.tracked_pids.clear();
     state.known_tids.clear();
 
-    let _ = proc_walk(cfg, |_| true, |pid, pkg, has_thread_rules| {
-        state.tracked_pids.insert(pid, pkg.to_string());
-        proc_tasks(pid, pkg, has_thread_rules, cfg, state);
-    });
+    let _ = proc_walk(
+        cfg,
+        |_| true,
+        |pid, pkg, has_thread_rules| {
+            state.tracked_pids.insert(pid, pkg.to_string());
+            proc_tasks(pid, pkg, has_thread_rules, cfg, state);
+        },
+    );
 
     state.known_pids = current;
     state.rescan_all = false;
@@ -154,10 +160,13 @@ fn proc_tasks(
         } else {
             String::new()
         };
-        if state
+        let ok = state
             .cache
-            .task_apply(tid, pid, pkg, &thread_name, cfg, |_, _, _| false)
-        {
+            .task_apply(tid, pid, pkg, &thread_name, cfg, |_, _, _| false);
+        if ok {
+            if let Some(e) = state.cache.tasks.get(&tid) {
+                rt::note(tid, pid, &e.comm, &e.cpus, cfg);
+            }
             added += 1;
         }
     }

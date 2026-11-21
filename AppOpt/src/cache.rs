@@ -11,6 +11,8 @@ pub struct TaskEntry {
     pub cpus: CpuSet,
     pub cpuset_dir: String,
     pub is_thread_rule: bool,
+    /// 线程名。S7 判定角色、RT 匹配模式都要用，不再回读 /proc
+    pub comm: String,
 }
 
 /// 双模式共用进程缓存，eBPF 事件驱动增量维护，proc 模式触发全量重建
@@ -70,7 +72,11 @@ impl ProcCache {
     where
         F: FnOnce(i32, &CpuSet, &str) -> bool,
     {
-        let thread_name = if cfg.has_thread_rules.contains(pkg) { comm } else { "" };
+        let thread_name = if cfg.has_thread_rules.contains(pkg) {
+            comm
+        } else {
+            ""
+        };
         let Some(result) = thread_affinity(pkg, thread_name, cfg) else {
             return false;
         };
@@ -93,6 +99,7 @@ impl ProcCache {
                 cpus: result.cpus,
                 cpuset_dir: result.cpuset_dir,
                 is_thread_rule: result.is_thread_rule,
+                comm: comm.to_string(),
             },
         );
         true
@@ -117,5 +124,3 @@ impl ProcCache {
         dead_tids
     }
 }
-
-

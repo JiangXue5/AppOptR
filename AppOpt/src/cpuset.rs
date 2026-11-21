@@ -69,6 +69,13 @@ impl CpuSet {
         }
     }
 
+    /// 交集。S7 把目标簇限制在规则允许集合内时用，避免把线程放到规则之外
+    pub fn and(&mut self, other: &CpuSet) {
+        for (d, &s) in self.bits.iter_mut().zip(other.bits.iter()) {
+            *d &= s;
+        }
+    }
+
     pub fn to_range_string(self) -> String {
         let mut result = String::new();
         let mut start: Option<usize> = None;

@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, UNIX_EPOCH};
 
-use crate::{lock_ignore_poison, CONFIG_UPDATED, MAX_PKG_LEN, MAX_THREAD_LEN};
-use crate::cpuset::{base_cpuset, create_cpuset_dir, parse_cpu_spec, CpuSet, CpuTopology};
+use crate::cpuset::{CpuSet, CpuTopology, base_cpuset, create_cpuset_dir, parse_cpu_spec};
+use crate::{CONFIG_UPDATED, MAX_PKG_LEN, MAX_THREAD_LEN, lock_ignore_poison};
 
 pub static INOTIFY_SUPPORTED: AtomicBool = AtomicBool::new(false);
 pub static INOTIFY_FD: AtomicI32 = AtomicI32::new(-1);
@@ -35,6 +35,43 @@ pub struct PkgRules {
     pub thread_rules: Vec<usize>,
 }
 
+/// S7 三档模式。默认 off：不采样、不产生系统调用，与纯静态规则行为一致
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[repr(u8)]
+pub enum SchedMode {
+    #[default]
+    Off = 0,
+    /// 采样与判定，只记录不迁移
+    Shadow = 1,
+    /// 全部约束满足时提交 sched_setaffinity
+    On = 2,
+}
+
+/// RT 提升范围。默认 off，与 `@sched` 同级但独立回滚
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub enum RtMode {
+    #[default]
+    Off,
+    /// 角色为 Critical 且允许集合不超过 2 核
+    Auto,
+    /// 显式线程名，支持 fnmatch
+    Names(Vec<String>),
+}
+
+impl RtMode {
+    pub fn label(&self) -> String {
+        match self {
+            RtMode::Off => "off".to_string(),
+            RtMode::Auto => "auto（仅 Critical，允许集合 ≤2 核）".to_string(),
+            RtMode::Names(v) => format!("{} 条线程名", v.len()),
+        }
+    }
+
+    pub fn is_off(&self) -> bool {
+        matches!(self, RtMode::Off)
+    }
+}
+
 pub struct AppConfig {
     pub rules: Vec<AffinityRule>,
     pub pkgs: HashSet<String>,
@@ -53,6 +90,10 @@ pub struct AppConfig {
     pub unmatched_all: bool,
     /// 跨簇规则统计，仅用于展示 S7 的潜在作用面
     pub sched_scope: SchedScope,
+    /// S7 模式，off 时运行期零开销
+    pub sched: SchedMode,
+    /// RT 提升范围
+    pub rt: RtMode,
     pub topo: CpuTopology,
 }
 
@@ -81,7 +122,9 @@ fn rule_hash(rule: &AffinityRule) -> u64 {
 fn build_pkg_sig(rules: &[AffinityRule]) -> HashMap<String, u64> {
     let mut per: HashMap<String, Vec<u64>> = HashMap::new();
     for rule in rules {
-        per.entry(rule.pkg.clone()).or_default().push(rule_hash(rule));
+        per.entry(rule.pkg.clone())
+            .or_default()
+            .push(rule_hash(rule));
     }
     per.into_iter()
         .map(|(pkg, mut hashes)| {
@@ -93,11 +136,24 @@ fn build_pkg_sig(rules: &[AffinityRule]) -> HashMap<String, u64> {
         .collect()
 }
 
-/// 全局策略指纹：逐包指纹只覆盖规则本身，@unmatched 这类影响所有包的开关
-/// 变化不会体现在 pkg_sig 里，必须单独比对，否则已缓存线程不会重新应用
-fn build_policy_sig(unmatched_all: bool) -> u64 {
+/// 全局策略指纹：逐包指纹只覆盖规则本身，@unmatched / @sched / @rt 这类
+/// 影响所有包的开关变化不会体现在 pkg_sig 里，必须单独比对，
+/// 否则已缓存线程不会重新应用，`on → off` 也回滚不了
+fn build_policy_sig(unmatched_all: bool, sched: SchedMode, rt: &RtMode) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     unmatched_all.hash(&mut h);
+    (sched as u8).hash(&mut h);
+    match rt {
+        RtMode::Off => 0u8.hash(&mut h),
+        RtMode::Auto => 1u8.hash(&mut h),
+        RtMode::Names(v) => {
+            2u8.hash(&mut h);
+            // 名字列表是 OR 语义，顺序无关，排序后再哈希避免误判变更
+            let mut sorted: Vec<&str> = v.iter().map(|s| s.as_str()).collect();
+            sorted.sort_unstable();
+            sorted.hash(&mut h);
+        }
+    }
     h.finish()
 }
 
@@ -221,7 +277,10 @@ pub fn split_rule_line(p: &str) -> Option<(&str, &str, bool)> {
 
 pub fn close_like(p: &str) -> bool {
     p.strip_prefix('}').is_some_and(|r| {
-        r.is_empty() || r.starts_with(char::is_whitespace) || r.starts_with('#') || r.starts_with("//")
+        r.is_empty()
+            || r.starts_with(char::is_whitespace)
+            || r.starts_with('#')
+            || r.starts_with("//")
     })
 }
 
@@ -235,10 +294,23 @@ pub fn split_single_line(body: &str) -> Option<(&str, &str, &str)> {
 }
 
 pub enum OuterLine<'a> {
-    Rule { pkg: &'a str, cpus: &'a str, open: bool },
-    BareOpen { pkg: &'a str },
-    Pending { pkg: &'a str },
-    Single { pkg: &'a str, thread: &'a str, cpus: &'a str, open: bool },
+    Rule {
+        pkg: &'a str,
+        cpus: &'a str,
+        open: bool,
+    },
+    BareOpen {
+        pkg: &'a str,
+    },
+    Pending {
+        pkg: &'a str,
+    },
+    Single {
+        pkg: &'a str,
+        thread: &'a str,
+        cpus: &'a str,
+        open: bool,
+    },
     Junk,
 }
 
@@ -249,7 +321,12 @@ pub fn parse_outer(p: &str) -> OuterLine<'_> {
         None => (false, p),
     };
     if let Some((pkg, thread, cpus)) = split_single_line(body) {
-        return OuterLine::Single { pkg, thread, cpus, open };
+        return OuterLine::Single {
+            pkg,
+            thread,
+            cpus,
+            open,
+        };
     }
     if !open && close_like(body) {
         return OuterLine::Junk;
@@ -286,7 +363,11 @@ fn add_rule(
     if pkg.is_empty() || pkg.len() >= MAX_PKG_LEN || thread.len() >= MAX_THREAD_LEN {
         return false;
     }
-    if pkg.bytes().chain(thread.bytes()).any(|b| b < 0x20 || b == 0x7f) {
+    if pkg
+        .bytes()
+        .chain(thread.bytes())
+        .any(|b| b < 0x20 || b == 0x7f)
+    {
         return false;
     }
     if !spec_like(cpus_spec) {
@@ -300,7 +381,11 @@ fn add_rule(
         let dir_name = set.to_range_string();
         if topo.cpuset_enabled {
             let path = format!("{}/{}", base_cpuset(), dir_name);
-            if create_cpuset_dir(&path, &dir_name, &topo.mems_str) { dir_name } else { Default::default() }
+            if create_cpuset_dir(&path, &dir_name, &topo.mems_str) {
+                dir_name
+            } else {
+                Default::default()
+            }
         } else {
             String::new()
         }
@@ -344,6 +429,9 @@ pub fn load_config(
     let mut in_block = false;
     // 保守默认：未匹配线程保持原有亲和性，不再主动设为全部核心
     let mut unmatched_all = false;
+    // 动态调度默认全关，配置里不写就与 2.3.0 行为一致
+    let mut sched = SchedMode::Off;
+    let mut rt = RtMode::Off;
 
     for line in content.lines() {
         let p = line.trim();
@@ -367,6 +455,25 @@ pub fn load_config(
             match (key, val) {
                 ("unmatched", "keep") => unmatched_all = false,
                 ("unmatched", "all") => unmatched_all = true,
+                ("sched", "off") => sched = SchedMode::Off,
+                ("sched", "shadow") => sched = SchedMode::Shadow,
+                ("sched", "on") => sched = SchedMode::On,
+                ("rt", "off") => rt = RtMode::Off,
+                ("rt", "auto") => rt = RtMode::Auto,
+                // 名字列表：逗号分隔的 fnmatch 模式
+                ("rt", v) if !v.is_empty() => {
+                    let names: Vec<String> = v
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty() && s.len() < MAX_THREAD_LEN)
+                        .map(str::to_string)
+                        .collect();
+                    if names.is_empty() {
+                        fail_cnt += 1;
+                    } else {
+                        rt = RtMode::Names(names);
+                    }
+                }
                 _ => fail_cnt += 1,
             }
             continue;
@@ -400,7 +507,12 @@ pub fn load_config(
         }
 
         match parse_outer(p) {
-            OuterLine::Single { pkg, thread, cpus, open } => {
+            OuterLine::Single {
+                pkg,
+                thread,
+                cpus,
+                open,
+            } => {
                 if !pending_pkg.is_empty() {
                     fail_cnt += 1;
                 }
@@ -473,7 +585,7 @@ pub fn load_config(
     let trunc_keys = build_trunc_keys(&pkgs);
     let rule_index = build_rule_index(&rules);
     let pkg_sig = build_pkg_sig(&rules);
-    let policy_sig = build_policy_sig(unmatched_all);
+    let policy_sig = build_policy_sig(unmatched_all, sched, &rt);
 
     // 同一包多条包级规则按并集生效，顺序无关；只提示不改变语义
     let mut multi: Vec<&str> = rule_index
@@ -510,6 +622,20 @@ pub fn load_config(
             scope.rules, num_rules, scope.pkgs, scope.levels
         );
     }
+    match sched {
+        SchedMode::Off => println!("S7 动态分配: off（不采样，行为与静态规则一致）"),
+        SchedMode::Shadow => println!("S7 动态分配: shadow（采样与记录，不修改亲和性）"),
+        // 拓扑不满足时照常记录意图，但明确不会生效，避免误以为已经在优化
+        SchedMode::On if scope.levels < 2 => {
+            println!("S7 动态分配: on（核心层仅 {} 个，不会生效）", scope.levels)
+        }
+        SchedMode::On => {
+            println!("S7 动态分配: on（仅 Worker/Background 让位，目标簇 ≥2 核）")
+        }
+    }
+    if !rt.is_off() {
+        println!("RT 调度: {}", rt.label());
+    }
 
     Some(AppConfig {
         rules,
@@ -521,6 +647,8 @@ pub fn load_config(
         policy_sig,
         unmatched_all,
         sched_scope: scope,
+        sched,
+        rt,
         topo: topo.clone(),
     })
 }
@@ -562,7 +690,9 @@ pub fn init_inotify(config_file: &str) {
         Ok(c) => c,
         Err(_) => {
             eprintln!("错误: 配置文件路径包含非法字符，使用轮询模式");
-            unsafe { libc::close(inotify_fd); }
+            unsafe {
+                libc::close(inotify_fd);
+            }
             return;
         }
     };
@@ -799,5 +929,59 @@ mod tests {
         let topo = topo_of(&[0, 1, 2, 3], &[0, 1, 2, 3], &[0, 1, 2, 3]);
         let s = scope_of("degraded", "com.a=0-1\n", &topo);
         assert_eq!((s.levels, s.rules, s.pkgs), (1, 0, 0));
+    }
+
+    fn cfg_of(name: &str, conf: &str) -> AppConfig {
+        let path = format!("/tmp/appopt_cfg_{}.conf", name);
+        fs::write(&path, conf).unwrap();
+        let topo = topo_of(&[0, 1, 2, 3], &[4, 5], &[6, 7]);
+        let mut mtime = -1i64;
+        load_config(&path, &topo, &mut mtime).expect("配置应能加载")
+    }
+
+    #[test]
+    fn sched_directive_parses_all_levels() {
+        assert_eq!(
+            cfg_of("s_off", "@sched=off\ncom.a=0-1\n").sched,
+            SchedMode::Off
+        );
+        assert_eq!(
+            cfg_of("s_sh", "@sched=shadow\ncom.a=0-1\n").sched,
+            SchedMode::Shadow
+        );
+        assert_eq!(
+            cfg_of("s_on", "@sched=on\ncom.a=0-1\n").sched,
+            SchedMode::On
+        );
+        // 非法值回退 off，但不能牵连规则
+        let bad = cfg_of("s_bad", "@sched=turbo\ncom.a=0-1\n");
+        assert_eq!(bad.sched, SchedMode::Off);
+        assert_eq!(bad.rules.len(), 1);
+    }
+
+    #[test]
+    fn rt_directive_parses_auto_and_names() {
+        assert_eq!(cfg_of("r_off", "@rt=off\ncom.a=0-1\n").rt, RtMode::Off);
+        assert_eq!(cfg_of("r_auto", "@rt=auto\ncom.a=0-1\n").rt, RtMode::Auto);
+        match cfg_of("r_names", "@rt=RenderThread,RHI*\ncom.a=0-1\n").rt {
+            RtMode::Names(v) => {
+                assert_eq!(v, vec!["RenderThread".to_string(), "RHI*".to_string()])
+            }
+            other => panic!("期望名字列表，得到 {:?}", other),
+        }
+    }
+
+    #[test]
+    fn policy_sig_covers_sched_and_rt() {
+        let base = cfg_of("sig_base", "com.a=0-1\n");
+        let s = cfg_of("sig_sched", "@sched=shadow\ncom.a=0-1\n");
+        let r = cfg_of("sig_rt", "@rt=auto\ncom.a=0-1\n");
+        // 不纳入 policy_sig 的话，改配置不会触发重建，on -> off 无法回滚
+        assert_ne!(base.policy_sig, s.policy_sig);
+        assert_ne!(base.policy_sig, r.policy_sig);
+        // 名字列表是 OR 语义，顺序不影响
+        let n1 = cfg_of("sig_n1", "@rt=A,B\ncom.a=0-1\n");
+        let n2 = cfg_of("sig_n2", "@rt=B,A\ncom.a=0-1\n");
+        assert_eq!(n1.policy_sig, n2.policy_sig);
     }
 }
