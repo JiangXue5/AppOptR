@@ -13,6 +13,8 @@
 - 修复模块安装脚本 x86_64 分支的复制错误，补充 `AppOpt-ebpf` 拷贝。
 - `service.sh` 日志改为写入模块目录 `appopt.log` 并做启动前轮转，不再丢弃到 `/dev/null`。
 - 新增 `build.sh`：工具链检查 → eBPF → 用户态 → 按 ABI 组包，产物落 `dist/`。
+- **修复**：`sched_param` 改为零初始化后赋值。`aarch64-unknown-linux-musl` 的该结构带
+  `sched_ss_*` 字段，结构体字面量无法编译，arm64 包因此构建不出来。
 
 ### 生命周期
 
@@ -77,6 +79,18 @@
 - `@sched` 纳入 `policy_sig`：改配置会触发全量重建，`on → off` 能真正回滚已迁移线程，
   不会停在「半 S7」状态。
 - 迁移后同步更新缓存里的 CPU 集合，否则 `affinity_sync` 会在数秒后把线程拉回规则值。
+- **修复**：`shadow` 不再产出 `Move`。旧实现在两种模式下都返回迁移候选，由主循环统一执行，
+  等于 `shadow` 也会真的改亲和性。现在决策层直接截断、主循环只在 `@sched=on` 时接收候选，
+  两道独立闸门；`shadow` 全程不建 cpuset、不调任何亲和性接口。
+- **修复**：迁移结果改为三态 `AffinityOutcome { Set, Gone, Failed }`。旧实现把
+  「线程是否退出」当成「亲和性是否设置成功」，EPERM/EINVAL 会被记成一次成功迁移并把
+  目标集合写进状态。现在只有 `Set` 才提交 `cur` / `own` / `applied` / `moved`，
+  失败只增加 `sched_failed` 并进入冷却；`Gone` 清掉线程状态。
+- **修复**：活跃 PID 判定超过 8 个进程时按窗口轮转，`MAX_ACTIVE_PIDS` 的低开销设计保留，
+  高位 pid 不再永远轮不到；增删进程只改变取模基数，不会把游标重置回 0。
+- **修复**：线程名按 `cfg.needs_comm(pkg)` 采集——线程规则、S7 角色判定、RT 匹配任一需要才读。
+  旧实现只在线程规则存在时读 `comm`，导致「只有包级规则」的应用在 S7 里角色恒为 Unknown、
+  RT Auto 永不命中；proc 模式也不再因此漏掉这类应用的新线程。
 
 ### RT 调度
 
@@ -95,6 +109,18 @@
   自有线程按新规则复核，符合的保留 RT，不符合的降为 `SCHED_OTHER`，不做降级再提升的无谓往返。
 - **修复**：时间片原值只在第一次改写时备份，后续热更新与多应用启停不再覆盖它；
   SIGTERM/SIGINT 正常退出时还原，异常退出仍靠下次启动的备份还原。
+- **修复**：`note` 会用一次 `sched_getscheduler` 复核记录是否仍有效。线程退出后 tid 被复用、
+  或外部把线程改回 CFS 时，旧记录会被当成「已提升」，新线程既不提升也不释放配额；
+  现在发现内核不是 RR 就丢弃记录并重新判定。
+- **修复**：全量重扫后对账（`rt::reconcile`）。缓存里已不存在的 tid、被移出配置的包、
+  规则变化后不再符合的线程一律收回；仍符合条件的保持 RT 不动。proc 模式的全量校验、
+  eBPF 的规则重建与丢弃对账都会走这一步。
+- **修复**：`affinity_check` 与 proc 模式的 `affinity_sync` 发现 ESRCH 时同时 `rt::forget`，
+  EXIT 事件丢失时配额也不会被永久占用。
+- **修复**：`sched_setscheduler` 返回 ESRCH（线程刚好退出）不再关闭全局闸门，只有 EPERM 这类
+  环境问题才整体停用 RT。
+- **修复**：时间片只还原自己写入的值。外部在运行期改过 `sched_rr_timeslice_ms` 时，
+  以现值为新的原值记录；关闭时若发现当前值已不是自己写的，只清记录不覆盖。
 - `SCHED_RR | SCHED_RESET_ON_FORK`、优先级 1 保持不变；只改 `sched_rr_timeslice_ms`，
   不动 `sched_rt_runtime_us` / `sched_rt_period_us`——改 RT 预算是整机行为。
 
@@ -110,7 +136,8 @@
   同时写一行启动日志。该数字仅用于评估动态调度的作用面，不参与任何决策。
 - 设置页新增「S7 动态分配」与「RT 调度」两行：展示模式、当前状态、本可迁移/已迁移次数与三簇负载；
   `/api/config` 增加 `sched_mode` / `sched_state` / `sched_ticks` / `sched_would` / `sched_moved` /
-  `sched_blocked` / `sched_load` / `sched_last` / `rt` 九个字段，便于写 A/B 记录脚本。
+  `sched_failed` / `sched_blocked` / `sched_load` / `sched_last` / `rt` 十个字段，便于写 A/B 记录脚本。
+  `sched_failed` 是亲和性设置失败次数，与 `sched_moved` 严格互斥。
 - 设置页新增「RT 实时调度」卡片：全局模式分段选择、每应用上限与时间片、应用列表
   （开关 / auto 或 names / 上限 / 当前 RT 线程数 / 内核时间片当前值），支持直接添加应用。
   新增 `GET /api/rt`、`POST /api/rt`、`POST /api/rt/app`，写入落到配置文件的 `@rt*` 指令行并触发热加载。
