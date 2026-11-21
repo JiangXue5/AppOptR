@@ -73,8 +73,9 @@ com.example.game {
 `tools/asopt2appopt.py` 把 AsoulOpt 的 `asopt.conf` 转成 AppOpt 规则，详见
 [docs/AsoulOpt_配置迁移.md](docs/AsoulOpt_配置迁移.md)。
 
-模块已附带 `applist.asoulopt.conf`（AsoulOpt 内置 324 个游戏的等价配置、9720 条规则），
-**不自动启用**；需要时在设置页把「规则配置文件」指向它，或复制覆盖 `applist.conf`。
+模块已附带 `applist.asoulopt.conf`（AsoulOpt 内置 **333** 个游戏、29 组线程规则，
+共 926 条），**不自动启用**；需要时在设置页把「规则配置文件」指向它，或复制覆盖
+`applist.conf`。包名与规则从 AsoulOpt Kana 的二进制逐组还原，核对方法见迁移文档第九节。
 加载与决策细节见 [CHANGELOG.md](CHANGELOG.md)；负载感知调度仅完成设计，见
 [docs/S7_负载感知调度策略设计.md](docs/S7_负载感知调度策略设计.md)。
 

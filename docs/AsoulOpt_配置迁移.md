@@ -40,7 +40,7 @@ python3 tools/asopt2appopt.py asopt.conf -o applist.conf
 # 只看解析结果，不生成
 python3 tools/asopt2appopt.py asopt.conf --list-only
 
-# 不读 asopt.conf，导出 AsoulOpt 内置的全部 324 个游戏（等价于它的白名单行为）
+# 不读 asopt.conf，导出 AsoulOpt 内置的全部 333 个游戏（逐组还原其线程规则）
 python3 tools/asopt2appopt.py --full -o applist.conf
 ```
 
@@ -138,13 +138,13 @@ EPERM / ESRCH 而不是静默忽略。
 转换后的配置可以直接用 AppOpt 加载，看启动日志：
 
 ```
-配置文件解析完成，共加载 9720 条规则
+配置文件解析完成，共加载 926 条规则
 未匹配线程: keep（保持原有亲和性）
 S7 动态分配: off（不采样，行为与静态规则一致）
 RT 调度: per_app（2 个应用启用），每应用上限 2，RR 时间片 3 ms
 ```
 
-`324 个游戏 × 30 条线程规则 = 9720` 条，解析在启动时一次完成，之后靠 mtime 判断
+`333 个游戏`按 29 个分组各写 1–4 条线程规则，合计 926 条，解析在启动时一次完成，之后靠 mtime 判断
 是否需要重载，运行期不重复解析。
 
 真机上还需要确认：`hp-core` / `p-core` / `e-core` 是否被正确识别（看
@@ -153,7 +153,7 @@ RT 调度: per_app（2 个应用启用），每应用上限 2，RR 时间片 3 m
 
 ## 七、随模块附带的现成配置
 
-`module/applist.asoulopt.conf` 是本工具 `--full` 的产物（324 个应用、9720 条线程
+`module/applist.asoulopt.conf` 是本工具 `--full` 的产物（333 个应用、926 条线程
 规则），随模块一起安装到 `/data/adb/modules/AppOpt/applist.asoulopt.conf`。
 
 **它不会自动生效**，避免升级模块时覆盖你自己写的规则。要启用二选一：
@@ -178,3 +178,74 @@ AsoulOpt 的 `rt=1` 是「给这个包的渲染线程套 SCHED_RR」。AppOpt �
 
 注意 RT 的生效前提：该应用的允许核心不超过 2 个（`auto` 只认这种线程），
 否则只登记不提升。
+
+## 九、内置表的逆向核对
+
+`tools/asoulopt_games.txt` 与 `tools/asoulopt_groups.json` 来自对 AsoulOpt 二进制
+的逆向，不是猜的。核对对象与结论如下。
+
+### 被核对的对象
+
+```
+文件    AsoulOpt（Module 里 /data/adb/naki/AsoulOpt 之外的 ldd 二进制）
+版本    Kana / versionCode 284
+大小    37208 字节，ELF64 aarch64 PIE，无 section header
+sha256  2ac898071119f31ee9080df4eebe2df86dbb67c7e8c4a5b405cbad6000766cf8
+```
+
+### 数据结构
+
+二进制把游戏表放在第二个 LOAD 段（文件偏移 `0x8150`，虚拟地址 `0xc150`）：
+
+- **包名**：8 字节指针数组，指向 `.rodata` 里的 C 字符串；
+- **线程规则**：紧邻的 `{ char *name; uint64_t count; }` 数组，`count` 取 1 或 2，
+  个别取 0（含义是「不处理」）；
+- 两者按「一组包名 + 该组规则」成组排列，整表共 **29 组**。
+
+`FUN_0010546c` 逐组构造内部链表：先按组读包名数组（`lVar15 != 0x558` 这类
+循环上限就是字节数），再读该组规则表或写入硬编码的单条规则。少数单包组不建
+数组，直接 `plStack_10148[1] = (long)"com.xxx"`；`com.netease.wotb` 等 4 个包则
+放在**栈上临时数组**里，只在文件里出现字符串、找不到指针引用——只看数据区会
+误判为死字符串。
+
+### 包名核对
+
+| 来源 | 数量 |
+|---|---|
+| 数据区指针数组（11 个块） | 316 |
+| 栈上临时数组 | 4 |
+| 代码内联的字符串常量 | 13 |
+| **合计（去重后）** | **333** |
+
+反向验证：把二进制里所有形似包名的可打印字符串取出，得 337 个；减去 4 个非包名
+（`libc.so`、`libdl.so`、`android.app.IActivityManager`、`android.app.IProcessObserver`）
+正好 333，与上表一致。
+
+### 规则核对
+
+29 组共 926 条生效规则（`count=0` 的已剔除）。典型分组：
+
+| 组 | 包数 | 规则 |
+|---|---|---|
+| 1 | 171 | TfLite 1、Thread- 1、UnityGfx 1、UnityMain 2 |
+| 25 | 33 | Thread- 2、__DoubleMain 0 |
+| 27 | 16 | GLThread 2 |
+| 7 | 10 | RenderThread 1、GameThread 2、Thread- 2 |
+| 9 | 11 | GameThread 1、RHIThread 2 |
+
+`com.digitalextremes.warframemobile` 那组的第 2 条规则指向字符串
+`/data/adb/naki/asopt.conf`（配置自身的路径），不可能是线程名，已按无效项丢弃，
+该包只保留 `Thread-` 一条。
+
+### 与 AsoulOpt 行为的关系
+
+线程名集合与分组是**逐字节还原**的；分配策略不是。AsoulOpt 在候选线程里按
+`schedstat` 挑最闲的放上大核，并受 `count` 限制数量；AppOpt 没有负载采样，
+只能把「该组列出的名字」静态映射到固定簇。所以本配置是「处理哪些线程」等价、
+「这些线程怎么分核」近似。
+
+重新生成：
+
+```
+python3 tools/asopt2appopt.py --full -o module/applist.asoulopt.conf
+```

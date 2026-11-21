@@ -1,0 +1,754 @@
+{
+ "source": "AsoulOpt Kana (versionCode 284)",
+ "groups": [
+  {
+   "id": 1,
+   "pkgs": [
+    "com.actgames.bbee",
+    "com.activision.callofduty.shooter",
+    "com.albiononline",
+    "com.AlfaBravo.Combat",
+    "com.and.games505.Terraria",
+    "com.axlebolt.standoff2",
+    "com.bairimeng.dmmdzz",
+    "com.bandainamcoent.idolmaster_gakuen",
+    "com.bandainamcoent.imas_millionlive_theaterdays",
+    "com.bandainamcoent.sao",
+    "com.bandainamcoent.shinycolorsprism",
+    "com.bilibili.heaven",
+    "com.bilibili.priconne",
+    "com.bilibili.star.bili",
+    "com.bilibili.warmsnow",
+    "com.biligamekr.aggp",
+    "com.bingkolo.kleins.cn",
+    "com.BlackSaltGames.DREDGE",
+    "com.blade.bd",
+    "com.bladetw.bd",
+    "com.blizzard.wtcg.hearthstone",
+    "com.bushiroad.d4dj",
+    "com.bushiroad.lovelive.schoolidolfestival2",
+    "com.CarXTech.highWay",
+    "com.ChillyRoom.DungeonShooter",
+    "com.crunchyroll.gv.shogunshowdown.game",
+    "com.crunchyroll.princessconnectredive",
+    "com.cytx.td",
+    "com.denachina.g13002010",
+    "com.denchi.vtubestudio",
+    "com.devsisters.ck",
+    "com.devsisters.cos",
+    "com.dfjz.moba",
+    "com.dgames.g15002002",
+    "com.dts.freefire",
+    "com.EtherGaming.PocketRogues",
+    "com.fantablade.icey",
+    "com.feimo.astralpartyjpn",
+    "com.garena.game.codm",
+    "com.garena.game.kgtw",
+    "com.garena.game.kgvn",
+    "com.gbits.funnyfighter.android.overseas",
+    "com.GlobalSoFunny.Sausage",
+    "com.gryphline.endfield.gp",
+    "com.gryphline.exastris.gp",
+    "com.guigugame.guigubahuang",
+    "com.guyou.deadstrike",
+    "com.halo.windf.hero",
+    "com.heavenburnsred",
+    "com.hermes.h1game",
+    "com.hermes.mk",
+    "com.herogame.gplay.punishing.grayraven.tw",
+    "com.hg.lbw",
+    "com.humo.yqqsqz.yw",
+    "com.hypergryph.arknights",
+    "com.hypergryph.endfield",
+    "com.hypergryph.exastris",
+    "com.ignm.raspberrymash.jp",
+    "com.ilongyuan.cytus2",
+    "com.ilongyuan.implosion",
+    "com.jumpw.mobile300",
+    "com.kiloo.subwaysurf.gw",
+    "com.kingnet.gundam",
+    "com.komoe.kmumamusumegp",
+    "com.kurogame.haru",
+    "com.leiting.daluandou",
+    "com.littleleogames.astreasixsidedoracles",
+    "com.longe.allstarhmt",
+    "com.madfingergames.legends",
+    "com.miHoYo.bh3",
+    "com.miHoYo.enterprise.NGHSoD",
+    "com.miHoYo.GenshinImpact",
+    "com.miHoYo.ys",
+    "com.miHoYo.Yuanshen",
+    "com.mindblocks.blocks",
+    "com.minidragon.idlefantasy",
+    "com.mobile.legends",
+    "com.modx.daluandou",
+    "com.morizero.milthm",
+    "com.netease.l22",
+    "com.neowizgames.game.browndust2",
+    "com.netease.allstar",
+    "com.netease.dunkcd",
+    "com.netease.ma84",
+    "com.netease.nshm",
+    "com.netease.nshmhmt",
+    "com.netease.yzs",
+    "com.nexon.bluearchive",
+    "com.nexon.mdnf",
+    "com.nexon.mod",
+    "com.nianticlabs.monsterhunter",
+    "com.nianticlabs.pokemongo",
+    "com.nianticproject.ingress",
+    "com.oninou.FAPI",
+    "com.PanikArcade.CloverPit",
+    "com.pi.czrxdfirst",
+    "com.pinkcore.tkfm",
+    "com.ProjectMoon.LimbusCompany",
+    "com.proximabeta.nikke",
+    "com.prpr.musedash",
+    "com.pwrd.p5x",
+    "com.pwrd.persona5x.laohu",
+    "com.r2games.myhero.bilibili",
+    "com.racoondigi.jqys",
+    "com.rawfury.kingdom2crowns",
+    "com.rayark.cytus2",
+    "com.rayark.implosion",
+    "com.riichicity.happywoods",
+    "com.riotgames.league.teamfighttactics",
+    "com.riotgames.league.wildrift",
+    "com.RoamingStar.BlueArchive",
+    "com.Roboatino.ShogunShowdown",
+    "com.savysoda.pss2.android",
+    "com.sega.ColorfulStage.en",
+    "com.sega.pjsekai",
+    "com.shangyoo.neon",
+    "com.ShinyShoe.MonsterTrain.mtap",
+    "com.Shooter.ModernWarfront",
+    "com.Shooter.ModernWarships",
+    "com.sofunny.Sausage",
+    "com.soulgamechst.majsoul",
+    "com.Sunborn.SnqxExilium",
+    "com.sy.dldlhsdj",
+    "com.TechTreeGames.TheTower",
+    "com.tencent.jkchess",
+    "com.tencent.KiHan",
+    "com.tencent.lolm",
+    "com.tencent.nikke",
+    "com.tencent.rmcn",
+    "com.tencent.tmgp.bh3",
+    "com.tencent.tmgp.cf",
+    "com.tencent.tmgp.cod",
+    "com.tencent.tmgp.dnf",
+    "com.tencent.tmgp.ffom",
+    "com.tencent.tmgp.kr.codm",
+    "com.tencent.tmgp.speedmobile",
+    "com.tencent.tmgp.WePop",
+    "com.tencent.tmgp.wuxia",
+    "com.tipsworks.android.pascalswager",
+    "com.tipsworks.pascalswager",
+    "com.xd.dxlzz.taptap",
+    "com.xd.rotaeno.googleplay",
+    "com.xd.rotaeno.tapcn",
+    "com.xd.terraria",
+    "com.xd.xdt",
+    "com.xjskp.tv.hnsc",
+    "com.xzy.styx",
+    "com.xzy.xgst",
+    "com.YiMoXuan.XYZJF",
+    "com.YoStarEN.Arknights",
+    "com.YoStarEN.MahjongSoul",
+    "com.YoStarEN.StellaSora",
+    "com.YostarJP.BlueArchive",
+    "com.YoStarJP.MajSoul",
+    "com.ZeroCastleGameStudio.StrikeBusterPrototype",
+    "com.ZeroCastleGameStudioINTL.StrikeBusterPrototype",
+    "com.zhanhuo.mw",
+    "com.ztgame.bob",
+    "com.ztgame.yyzy",
+    "com.zy.wqmt.cn",
+    "gplay.punishing.grayraven",
+    "jp.co.bandainamcoent.BNEI0242",
+    "jp.co.craftegg.band",
+    "jp.co.cygames.princessconnectredive",
+    "jp.co.cygames.ShadowverseWorldsBeyond",
+    "jp.konami.masterduel",
+    "me.mugzone.emiria",
+    "me.tigerhix.cytoid",
+    "Nekootan.kfkj",
+    "tw.sonet.allbw",
+    "tw.sonet.princessconnect"
+   ],
+   "rules": [
+    [
+     "TfLite",
+     1
+    ],
+    [
+     "Thread-",
+     1
+    ],
+    [
+     "UnityGfx",
+     1
+    ],
+    [
+     "UnityMain",
+     2
+    ]
+   ]
+  },
+  {
+   "id": 2,
+   "pkgs": [
+    "com.je.skgame"
+   ],
+   "rules": [
+    [
+     "UnityGfx",
+     1
+    ],
+    [
+     "UnityMain",
+     2
+    ],
+    [
+     "__DummyMain",
+     0
+    ]
+   ]
+  },
+  {
+   "id": 3,
+   "pkgs": [
+    "com.bilibili.azurlane",
+    "com.bilibili.fatego",
+    "com.Flanne.MinutesTillDawn.roguelike.shooting.gp",
+    "com.GameCoaster.ProtectDungeon",
+    "com.GentleManiac.HorizonWalker",
+    "com.hermes.j1game",
+    "com.HoYoverse.hkrpgoversea",
+    "com.HoYoverse.Nap",
+    "com.jacksparrow.jpmajiang",
+    "com.LanPiaoPiao.PlantsVsZombiesRH",
+    "com.levelinfinite.sgameGlobal",
+    "com.miHoYo.hkrpg",
+    "com.miHoYo.Nap",
+    "com.miHoYo.zenless",
+    "com.nanostudios.games.twenty.minutes",
+    "com.shenlan.m.reverse1999",
+    "com.tencent.tmgp.sgame",
+    "com.tencent.tmgp.sskgame",
+    "com.ubisoft.rainbowsixmobile.r6.fps.pvp.shooter",
+    "com.unity.mmd",
+    "com.yongshi.tenojo",
+    "com.zlongame.mhmnz"
+   ],
+   "rules": [
+    [
+     "UnityMain",
+     2
+    ]
+   ]
+  },
+  {
+   "id": 4,
+   "pkgs": [
+    "com.bhvr.deadbydaylight",
+    "com.blizzard.diablo.immortal",
+    "com.netease.tank",
+    "com.netease.ywzh",
+    "com.seasun.jx3",
+    "com.tencent.nba2kx",
+    "com.tencent.tmgp.gnyx",
+    "com.tencent.toaa",
+    "com.the10tons.dysmantle",
+    "com.vng.pubgmobile"
+   ],
+   "rules": [
+    [
+     "Thread-",
+     2
+    ]
+   ]
+  },
+  {
+   "id": 5,
+   "pkgs": [
+    "com.roblox.client"
+   ],
+   "rules": [
+    [
+     "FunctionMarshal",
+     2
+    ],
+    [
+     "RBX Worker",
+     2
+    ]
+   ]
+  },
+  {
+   "id": 6,
+   "pkgs": [
+    "com.idreamsky.klbqm"
+   ],
+   "rules": [
+    [
+     "RenderThread",
+     1
+    ],
+    [
+     "Thread-",
+     2
+    ]
+   ]
+  },
+  {
+   "id": 7,
+   "pkgs": [
+    "com.krafton.dndm",
+    "com.kurogame.mingchao",
+    "com.kurogame.wutheringwaves.global",
+    "com.rekoo.pubgm",
+    "com.pubg",
+    "com.tencent.ig",
+    "com.tencent.ngr",
+    "com.tencent.tmgp.codev",
+    "com.tencent.tmgp.nz",
+    "com.tencent.tmgp.pubgmhd"
+   ],
+   "rules": [
+    [
+     "RenderThread",
+     1
+    ],
+    [
+     "GameThread",
+     2
+    ],
+    [
+     "Thread-",
+     2
+    ]
+   ]
+  },
+  {
+   "id": 8,
+   "pkgs": [
+    "com.garena.game.df",
+    "com.proxima.dfm",
+    "com.tencent.tmgp.dfm"
+   ],
+   "rules": [
+    [
+     "GameThread",
+     1
+    ],
+    [
+     "RenderThread",
+     2
+    ]
+   ]
+  },
+  {
+   "id": 9,
+   "pkgs": [
+    "com.epicgames.fortnite",
+    "com.hottapkgs.hotta",
+    "com.infoldgames.infinitynikkien",
+    "com.kurogame.aki",
+    "com.MOBGames.PoppyMobileChap1",
+    "com.netease.dfjs",
+    "com.netease.race",
+    "com.papegames.infinitynikki",
+    "com.pwrd.hotta.laohu",
+    "com.pwrd.huanta",
+    "com.tencent.tmgp.dfjs"
+   ],
+   "rules": [
+    [
+     "GameThread",
+     1
+    ],
+    [
+     "RHIThread",
+     2
+    ]
+   ]
+  },
+  {
+   "id": 10,
+   "pkgs": [
+    "com.dragonli.projectsnow",
+    "com.garena.game.nfsm",
+    "com.hottagames.nte",
+    "com.hottagames.yh",
+    "com.lilithgames.solarland.android.cn",
+    "com.miraclegames.farlight84",
+    "com.netease.pes",
+    "com.nexon.kartdrift",
+    "com.pubg.newstate",
+    "com.seasun.snowbreak.google",
+    "com.tencent.hhw",
+    "com.tencent.letsgo",
+    "com.tencent.mf.uam",
+    "com.tencent.nfsonline",
+    "com.tencent.nrc",
+    "com.xd.TLglobal",
+    "com.xindong.torchlight",
+    "jp.konami.pesam"
+   ],
+   "rules": [
+    [
+     "RHIThread",
+     1
+    ],
+    [
+     "GameThread",
+     2
+    ]
+   ]
+  },
+  {
+   "id": 11,
+   "pkgs": [
+    "com.chucklefish.stardewvalley",
+    "com.leiting.wf",
+    "com.movtery.zalithlauncher",
+    "com.netease.x19",
+    "com.t2ksports.nba2k20and",
+    "com.tungsten.fcl",
+    "net.kdt.pojavlaunch"
+   ],
+   "rules": [
+    [
+     "RHIThread",
+     1
+    ],
+    [
+     "GameThread",
+     2
+    ]
+   ]
+  },
+  {
+   "id": 12,
+   "pkgs": [
+    "com.activision.callofduty.warzone"
+   ],
+   "rules": [
+    [
+     "WZM_Main",
+     2
+    ]
+   ]
+  },
+  {
+   "id": 13,
+   "pkgs": [
+    "com.shatteredpixel.shatteredpixeldungeon"
+   ],
+   "rules": [
+    [
+     "SHPD Render",
+     2
+    ]
+   ]
+  },
+  {
+   "id": 14,
+   "pkgs": [
+    "com.megacrit.sts2re"
+   ],
+   "rules": [
+    [
+     "VkThread",
+     2
+    ]
+   ]
+  },
+  {
+   "id": 15,
+   "pkgs": [
+    "com.bilibili.deadcells.mobile",
+    "com.playdigious.deadcells.mobile",
+    "com.valvesoftware.cswgsm",
+    "com.valvesoftware.source"
+   ],
+   "rules": [
+    [
+     "SDLThread",
+     2
+    ]
+   ]
+  },
+  {
+   "id": 16,
+   "pkgs": [
+    "com.mojang.minecraftpe"
+   ],
+   "rules": [
+    [
+     "Rendering Pool",
+     1
+    ],
+    [
+     "MINECRAFT MAIN",
+     2
+    ]
+   ]
+  },
+  {
+   "id": 17,
+   "pkgs": [
+    "xd.sce.promotion"
+   ],
+   "rules": [
+    [
+     "SCERender",
+     1
+    ],
+    [
+     "SCELogic",
+     2
+    ]
+   ]
+  },
+  {
+   "id": 18,
+   "pkgs": [
+    "sh.ppy.osulazer"
+   ],
+   "rules": [
+    [
+     "Update",
+     1
+    ],
+    [
+     "Draw",
+     2
+    ]
+   ]
+  },
+  {
+   "id": 19,
+   "pkgs": [
+    "com.miniworldgame.creata.vn",
+    "com.playmini.miniworld",
+    "minitech.miniworld"
+   ],
+   "rules": [
+    [
+     "MiniRenderThrea",
+     1
+    ],
+    [
+     "MiniRainbowMain",
+     2
+    ]
+   ]
+  },
+  {
+   "id": 20,
+   "pkgs": [
+    "com.supercell.clashroyale",
+    "com.tencent.tmgp.supercell.clash"
+   ],
+   "rules": [
+    [
+     "Thread-",
+     1
+    ],
+    [
+     "Mainloop",
+     2
+    ]
+   ]
+  },
+  {
+   "id": 21,
+   "pkgs": [
+    "com.supercell.moco"
+   ],
+   "rules": [
+    [
+     "Mainloop",
+     2
+    ]
+   ]
+  },
+  {
+   "id": 22,
+   "pkgs": [
+    "com.rockstargames.rdr"
+   ],
+   "rules": [
+    [
+     "Thread-",
+     1
+    ],
+    [
+     "Render T",
+     2
+    ]
+   ]
+  },
+  {
+   "id": 23,
+   "pkgs": [
+    "com.digitalextremes.warframemobile"
+   ],
+   "rules": [
+    [
+     "Thread-",
+     1
+    ]
+   ],
+   "note": "原始第2条指向配置路径，属无效项，已丢弃"
+  },
+  {
+   "id": 24,
+   "pkgs": [
+    "com.wg.wowslegends"
+   ],
+   "rules": [
+    [
+     "Draw Thread",
+     1
+    ],
+    [
+     "Update Thread",
+     1
+    ],
+    [
+     "GPU Submission",
+     2
+    ]
+   ]
+  },
+  {
+   "id": 25,
+   "pkgs": [
+    "com.aligames.kuang.kybc",
+    "com.gaijingames.wtm",
+    "com.gameloft.android.ANMP.GloftA9HM",
+    "com.netease.aceracer",
+    "com.netease.AVALON",
+    "com.netease.cfxf",
+    "com.netease.dwrg",
+    "com.netease.EVE",
+    "com.netease.eve.en",
+    "com.netease.g78na",
+    "com.netease.g93na",
+    "com.netease.h75na",
+    "com.netease.hyxd",
+    "com.netease.idv",
+    "com.netease.jddsaef",
+    "com.netease.ko",
+    "com.netease.lglr",
+    "com.netease.moba",
+    "com.netease.mrzh",
+    "com.netease.newspike",
+    "com.netease.onmyoji",
+    "com.netease.soulofhunter",
+    "com.netease.yhtj",
+    "com.netease.yyslscn",
+    "com.supercell.boombeach",
+    "com.tencent.tmgp.dwrg",
+    "com.tencent.tmgp.supercell.boombeach",
+    "com.tencent.tmgp.yys.zqb",
+    "com.netease.wyclx",
+    "org.flos.phira",
+    "supercell.brawlstars",
+    "supercell.clashofclans",
+    "supercell.squad"
+   ],
+   "rules": [
+    [
+     "Thread-",
+     2
+    ],
+    [
+     "__DoubleMain",
+     0
+    ]
+   ]
+  },
+  {
+   "id": 26,
+   "pkgs": [
+    "com.netease.party",
+    "com.netease.sky",
+    "com.tgc.sky.android"
+   ],
+   "rules": [
+    [
+     "MainThread",
+     2
+    ]
+   ]
+  },
+  {
+   "id": 27,
+   "pkgs": [
+    "age.of.civilizations2.jakowski.lukasz",
+    "ahf.dummynation",
+    "com.bandainamcogames.dbzdokkanww",
+    "com.bf.sgs.hdexp.bd",
+    "com.bscotch.crashlands2",
+    "com.cnvcs.xiangqi",
+    "com.ea.game.pvz2_row",
+    "com.ea.games.r3",
+    "com.lilithgames.hgame.cn",
+    "com.netease.tj",
+    "com.netease.tom",
+    "com.pauloondra.zerostressking",
+    "com.trampolinetales.lbal",
+    "com.yinhan.hunter",
+    "moe.low.arc",
+    "org.maxbytes.lfs"
+   ],
+   "rules": [
+    [
+     "GLThread",
+     2
+    ]
+   ]
+  },
+  {
+   "id": 28,
+   "pkgs": [
+    "com.netease.wotb",
+    "net.wargaming.wot.blitz"
+   ],
+   "rules": [
+    [
+     "DAVA::RhiThread",
+     1
+    ],
+    [
+     "DAVA Engine Mai",
+     2
+    ]
+   ]
+  },
+  {
+   "id": 29,
+   "pkgs": [
+    "brownmonster.app.game.rushrally3",
+    "com.h73.jhqyna",
+    "com.netease.h73hmt",
+    "com.netease.qrsj",
+    "com.tencent.tmgp.djsy"
+   ],
+   "rules": [
+    [
+     "MainThread",
+     1
+    ],
+    [
+     "Thread-",
+     2
+    ]
+   ]
+  }
+ ]
+}

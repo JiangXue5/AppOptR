@@ -19,6 +19,7 @@ asopt.conf 的格式（`/data/adb/naki/asopt.conf`）：
 """
 
 import argparse
+import json
 import os
 import sys
 
@@ -163,6 +164,121 @@ def render_app(pkg, mode, rt, out):
     return soft
 
 
+# ---- 内置分组（--full）：按 AsoulOpt 二进制里的 29 个分组逐组还原 ----
+
+GROUP_HP = {
+    "UnityMain",
+    "GameThread",
+    "__DummyMain",
+    "__DoubleMain",
+    "MiniRainbowMain",
+    "Mainloop",
+    "MINECRAFT MAIN",
+    "DAVA Engine Mai",
+    "MainThread",
+    "WZM_Main",
+    "SCELogic",
+    "Update",
+}
+GROUP_P = {
+    "RenderThread",
+    "UnityGfx",
+    "RHIThread",
+    "SCERender",
+    "SHPD Render",
+    "MiniRenderThrea",
+    "Render T",
+    "Draw Thread",
+    "DAVA::RhiThread",
+    "Rendering Pool",
+    "VkThread",
+    "SDLThread",
+    "GLThread",
+    "Draw",
+    "GPU Submission",
+}
+GROUP_E = {"Thread-", "TfLite", "FunctionMarshal", "RBX Worker", "Update Thread"}
+# 原始表里被内核 comm 截断或以「-」结尾的名字，匹配时需要前缀
+GROUP_WILDCARD = {"Thread-", "Render T", "MiniRenderThrea", "DAVA Engine Mai"}
+GROUP_SPEC = {"hp": "hp-core", "p": "p-core,hp-core", "e": "e-core"}
+
+
+def group_class(name):
+    base = name.rstrip("*")
+    if base in GROUP_HP:
+        return "hp"
+    if base in GROUP_P:
+        return "p"
+    if base in GROUP_E:
+        return "e"
+    # 名单外的新线程按工作线程处理，宁可放小核也不误升大核
+    return "e"
+
+
+def render_group_app(pkg, rules, out):
+    """按该组实际列出的线程名生成规则块，返回是否写出了内容"""
+    body = []
+    for name, cnt in rules:
+        if cnt == 0:  # 原始表里 count=0 表示不处理
+            continue
+        spec = GROUP_SPEC[group_class(name)]
+        nm = name + "*" if name in GROUP_WILDCARD else name
+        body.append(f"\t{nm}={spec}")
+    if not body:
+        return False
+    out.append(f"# {pkg}")
+    out.append(f"{pkg} {{")
+    out.extend(body)
+    out.append("}")
+    out.append("")
+    return True
+
+
+HEADER_GROUP = """\
+# ============================================================
+# AsoulOpt 内置游戏表（{total} 个应用 / {groups} 组规则）
+#
+# 生成自 AsoulOpt Kana（versionCode 284）的内置结构：二进制里是 29 个
+# 「包名数组 + 线程规则」分组。本文件逐组还原，每个应用只写它所在组
+# 实际列出的线程名，而不是对全部应用套同一份 30 条名单。
+#
+# 簇映射：
+#   主线程类      → hp-core
+#   图形/渲染类   → p-core,hp-core
+#   其余工作线程  → e-core
+#   原始表里 count=0 的条目表示不处理，已跳过
+#
+# 与 AsoulOpt 的差异：原始实现按 schedstat 在候选线程里挑最闲的上大核，
+# 并按 count 限制数量；AppOpt 只做静态亲和，没有负载挑选。所以这里是
+# 「线程集合一致、分配策略近似」，不是逐字节等价。
+# ============================================================
+
+@unmatched=keep
+@sched=off
+@rt=off
+"""
+
+
+def emit_groups(path, output):
+    """按内置分组逐组生成配置"""
+    with open(path, encoding="utf-8") as f:
+        groups = json.load(f)["groups"]
+    total = sum(len(g["pkgs"]) for g in groups)
+    out = [HEADER_GROUP.format(total=total, groups=len(groups))]
+    written = 0
+    for g in groups:
+        for pkg in g["pkgs"]:
+            if render_group_app(pkg, g["rules"], out):
+                written += 1
+    text = "\n".join(out).rstrip() + "\n"
+    if output:
+        with open(output, "w", encoding="utf-8") as f:
+            f.write(text)
+        print(f"已写入 {output}：{written} 个应用，{len(groups)} 组规则（逐组还原）")
+    else:
+        sys.stdout.write(text)
+
+
 def main():
     here = os.path.dirname(os.path.abspath(__file__))
     ap = argparse.ArgumentParser(description="AsoulOpt asopt.conf → AppOpt applist.conf")
@@ -177,6 +293,11 @@ def main():
     args = ap.parse_args()
 
     if args.full:
+        groups_file = os.path.join(here, "asoulopt_groups.json")
+        if os.path.exists(groups_file):
+            emit_groups(groups_file, args.output)
+            return
+        # 兼容：没有分组数据时退回「清单 + 通用 30 条名单」
         games_file = os.path.join(here, "asoulopt_games.txt")
         if not os.path.exists(games_file):
             sys.exit(f"找不到内置清单 {games_file}，请改用位置参数指定 asopt.conf")
