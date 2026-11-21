@@ -1000,6 +1000,65 @@ mod tests {
         assert!(!st.threads.contains_key(&1001));
     }
 
+    /// 起一个真实线程并命名，用于验证「决策没有落到系统调用上」
+    fn spawn_named(name: &str) -> (std::thread::JoinHandle<()>, i32) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let name = name.to_string();
+        let handle = std::thread::spawn(move || {
+            let c_name = std::ffi::CString::new(name).unwrap();
+            unsafe {
+                libc::pthread_setname_np(libc::pthread_self(), c_name.as_ptr());
+            }
+            let tid = unsafe { libc::syscall(libc::SYS_gettid) as i32 };
+            tx.send(tid).unwrap();
+            std::thread::park();
+        });
+        let tid = rx.recv().expect("线程未启动");
+        (handle, tid)
+    }
+
+    /// 端到端：影子模式跑满 12 轮后，真实线程的亲和性必须一字未改
+    #[test]
+    fn shadow_never_touches_real_affinity() {
+        let (handle, tid) = spawn_named("Thread-7");
+        let t = topo();
+        let mut allowed = CpuSet::new();
+        allowed.or(&t.p_core);
+        allowed.or(&t.hp_core);
+        assert_eq!(
+            crate::apply_affinity::affinity_set(tid, &allowed, "", &t),
+            AffinityOutcome::Set
+        );
+
+        let cfg = cfg_with("shadow_real", "com.test.game=p-core,hp-core\n");
+        let mut cache = ProcCache::new();
+        cache.tasks.insert(
+            tid,
+            crate::cache::TaskEntry {
+                pid: 100,
+                pkg: "com.test.game".to_string(),
+                cpus: allowed,
+                cpuset_dir: String::new(),
+                is_thread_rule: false,
+                comm: "Thread-7".to_string(),
+            },
+        );
+        let mut st = state_for(&cache, SchedMode::Shadow);
+        for _ in 0..12 {
+            assert!(
+                st.tick_at(&cfg, &cache, [-1, 600, 100], Instant::now())
+                    .is_empty()
+            );
+        }
+        // 判定确实成型（否则这条断言没有意义）
+        assert_eq!(st.would, 1);
+        // 但内核里的亲和性必须还是 p-core ∪ hp-core
+        assert_eq!(CpuSet::get_affinity(tid).expect("读取亲和性失败"), allowed);
+
+        handle.thread().unpark();
+        handle.join().unwrap();
+    }
+
     /// 超过 MAX_ACTIVE_PIDS 时所有 pid 都必须轮到
     #[test]
     fn active_pid_rotation_covers_all() {

@@ -936,6 +936,57 @@ mod tests {
         assert!(s.own.is_empty(), "失效记录必须先丢弃，不能继续算作已提升");
     }
 
+    /// 起一个真实线程并命名。RT 的成败取决于进程权限，用例按实际结果分支断言，
+    /// 两种环境下都必须成立
+    fn spawn_named(name: &str) -> (std::thread::JoinHandle<()>, i32) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let name = name.to_string();
+        let handle = std::thread::spawn(move || {
+            let c_name = std::ffi::CString::new(name).unwrap();
+            unsafe {
+                libc::pthread_setname_np(libc::pthread_self(), c_name.as_ptr());
+            }
+            let tid = unsafe { libc::syscall(libc::SYS_gettid) as i32 };
+            tx.send(tid).unwrap();
+            std::thread::park();
+        });
+        let tid = rx.recv().expect("线程未启动");
+        (handle, tid)
+    }
+
+    /// 真实线程走一遍：成功则进表并可回滚，失败则不留记录、不改策略
+    #[test]
+    fn promotion_outcome_matches_kernel_state() {
+        let (handle, tid) = spawn_named("RenderThread");
+        let before = unsafe { libc::sched_getscheduler(tid) };
+        let cfg = cfg_of(
+            RtConfig {
+                scope: RtScope::Global,
+                ..RtConfig::default()
+            },
+            &["com.a"],
+        );
+        let target = cpus(2);
+        let mut s = state();
+        let ok = s.note(tid, 100, "com.a", "RenderThread", &target, &cfg);
+
+        if ok {
+            // 有 CAP_SYS_NICE：必须进表，且能被单独回滚
+            assert!(s.own.contains_key(&tid));
+            assert_eq!(unsafe { libc::sched_getscheduler(tid) }, libc::SCHED_RR);
+            s.demote_all();
+            assert!(!s.own.contains_key(&tid));
+            assert_eq!(unsafe { libc::sched_getscheduler(tid) }, libc::SCHED_OTHER);
+        } else {
+            // EPERM：不能留记录，线程策略保持原样
+            assert!(s.own.is_empty(), "失败的提升不能留下所有权记录");
+            assert_eq!(unsafe { libc::sched_getscheduler(tid) }, before);
+        }
+
+        handle.thread().unpark();
+        handle.join().unwrap();
+    }
+
     /// 只有内核值仍是自己写的才恢复，外部改过就保留现值
     #[test]
     fn timeslice_is_only_restored_when_still_ours() {
