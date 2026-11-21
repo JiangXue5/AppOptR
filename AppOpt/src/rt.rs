@@ -131,8 +131,17 @@ impl RtState {
         if !self.enabled {
             return false;
         }
+
+        // TID 复用：记录里的 pid 与当前线程不符，说明旧线程已经退出，
+        // 这条记录与新线程无关。必须排在策略检查和任何降级之前——
+        // 否则复用了该 tid 的新线程会顶着别人的记录被 drop_threads 降级
+        if self.own.get(&tid).is_some_and(|a| a.pid != pid) {
+            self.own.remove(&tid);
+        }
+
         let Some((mode, max)) = cfg.rt.policy(pkg) else {
-            // 新配置里这个包已无 RT 资格：只收回自己提升过的线程
+            // 新配置里这个包已无 RT 资格：只收回自己提升过的线程。
+            // 走到这里 own 里若还有该 tid，pid 已核对一致，确实属于当前线程
             if self.own.contains_key(&tid) {
                 self.drop_threads(&[tid]);
             }
@@ -143,11 +152,6 @@ impl RtState {
         // 1) 记录里的线程是否还在按 RT 运行（退出后 tid 复用 / 外部改回 CFS）
         // 2) 还没接管的线程是否已被系统或其他模块设成 RR/FIFO
         let realtime = is_realtime(tid);
-        // pid 对不上说明 tid 已被别的进程复用：旧记录与新线程无关，
-        // 直接丢弃。否则新线程会被当成「已提升」，关 RT 时被误降级
-        if self.own.get(&tid).is_some_and(|a| a.pid != pid) {
-            self.own.remove(&tid);
-        }
         let mut owned = self.own.contains_key(&tid);
         if owned && !realtime {
             // 记录已经失效。直接丢弃，避免把复用了该 tid 的新线程当成自己提升过的
@@ -1121,6 +1125,33 @@ mod tests {
             // 熔断：闸门关闭且残留清零
             assert!(s.own.is_empty(), "熔断必须回滚已提升的线程");
         }
+    }
+
+    /// TID 复用：旧记录 pid 与新线程不符时，必须在任何降级之前丢弃。
+    /// 旧代码先查策略，无策略时直接 drop_threads，会把复用该 tid 的新线程降级。
+    /// 用真实线程（CFS → CFS 不需要 CAP_SYS_NICE）让「是否降级」可以从 demoted 观察
+    #[test]
+    fn note_drops_stale_record_before_policy_check() {
+        let (handle, tid) = spawn_named("Worker");
+        let mut s = state();
+        // 旧记录：同一个 tid，pid 100，所属包本来有 RT 资格
+        adopt(&mut s, tid, 100, "com.old", "RenderThread", cpus(2));
+        // 新线程：tid 被复用，pid 变成 200，所属包没有任何 RT 策略
+        let cfg = cfg_of(RtConfig::default(), &[]);
+
+        assert!(!s.note(tid, 200, "com.new", "Worker", &cpus(2), &cfg));
+
+        assert!(!s.own.contains_key(&tid), "旧记录必须被清除");
+        assert!(
+            !s.own.values().any(|a| a.pid == 100),
+            "不能留下 pid 100 的旧所有权记录"
+        );
+        assert_eq!(s.demoted, 0, "pid 不符的旧记录不能触发降级");
+        // 新线程没有策略，不能被提升，也不该被改成别的调度策略
+        assert_eq!(unsafe { libc::sched_getscheduler(tid) }, libc::SCHED_OTHER);
+
+        handle.thread().unpark();
+        handle.join().unwrap();
     }
 
     /// 只有内核值仍是自己写的才恢复，外部改过就保留现值
