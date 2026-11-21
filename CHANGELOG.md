@@ -23,6 +23,29 @@
 - `com.digitalextremes.warframemobile` 那组第 2 条指向 `/data/adb/naki/asopt.conf`
   自身路径，不可能是线程名，按无效项丢弃。
 
+### Web 面板
+
+此前 `@sched`、`@rt.max`、`@rt.timeslice`、`@unmatched` 只能在配置文件里手写，
+`@rt=global` 有后端但没有按钮，`@rt.app` 的 `names:` 与逐应用上限也没有界面。
+
+- 设置页新增「S7 动态分配」卡片：关闭 / 观察 / 开启三档，实时显示采样轮数、
+  本可迁移、已迁移、失败、受限与三簇负载。单核心层机型选「开启」会明确提示
+  「不会生效」，不再让人误以为已经在优化。
+- RT 卡片补「全部应用」档，与「关闭 / 按规则开启」并列。
+- 新增可折叠的「进阶配置」抽屉：
+  - 每应用 RT 线程上限（`@rt.max`，1–8）
+  - RR 时间片（`@rt.timeslice`，1–100 ms）
+  - 未匹配线程行为（`@unmatched=keep|all`）
+  - 逐应用 RT 条目列表：显示包名、匹配方式（`auto` 或完整的 `names:...`）、
+    该应用上限，可直接开关或删除
+- 新增接口 `POST /api/sched`（`{"mode":"off|shadow|on"}`）与
+  `POST /api/adv`（`rt_max` / `rt_timeslice` / `unmatched`，三项均可选）。
+  进阶三项一次写盘，不产生「只改了一半」的中间状态。
+- `POST /api/rt/app` 支持 `{"delete":true}` 删除条目；删掉最后一个启用条目时
+  `@rt` 自动收回 `off`，与规则页一键开关的收尾一致。`global` 不因删条目降级。
+- `/api/config` 的 `sched_mode` 改为读配置真值而非运行快照，切档后按钮高亮
+  不再慢一拍。
+
 ### 已知差异
 
 - 线程名集合与分组逐字节还原；分配策略仍是静态近似——AsoulOpt 按 schedstat

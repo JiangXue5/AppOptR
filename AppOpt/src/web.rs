@@ -14,15 +14,16 @@ use crate::apply_affinity::{read_cmdline, reset_cpuset_dir_cache, task_tids};
 use crate::cache::ProcCache;
 use crate::config::{
     config_reload_now, spec_like,
-    CHECK_INTERVAL, CONFIG_FILE, CURRENT_CONFIG, FORCE_RELOAD, PARSE_FAILS,
+    CHECK_INTERVAL, CONFIG_FILE, CURRENT_CONFIG, FORCE_RELOAD, PARSE_FAILS, RT_MAX_LIMIT,
+    RT_TIMESLICE_LIMIT,
 };
 use crate::cpuset::{base_cpuset, create_cpuset_dir, parse_cpu_spec, CpuSet, CpuTopology, DEFAULT_CPUSET_NAME};
 use crate::ebpf_mode::ebpf_probe;
 use crate::config::{RtMatch, RtScope};
 use crate::rt;
 use crate::rule_edit::{
-    rt_app_set, rt_configure, rt_toggle, rule_delete, rule_delete_pkg, rule_rename, rule_upsert,
-    RuleEdit,
+    adv_configure, rt_app_set, rt_configure, rt_toggle, rule_delete, rule_delete_pkg, rule_rename,
+    rule_upsert, sched_set, RuleEdit,
 };
 use crate::sched::SCHED_SNAPSHOT;
 use crate::{lock_ignore_poison, EBPF_GAVE_UP, MAX_PKG_LEN, MAX_THREAD_LEN};
@@ -288,6 +289,8 @@ fn dispatch(out: &mut TcpStream, req: &Request) {
         ("POST", "/api/rt") => rt_api(req),
         ("POST", "/api/rt/app") => rt_app_api(req),
         ("POST", "/api/rt/toggle") => rt_toggle_api(req),
+        ("POST", "/api/sched") => sched_api(req),
+        ("POST", "/api/adv") => adv_api(req),
         ("POST", "/api/suggest") => suggest_api(req),
         _ => err_json(404, "not found"),
     };
@@ -595,12 +598,19 @@ fn config_json() -> String {
     let cpuset_enabled = cfg.as_ref().is_some_and(|c| c.topo.cpuset_enabled);
     let unmatched = if cfg.as_ref().is_some_and(|c| c.unmatched_all) { "all" } else { "keep" };
     let scope = cfg.as_ref().map(|c| c.sched_scope).unwrap_or_default();
+    // 档位取配置真值而不是运行快照：快照由主循环低频刷新，
+    // 刚切档时读到的还是旧值，界面高亮会慢一拍
+    let sched_mode = cfg.as_ref().map(|c| c.sched as u8).unwrap_or(0);
     let rules_total = cfg.as_ref().map(|c| c.rules.len()).unwrap_or(0);
     let rt = cfg
         .as_ref()
         .map(|c| c.rt.label())
         .unwrap_or_else(|| "off".to_string());
-    let (s_mode, s_state, s_ticks, s_would, s_moved, s_failed, s_blocked, s_load, s_last) =
+    let (rt_max, rt_ts) = cfg
+        .as_ref()
+        .map(|c| (c.rt.max_per_app, c.rt.timeslice_ms))
+        .unwrap_or((crate::config::RT_DEFAULT_MAX, crate::config::RT_DEFAULT_TIMESLICE));
+    let (_s_mode, s_state, s_ticks, s_would, s_moved, s_failed, s_blocked, s_load, s_last) =
         match lock_ignore_poison(&SCHED_SNAPSHOT).clone() {
             Some(s) => (
                 s.mode,
@@ -629,7 +639,9 @@ fn config_json() -> String {
         "cross_pkgs": scope.pkgs,
         "rules_total": rules_total,
         "rt": rt,
-        "sched_mode": s_mode,
+        "rt_max": rt_max,
+        "rt_timeslice": rt_ts,
+        "sched_mode": sched_mode,
         "sched_state": s_state,
         "sched_ticks": s_ticks,
         "sched_would": s_would,
@@ -758,7 +770,10 @@ fn rt_app_api(req: &Request) -> (u16, String) {
     // 因此「关闭」会写成 `off <原模式> <原上限>`，再打开不必重填
     let enabled = v["enabled"].as_bool().unwrap_or(true);
     let has_mode = v["mode"].is_string();
-    let spec = if !enabled && !has_mode {
+    let spec = if v["delete"].as_bool().unwrap_or(false) {
+        // 空 spec 即删除条目，与 rt_app_set 的约定一致
+        String::new()
+    } else if !enabled && !has_mode {
         "off".to_string()
     } else {
         let part = match v["mode"].as_str().unwrap_or("auto") {
@@ -845,6 +860,80 @@ fn rt_toggle_api(req: &Request) -> (u16, String) {
                 200,
                 json!({ "ok": true, "pkg": pkg, "enabled": enabled }).to_string(),
             )
+        }
+        RuleEdit::Malformed => err_json(409, "配置文件存在未闭合块，请修复后重试"),
+        _ => err_json(500, "配置文件写入失败"),
+    }
+}
+
+/// S7 三档开关，只写 `@sched=`，不牵动其它键
+fn sched_api(req: &Request) -> (u16, String) {
+    let Ok(v) = serde_json::from_slice::<Value>(&req.body) else {
+        return err_json(400, "请求体不是合法 JSON");
+    };
+    let Some(mode) = v["mode"].as_str() else {
+        return err_json(400, "缺少 mode 字段");
+    };
+    if !matches!(mode, "off" | "shadow" | "on") {
+        return err_json(400, "无效的 S7 模式");
+    }
+
+    let file = lock_ignore_poison(&CONFIG_FILE).clone();
+    match sched_set(&file, mode) {
+        RuleEdit::Ok => {
+            config_reload_now();
+            // 单核心层机型开 on 不会生效。写盘照做，但把结论回传，
+            // 免得用户以为已经在优化，实际一直在走「不适用」分支
+            let levels = current_cfg().map(|c| c.sched_scope.levels).unwrap_or(0);
+            let inactive = mode == "on" && levels < 2;
+            (
+                200,
+                json!({ "ok": true, "levels": levels, "inactive": inactive }).to_string(),
+            )
+        }
+        RuleEdit::Malformed => err_json(409, "配置文件存在未闭合块，请修复后重试"),
+        _ => err_json(500, "配置文件写入失败"),
+    }
+}
+
+/// 进阶参数：`@unmatched`、`@rt.max`、`@rt.timeslice`。三项都可选，
+/// 但不带的项保持原值不动，一项都不带直接拒绝，避免空写一次文件
+fn adv_api(req: &Request) -> (u16, String) {
+    let Ok(v) = serde_json::from_slice::<Value>(&req.body) else {
+        return err_json(400, "请求体不是合法 JSON");
+    };
+    let unmatched = match v["unmatched"].as_str() {
+        Some("keep") => Some("keep"),
+        Some("all") => Some("all"),
+        Some(_) => return err_json(400, "unmatched 只能是 keep 或 all"),
+        None => None,
+    };
+    let rt_max = match v["rt_max"].as_u64() {
+        Some(n) if (1..=RT_MAX_LIMIT as u64).contains(&n) => Some(n as u8),
+        Some(_) => {
+            return err_json(400, &format!("每应用上限需在 1-{} 之间", RT_MAX_LIMIT));
+        }
+        None => None,
+    };
+    let rt_ts = match v["rt_timeslice"].as_u64() {
+        Some(n) if (1..=RT_TIMESLICE_LIMIT as u64).contains(&n) => Some(n as u32),
+        Some(_) => {
+            return err_json(
+                400,
+                &format!("RR 时间片需在 1-{} ms 之间", RT_TIMESLICE_LIMIT),
+            );
+        }
+        None => None,
+    };
+    if unmatched.is_none() && rt_max.is_none() && rt_ts.is_none() {
+        return err_json(400, "没有要修改的项");
+    }
+
+    let file = lock_ignore_poison(&CONFIG_FILE).clone();
+    match adv_configure(&file, unmatched, rt_max, rt_ts) {
+        RuleEdit::Ok => {
+            config_reload_now();
+            (200, json!({ "ok": true }).to_string())
         }
         RuleEdit::Malformed => err_json(409, "配置文件存在未闭合块，请修复后重试"),
         _ => err_json(500, "配置文件写入失败"),

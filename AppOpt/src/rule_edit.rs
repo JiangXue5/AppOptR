@@ -543,6 +543,38 @@ pub fn rt_configure(path: &str, mode: &str, max: Option<u8>, timeslice: Option<u
     file_write(path, &lines)
 }
 
+/// 写 `@sched=off|shadow|on`。S7 的三档开关，不写时保持 off。
+/// 与 `@rt` 不同，这里没有分应用条目，切换即整机生效
+pub fn sched_set(path: &str, mode: &str) -> RuleEdit {
+    let _guard = crate::lock_ignore_poison(&WRITE_LOCK);
+    let mut lines = read_lines(path);
+    directive_put(&mut lines, "sched", Some(mode));
+    file_write(path, &lines)
+}
+
+/// 进阶参数一次写盘：`@unmatched`、`@rt.max`、`@rt.timeslice`。
+/// `None` 表示该键不动。三者互不依赖，但分三次写会留下中间态，
+/// 配置线程可能读到只改了一半的文件
+pub fn adv_configure(
+    path: &str,
+    unmatched: Option<&str>,
+    rt_max: Option<u8>,
+    rt_timeslice: Option<u32>,
+) -> RuleEdit {
+    let _guard = crate::lock_ignore_poison(&WRITE_LOCK);
+    let mut lines = read_lines(path);
+    if let Some(u) = unmatched {
+        directive_put(&mut lines, "unmatched", Some(u));
+    }
+    if let Some(m) = rt_max {
+        directive_put(&mut lines, "rt.max", Some(&m.to_string()));
+    }
+    if let Some(t) = rt_timeslice {
+        directive_put(&mut lines, "rt.timeslice", Some(&t.to_string()));
+    }
+    file_write(path, &lines)
+}
+
 fn read_lines(path: &str) -> Vec<String> {
     fs::read_to_string(path)
         .unwrap_or_default()
@@ -581,7 +613,25 @@ pub fn rt_app_set(path: &str, pkg: &str, spec: &str) -> RuleEdit {
     if !found && let Some(l) = new_line {
         insert_directive(&mut lines, l);
     }
+    // 删掉最后一个启用条目后把 @rt 收回 off，与 rt_toggle 的收尾一致。
+    // global 不动：那是显式声明的全局策略，不因删条目降级
+    if spec.is_empty() && !any_rt_enabled(&lines) {
+        let scope = lines.iter().find_map(|l| match directive_parts(l) {
+            Some(("rt", v)) => Some(v.trim().to_string()),
+            _ => None,
+        });
+        if scope.as_deref() == Some("per_app") {
+            directive_put(&mut lines, "rt", Some("off"));
+        }
+    }
     file_write(path, &lines)
+}
+
+/// 是否还存在启用的 `@rt.app=` 条目。省略状态时与解析一致按 on 处理
+fn any_rt_enabled(lines: &[String]) -> bool {
+    lines
+        .iter()
+        .any(|l| matches!(directive_parts(l), Some(("rt.app", _))) && rt_app_state(l) == Some(true))
 }
 
 /// `@rt.app=<包名> on|off ...` 的开关状态。省略状态时按 on 处理，
@@ -723,6 +773,40 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// 删掉最后一个启用条目后 @rt 收回 off，避免空转改写内核时间片；
+    /// global 是显式策略，不能因为删条目被降级
+    #[test]
+    fn deleting_last_rt_app_retracts_scope() {
+        let dir = format!("/tmp/appopt_rt_del_{}", std::process::id());
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let conf = format!("{}/applist.conf", dir);
+
+        fs::write(&conf, "@rt=per_app\n@rt.app=com.a on auto\ncom.a=0-1\n").unwrap();
+        assert!(matches!(rt_app_set(&conf, "com.a", ""), RuleEdit::Ok));
+        let s = fs::read_to_string(&conf).unwrap();
+        assert!(!s.contains("@rt.app="));
+        assert!(s.contains("@rt=off"), "最后一个条目删除后应收敛为 off");
+
+        // 还有别的启用条目时不动 @rt
+        fs::write(
+            &conf,
+            "@rt=per_app\n@rt.app=com.a on auto\n@rt.app=com.b on auto\n",
+        )
+        .unwrap();
+        assert!(matches!(rt_app_set(&conf, "com.a", ""), RuleEdit::Ok));
+        let s = fs::read_to_string(&conf).unwrap();
+        assert!(s.contains("@rt=per_app"));
+
+        // global 不降级
+        fs::write(&conf, "@rt=global\n@rt.app=com.a on auto\n").unwrap();
+        assert!(matches!(rt_app_set(&conf, "com.a", ""), RuleEdit::Ok));
+        let s = fs::read_to_string(&conf).unwrap();
+        assert!(s.contains("@rt=global"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn rt_toggle_opens_with_defaults_and_restores_scope() {
         let dir = format!("/tmp/appopt_rt_toggle_{}", std::process::id());
@@ -787,6 +871,78 @@ mod tests {
                 .count(),
             1
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// @sched 是单值指令：重复写只留一条，已有注释要跟着走
+    #[test]
+    fn sched_set_rewrites_single_line() {
+        let dir = format!("/tmp/appopt_sched_{}", std::process::id());
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let conf = format!("{}/applist.conf", dir);
+        fs::write(&conf, "@unmatched=keep\ncom.a=0-1\n").unwrap();
+
+        assert!(matches!(sched_set(&conf, "shadow"), RuleEdit::Ok));
+        let s = fs::read_to_string(&conf).unwrap();
+        assert!(s.contains("@sched=shadow"));
+        // 新键插在指令区，不跑到规则后面
+        assert!(s.find("@sched=shadow").unwrap() < s.find("com.a=0-1").unwrap());
+
+        // 改档不新增第二行
+        assert!(matches!(sched_set(&conf, "on"), RuleEdit::Ok));
+        let s = fs::read_to_string(&conf).unwrap();
+        assert_eq!(s.matches("@sched=").count(), 1);
+        assert!(s.contains("@sched=on"));
+
+        // 行尾注释保留
+        fs::write(&conf, "@sched=on  # 手写备注\ncom.a=0-1\n").unwrap();
+        assert!(matches!(sched_set(&conf, "off"), RuleEdit::Ok));
+        let s = fs::read_to_string(&conf).unwrap();
+        assert!(s.contains("@sched=off  # 手写备注"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 进阶三项一次写盘：只动传入的键，其余保持不变
+    #[test]
+    fn adv_configure_only_touches_given_keys() {
+        let dir = format!("/tmp/appopt_adv_{}", std::process::id());
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let conf = format!("{}/applist.conf", dir);
+        fs::write(&conf, "@rt=per_app\ncom.a=0-1\n").unwrap();
+
+        // 只改 unmatched：不应凭空写出 rt.max / rt.timeslice
+        assert!(matches!(
+            adv_configure(&conf, Some("all"), None, None),
+            RuleEdit::Ok
+        ));
+        let s = fs::read_to_string(&conf).unwrap();
+        assert!(s.contains("@unmatched=all"));
+        assert!(!s.contains("@rt.max"));
+        assert!(!s.contains("@rt.timeslice"));
+        assert!(s.contains("@rt=per_app"));
+
+        // 三项同写：一次落盘，各一条
+        assert!(matches!(
+            adv_configure(&conf, Some("keep"), Some(4), Some(6)),
+            RuleEdit::Ok
+        ));
+        let s = fs::read_to_string(&conf).unwrap();
+        assert!(s.contains("@unmatched=keep"));
+        assert!(s.contains("@rt.max=4"));
+        assert!(s.contains("@rt.timeslice=6"));
+        assert_eq!(s.matches("@rt.max=").count(), 1);
+
+        // 空参数不动文件
+        let before = fs::read_to_string(&conf).unwrap();
+        assert!(matches!(
+            adv_configure(&conf, None, None, None),
+            RuleEdit::Ok
+        ));
+        assert_eq!(before, fs::read_to_string(&conf).unwrap());
 
         let _ = fs::remove_dir_all(&dir);
     }
