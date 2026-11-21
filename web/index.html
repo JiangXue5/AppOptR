@@ -314,9 +314,13 @@ const $=id=>document.getElementById(id);
 const esc=s=>String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 function fmtUp(s){s=+s||0;const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return d>0?d+'天'+h+'小时':h>0?h+'小时'+m+'分':m>0?m+'分':'刚刚'}
 const modeLabel=m=>m==='ebpf'?'eBPF 事件驱动':'Proc 轮询';
+// KernelSU 的 WebUI 由 https://mui.kernelsu.org 加载页面，相对路径会被解析到该域，
+// 而 API 在本机 8889 上，因此非 8889 端口时显式指向回环地址；浏览器直连保持同源。
+const API_BASE=location.port==='8889'?'':'http://127.0.0.1:8889';
 async function api(path,body){
   const opts=body!==undefined?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}:{};
-  const r=await fetch(path,opts);
+  let r;
+  try{r=await fetch(API_BASE+path,opts);}catch(e){throw new Error('无法连接本机服务，请用浏览器打开 http://127.0.0.1:8889/')}
   const d=await r.json().catch(()=>({}));
   if(!r.ok)throw new Error(d.err||('HTTP '+r.status));
   return d;

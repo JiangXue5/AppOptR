@@ -70,6 +70,10 @@
   符号链接无法再把 root 写入引到白名单外。
 - 设置页新增「可跨簇调度的规则」统计：解析期按去重后的核心层判定哪些规则的允许集合横跨多层，
   同时写一行启动日志。该数字仅用于评估动态调度的作用面，不参与任何决策。
+- 适配 KernelSU 的 WebUI 入口：页面由 `https://mui.kernelsu.org` 加载，相对路径会被解析到该域，
+  前端在非 8889 端口时改用绝对地址 `http://127.0.0.1:8889`；后端补 OPTIONS 预检与
+  `Access-Control-Allow-Private-Network`。来源白名单只放行该域与回环地址，其他跨站 Origin 仍返回 403，
+  POST 仍要求 `application/json`。
 
 ### 已知限制
 

@@ -161,22 +161,59 @@ fn request_read(reader: &mut BufReader<TcpStream>) -> Option<Request> {
     })
 }
 
-fn resp_send(out: &mut TcpStream, status: u16, ctype: &str, body: &[u8], close: bool) {
+/// WebUI 容器（KernelSU 的 WebViewAssetLoader）页面源的固定域名。
+/// 该域名下的页面由模块自己的 webroot 提供，属于本机受信容器；
+/// 回环来源同理，能起本地服务的进程本来就能直连 8889，不构成新增攻击面。
+/// 其余跨站 Origin 仍然拒绝，避免任意网页驱动本地 API。
+fn origin_allowed(origin: &str) -> bool {
+    if origin == "https://mui.kernelsu.org" {
+        return true;
+    }
+    // 回环来源允许任意端口，但 host 之后必须是结尾或 ":端口"，避免 127.0.0.1.evil 这类前缀伪装
+    for prefix in ["http://127.0.0.1", "http://localhost"] {
+        if let Some(rest) = origin.strip_prefix(prefix) {
+            if rest.is_empty()
+                || (rest.starts_with(':') && rest[1..].bytes().all(|b| b.is_ascii_digit()))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn resp_send(
+    out: &mut TcpStream,
+    status: u16,
+    ctype: &str,
+    body: &[u8],
+    close: bool,
+    cors: Option<&str>,
+) {
     let reason = match status {
         200 => "OK",
+        204 => "No Content",
         400 => "Bad Request",
         403 => "Forbidden",
         404 => "Not Found",
         _ => "Error",
     };
-    let head = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: {}\r\n\r\n",
+    let mut head = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: {}\r\n",
         status,
         reason,
         ctype,
         body.len(),
         if close { "close" } else { "keep-alive" }
     );
+    if let Some(o) = cors {
+        // 回显具体来源而非 *，保留将来加凭据的可能；PNA 头供 https 页面访问回环地址时通过预检
+        head.push_str(&format!(
+            "Access-Control-Allow-Origin: {}\r\nVary: Origin\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nAccess-Control-Allow-Private-Network: true\r\n",
+            o
+        ));
+    }
+    head.push_str("\r\n");
     let _ = out.write_all(head.as_bytes());
     let _ = out.write_all(body);
     let _ = out.flush();
@@ -185,18 +222,52 @@ fn resp_send(out: &mut TcpStream, status: u16, ctype: &str, body: &[u8], close: 
 fn dispatch(out: &mut TcpStream, req: &Request) {
     let port_str = format!(":{}", WEB_PORT);
     let host = req.host.strip_suffix(&port_str).unwrap_or(req.host.as_str());
-    let origin_ok = matches!(host, "127.0.0.1" | "localhost")
-        && (req.origin.is_empty()
-            || req.origin == "null"
-            || matches!(req.fetch_site.as_str(), "" | "none" | "same-origin"))
+    let host_ok = matches!(host, "127.0.0.1" | "localhost");
+    // 同源请求不带 Origin 或为 null；WebUI 容器来源的 Sec-Fetch-Site 必然是 cross-site
+    let same_site = req.origin.is_empty()
+        || req.origin == "null"
+        || matches!(req.fetch_site.as_str(), "" | "none" | "same-origin");
+    let cross_webui = origin_allowed(&req.origin);
+    let cors = cross_webui.then_some(req.origin.as_str());
+    let origin_ok = host_ok
+        && (same_site || cross_webui)
         && (req.method != "POST" || req.content_type.starts_with("application/json"));
+
+    // 预检不携带业务语义，只回放行头；来源不在白名单时直接拒绝
+    if req.method == "OPTIONS" {
+        let ok = host_ok && cross_webui;
+        resp_send(
+            out,
+            if ok { 204 } else { 403 },
+            "text/plain",
+            b"",
+            true,
+            if ok { cors } else { None },
+        );
+        return;
+    }
+
     if !origin_ok {
-        resp_send(out, 403, "application/json", b"{\"ok\":false,\"err\":\"forbidden\"}", true);
+        resp_send(
+            out,
+            403,
+            "application/json",
+            b"{\"ok\":false,\"err\":\"forbidden\"}",
+            true,
+            None,
+        );
         return;
     }
 
     if req.method == "GET" && matches!(req.path.as_str(), "/" | "/index.html") {
-        resp_send(out, 200, "text/html; charset=utf-8", INDEX_HTML.as_bytes(), !req.keep_alive);
+        resp_send(
+            out,
+            200,
+            "text/html; charset=utf-8",
+            INDEX_HTML.as_bytes(),
+            !req.keep_alive,
+            cors,
+        );
         return;
     }
 
@@ -211,7 +282,7 @@ fn dispatch(out: &mut TcpStream, req: &Request) {
         ("POST", "/api/suggest") => suggest_api(req),
         _ => err_json(404, "not found"),
     };
-    resp_send(out, status, "application/json", body.as_bytes(), !req.keep_alive);
+    resp_send(out, status, "application/json", body.as_bytes(), !req.keep_alive, cors);
 }
 
 fn err_json(code: u16, msg: &str) -> (u16, String) {
@@ -799,6 +870,22 @@ pub fn settings_save() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn webui_origin_is_accepted() {
+        assert!(origin_allowed("https://mui.kernelsu.org"));
+        assert!(origin_allowed("http://localhost:8080"));
+        assert!(origin_allowed("http://127.0.0.1:5000"));
+    }
+
+    #[test]
+    fn foreign_origin_is_rejected() {
+        assert!(!origin_allowed("https://evil.example"));
+        // 前缀相似但域名不同，不能被 starts_with 放行
+        assert!(!origin_allowed("https://mui.kernelsu.org.evil.example"));
+        assert!(!origin_allowed("http://127.0.0.1.evil.example"));
+        assert!(!origin_allowed(""));
+    }
 
     fn exe_dir() -> std::path::PathBuf {
         std::env::current_exe()
