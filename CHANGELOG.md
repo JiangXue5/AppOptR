@@ -53,7 +53,7 @@
 
 ### 验证
 
-- `cargo test`：124 passed / 0 failed / 1 ignored。
+- `cargo test`：127 passed / 0 failed / 1 ignored。
 - 配置实测加载 926 条规则，333 个规则块与清单完全对应。
 - `--full` 在缺少分组数据时退回旧清单路径，输出仍为 333 个应用。
 
