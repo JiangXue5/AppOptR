@@ -24,8 +24,11 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::apply_affinity::affinity_set;
-use crate::config::{config_loader, init_inotify, load_config, AppConfig, CHECK_INTERVAL, CONFIG_FILE, CURRENT_CONFIG};
+use crate::apply_affinity::{affinity_set, AffinityOutcome};
+use crate::config::{
+    config_loader, init_inotify, load_config, AppConfig, SchedMode, CHECK_INTERVAL, CONFIG_FILE,
+    CURRENT_CONFIG,
+};
 use crate::cpuset::{init_cpu_topo, set_base_cpuset};
 use crate::ebpf_mode::{
     affinity_check, full_scan, event_dispatch, comm_map_init,
@@ -441,8 +444,13 @@ fn main() {
                 cache.request_full_scan();
             }
             cache_sync(&cfg, cache);
-            if affinity_deadline.elapsed() >= Duration::from_secs(5 * interval) || cache.force_affinity {
-                cache.cache.affinity_sync(&cfg.topo);
+            if affinity_deadline.elapsed() >= Duration::from_secs(5 * interval)
+                || cache.force_affinity
+            {
+                // ESRCH 的线程同时收回 RT 记录，避免事件漏报时配额一直被占
+                for tid in cache.cache.affinity_sync(&cfg.topo) {
+                    rt::forget(tid);
+                }
                 affinity_deadline = Instant::now();
                 cache.force_affinity = false;
             }
@@ -461,33 +469,34 @@ fn main() {
         if sched_deadline.elapsed() >= sched::sample_period() {
             sched_deadline = Instant::now();
             sched_state.set_mode(cfg.sched);
-            let moves = match (&ebpf_state, &proc_state) {
-                (Some(es), _) => sched_state.tick(&cfg, &es.cache),
-                (None, Some(ps)) => sched_state.tick(&cfg, &ps.cache),
-                _ => Vec::new(),
-            };
-            if !moves.is_empty() {
-                let mut dead: Vec<i32> = Vec::new();
-                match (&mut ebpf_state, &mut proc_state) {
+            let moves = if cfg.sched == SchedMode::On {
+                match (&ebpf_state, &proc_state) {
+                    (Some(es), _) => sched_state.tick(&cfg, &es.cache),
+                    (None, Some(ps)) => sched_state.tick(&cfg, &ps.cache),
+                    _ => Vec::new(),
+                }
+            } else {
+                // off / shadow：只推进采样与 would 统计，候选迁移直接丢弃。
+                // 主循环只有这一条通往亲和性写入的路径，shadow 不可能执行迁移
+                match (&ebpf_state, &proc_state) {
                     (Some(es), _) => {
-                        for m in &moves {
-                            if apply_move_ebpf(es, &cfg, m) {
-                                dead.push(m.tid);
-                            }
-                        }
+                        sched_state.tick(&cfg, &es.cache);
                     }
                     (None, Some(ps)) => {
-                        for m in &moves {
-                            if apply_move_proc(ps, &cfg, m) {
-                                dead.push(m.tid);
-                            }
-                        }
+                        sched_state.tick(&cfg, &ps.cache);
                     }
                     _ => {}
                 }
-                for tid in dead {
-                    sched_state.forget(tid);
-                }
+                Vec::new()
+            };
+            for m in &moves {
+                let outcome = match (&mut ebpf_state, &mut proc_state) {
+                    (Some(es), _) => apply_move_ebpf(es, &cfg, m),
+                    (None, Some(ps)) => apply_move_proc(ps, &cfg, m),
+                    _ => AffinityOutcome::Failed,
+                };
+                // 只有内核确认写入成功，settle 才会提交落点与 moved
+                sched_state.settle(m, outcome);
             }
             sched_state.publish();
         }
@@ -516,39 +525,49 @@ fn main() {
 }
 
 /// S7 迁移执行（eBPF 模式）：只改亲和性，不写 cpuset 目录，保持原有归属。
-/// 返回 true 表示线程已退出，调用方需要清 S7 状态。
-fn apply_move_ebpf(es: &mut EbpfState, cfg: &AppConfig, m: &sched::Move) -> bool {
+/// 只有 `Set` 才同步缓存里的集合，失败保持旧值等下一轮
+fn apply_move_ebpf(es: &mut EbpfState, cfg: &AppConfig, m: &sched::Move) -> AffinityOutcome {
     let dir = es
         .cache
         .tasks
         .get(&m.tid)
         .map(|e| e.cpuset_dir.clone())
         .unwrap_or_default();
-    if affinity_set(m.tid, &m.cpus, &dir, &cfg.topo) {
-        es.cache.task_del(m.tid);
-        return true;
+    match affinity_set(m.tid, &m.cpus, &dir, &cfg.topo) {
+        AffinityOutcome::Set => {
+            // 同步缓存：affinity_sync 每 3*interval 秒会按 entry.cpus 重设，
+            // 不改这里，迁移结果几秒后就被拉回规则值
+            if let Some(e) = es.cache.tasks.get_mut(&m.tid) {
+                e.cpus = m.cpus;
+            }
+            AffinityOutcome::Set
+        }
+        AffinityOutcome::Gone => {
+            es.cache.task_del(m.tid);
+            AffinityOutcome::Gone
+        }
+        AffinityOutcome::Failed => AffinityOutcome::Failed,
     }
-    // 同步缓存：affinity_sync 每 3*interval 秒会按 entry.cpus 重设，
-    // 不改这里，迁移结果几秒后就被拉回规则值
-    if let Some(e) = es.cache.tasks.get_mut(&m.tid) {
-        e.cpus = m.cpus;
-    }
-    false
 }
 
-fn apply_move_proc(ps: &mut ProcScanState, cfg: &AppConfig, m: &sched::Move) -> bool {
+fn apply_move_proc(ps: &mut ProcScanState, cfg: &AppConfig, m: &sched::Move) -> AffinityOutcome {
     let dir = ps
         .cache
         .tasks
         .get(&m.tid)
         .map(|e| e.cpuset_dir.clone())
         .unwrap_or_default();
-    if affinity_set(m.tid, &m.cpus, &dir, &cfg.topo) {
-        ps.cache.task_del(m.tid);
-        return true;
+    match affinity_set(m.tid, &m.cpus, &dir, &cfg.topo) {
+        AffinityOutcome::Set => {
+            if let Some(e) = ps.cache.tasks.get_mut(&m.tid) {
+                e.cpus = m.cpus;
+            }
+            AffinityOutcome::Set
+        }
+        AffinityOutcome::Gone => {
+            ps.cache.task_del(m.tid);
+            AffinityOutcome::Gone
+        }
+        AffinityOutcome::Failed => AffinityOutcome::Failed,
     }
-    if let Some(e) = ps.cache.tasks.get_mut(&m.tid) {
-        e.cpus = m.cpus;
-    }
-    false
 }

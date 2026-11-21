@@ -178,11 +178,25 @@ pub struct AppConfig {
     pub unmatched_all: bool,
     /// 跨簇规则统计，仅用于展示 S7 的潜在作用面
     pub sched_scope: SchedScope,
+    /// 允许集合横跨多个核心层的包。S7 靠线程名判角色，这些包即使没有线程规则
+    /// 也必须采集 comm，否则 S7 对「只有包级规则」的应用完全失效
+    pub sched_pkgs: HashSet<String>,
     /// S7 模式，off 时运行期零开销
     pub sched: SchedMode,
     /// RT 配置。off 时运行期不查询任何线程的调度策略
     pub rt: RtConfig,
     pub topo: CpuTopology,
+}
+
+impl AppConfig {
+    /// 该包是否需要读取线程名。三个消费方：线程规则匹配、S7 角色判定、RT 匹配。
+    /// 只在任一成立时才读 `/proc/<tid>/comm`，不给无关应用增加开销；
+    /// S7 关闭时跨簇包也不再采集，避免留下无意义的读取
+    pub fn needs_comm(&self, pkg: &str) -> bool {
+        self.has_thread_rules.contains(pkg)
+            || (self.sched != SchedMode::Off && self.sched_pkgs.contains(pkg))
+            || self.rt.policy(pkg).is_some()
+    }
 }
 
 #[cfg(test)]
@@ -199,6 +213,7 @@ impl AppConfig {
             policy_sig: 0,
             unmatched_all: false,
             sched_scope: SchedScope::default(),
+            sched_pkgs: HashSet::new(),
             sched: SchedMode::Off,
             rt: RtConfig::default(),
             topo: CpuTopology::empty(),
@@ -305,7 +320,8 @@ fn intersects(a: &CpuSet, b: &CpuSet) -> bool {
 
 /// 统计跨簇规则。等于在线全集的规则视为「不限制」，不计入：
 /// 写 0-7 的用户本来就没打算指定核心层，动态分配对他没有信息可加。
-fn sched_scope(rules: &[AffinityRule], topo: &CpuTopology) -> SchedScope {
+/// 同时返回涉及的包集合，供线程名采集判定使用（S7 判角色必须有 comm）
+fn sched_scope(rules: &[AffinityRule], topo: &CpuTopology) -> (SchedScope, HashSet<String>) {
     let mut levels: Vec<CpuSet> = Vec::new();
     for s in [topo.e_core, topo.p_core, topo.hp_core] {
         if s.count() > 0 && !levels.contains(&s) {
@@ -316,11 +332,11 @@ fn sched_scope(rules: &[AffinityRule], topo: &CpuTopology) -> SchedScope {
         levels: levels.len(),
         ..SchedScope::default()
     };
+    let mut pkgs: HashSet<String> = HashSet::new();
     if levels.len() < 2 {
-        return scope;
+        return (scope, pkgs);
     }
 
-    let mut pkgs: HashSet<&str> = HashSet::new();
     for r in rules {
         if r.cpus.count() == 0 || r.cpus == topo.present_cpus {
             continue;
@@ -328,11 +344,11 @@ fn sched_scope(rules: &[AffinityRule], topo: &CpuTopology) -> SchedScope {
         let hit = levels.iter().filter(|l| intersects(&r.cpus, l)).count();
         if hit > 1 {
             scope.rules += 1;
-            pkgs.insert(r.pkg.as_str());
+            pkgs.insert(r.pkg.clone());
         }
     }
     scope.pkgs = pkgs.len();
-    scope
+    (scope, pkgs)
 }
 
 /// 包名被截断到 15 字节时可能命中的键（前缀 + 后缀），与内核白名单同构
@@ -843,7 +859,7 @@ pub fn load_config(
     } else {
         println!("未匹配线程: keep（保持原有亲和性）");
     }
-    let scope = sched_scope(&rules, topo);
+    let (scope, sched_pkgs) = sched_scope(&rules, topo);
     if scope.levels < 2 {
         println!("跨簇规则: 不适用（当前识别为 {} 个核心层）", scope.levels);
     } else {
@@ -906,6 +922,7 @@ pub fn load_config(
         policy_sig,
         unmatched_all,
         sched_scope: scope,
+        sched_pkgs,
         sched,
         rt,
         topo: topo.clone(),
@@ -1292,6 +1309,38 @@ mod tests {
     fn rt_bad_entry_counts_as_failure() {
         let cfg = cfg_of("r_bad", "@rt=per_app\n@rt.app=com.a turbo\ncom.a=0-1\n");
         assert!(cfg.rt.apps.is_empty());
+    }
+
+    #[test]
+    fn needs_comm_follows_consumers() {
+        // 测试拓扑：e=0-3、p=4-5、hp=6-7。3-4 横跨 e 与 p
+        let plain = cfg_of("comm_plain", "com.a=0-1\n");
+        assert!(!plain.needs_comm("com.a"));
+
+        // 线程规则：必须读
+        let thread = cfg_of("comm_thread", "com.a {\n  RenderThread=0-1\n}\n");
+        assert!(thread.needs_comm("com.a"));
+
+        // S7 开启且规则跨簇：必须读，否则判不出角色
+        let sched = cfg_of("comm_sched", "@sched=on\ncom.a=3-4\n");
+        assert!(sched.needs_comm("com.a"));
+        // 关掉 S7 后不再有理由读
+        let off = cfg_of("comm_sched_off", "@sched=off\ncom.a=3-4\n");
+        assert!(!off.needs_comm("com.a"));
+        // 单簇规则即使开了 S7 也不需要线程名
+        let single = cfg_of("comm_single", "@sched=on\ncom.a=0-1\n");
+        assert!(!single.needs_comm("com.a"));
+
+        // RT 需要线程名做角色/名字匹配
+        let rt = cfg_of("comm_rt", "@rt=auto\ncom.a=0-1\n");
+        assert!(rt.needs_comm("com.a"));
+        // per_app 只影响列表里的包
+        let per = cfg_of(
+            "comm_rt_per",
+            "@rt=per_app\n@rt.app=com.b\ncom.a=0-1\ncom.b=0-1\n",
+        );
+        assert!(!per.needs_comm("com.a"));
+        assert!(per.needs_comm("com.b"));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::apply_affinity::affinity_set;
+use crate::apply_affinity::{AffinityOutcome, affinity_set};
 use crate::config::AppConfig;
 use crate::cpuset::{CpuSet, CpuTopology};
 use crate::rule_match::{comm_to_pkg, thread_affinity};
@@ -105,18 +105,16 @@ impl ProcCache {
         true
     }
 
-    /// 遍历 tasks 应用亲和性，返回 dead_tids 供 eBPF 调用方清理 APPLIED_MAP
+    /// 遍历 tasks 应用亲和性，返回 dead_tids 供 eBPF 调用方清理 APPLIED_MAP。
+    /// 只有 ESRCH 才算退出，设置失败（EPERM/EINVAL）的线程保留在缓存里等下一轮
     pub fn affinity_sync(&mut self, topo: &CpuTopology) -> Vec<i32> {
         let dead_tids: Vec<i32> = self
             .tasks
             .iter()
-            .filter_map(|(tid, e)| {
-                if affinity_set(*tid, &e.cpus, &e.cpuset_dir, topo) {
-                    Some(*tid)
-                } else {
-                    None
-                }
+            .filter(|(tid, e)| {
+                affinity_set(**tid, &e.cpus, &e.cpuset_dir, topo) == AffinityOutcome::Gone
             })
+            .map(|(tid, _)| *tid)
             .collect();
         for tid in &dead_tids {
             self.task_del(*tid);

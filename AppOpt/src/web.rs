@@ -595,7 +595,7 @@ fn config_json() -> String {
         .as_ref()
         .map(|c| c.rt.label())
         .unwrap_or_else(|| "off".to_string());
-    let (s_mode, s_state, s_ticks, s_would, s_moved, s_blocked, s_load, s_last) =
+    let (s_mode, s_state, s_ticks, s_would, s_moved, s_failed, s_blocked, s_load, s_last) =
         match lock_ignore_poison(&SCHED_SNAPSHOT).clone() {
             Some(s) => (
                 s.mode,
@@ -603,11 +603,12 @@ fn config_json() -> String {
                 s.ticks,
                 s.would,
                 s.moved,
+                s.failed,
                 s.blocked,
                 s.load.to_vec(),
                 s.last,
             ),
-            None => (0, "off", 0, 0, 0, 0, vec![-1, -1, -1], String::new()),
+            None => (0, "off", 0, 0, 0, 0, 0, vec![-1, -1, -1], String::new()),
         };
     json!({
         "mode": MODE_FORCE.load(Ordering::Relaxed),
@@ -628,6 +629,7 @@ fn config_json() -> String {
         "sched_ticks": s_ticks,
         "sched_would": s_would,
         "sched_moved": s_moved,
+        "sched_failed": s_failed,
         "sched_blocked": s_blocked,
         "sched_load": s_load,
         "sched_last": s_last,

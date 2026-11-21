@@ -73,9 +73,8 @@ pub fn cache_sync(cfg: &AppConfig, state: &mut ProcScanState) {
         if !cfg.pkgs.contains(&pkg) {
             continue;
         }
-        let has_thread_rules = cfg.has_thread_rules.contains(&pkg);
         state.tracked_pids.insert(pid, pkg.clone());
-        if proc_tasks(pid, &pkg, has_thread_rules, cfg, state) > 0 {
+        if proc_tasks(pid, &pkg, cfg.needs_comm(&pkg), cfg, state) > 0 {
             state.force_affinity = true;
         }
     }
@@ -87,23 +86,29 @@ pub fn cache_sync(cfg: &AppConfig, state: &mut ProcScanState) {
         rt::release_pid(pid);
     }
 
-    // 已跟踪进程的新线程：新线程会在创建后立刻命名，需在下一个周期内纳入管理
-    let targets: Vec<i32> = state
-        .tracked_pids
-        .iter()
-        .filter(|(_, pkg)| cfg.has_thread_rules.contains(pkg.as_str()))
-        .map(|(&pid, _)| pid)
-        .collect();
-    for pid in targets {
+    // 已跟踪进程的新线程：新线程会在创建后立刻命名，需在下一个周期内纳入管理。
+    // 这里必须用 needs_comm 而不是 has_thread_rules：只有包级规则的应用
+    // 也可能启用 S7 / RT，同样要发现新线程
+    for pid in discover_targets(&state.tracked_pids, cfg) {
         let Some(pkg) = state.tracked_pids.get(&pid).cloned() else {
             continue;
         };
-        if proc_tasks(pid, &pkg, true, cfg, state) > 0 {
+        if proc_tasks(pid, &pkg, cfg.needs_comm(&pkg), cfg, state) > 0 {
             state.force_affinity = true;
         }
     }
 
     state.known_pids = current;
+}
+
+/// 需要每轮发现新线程的进程：只有消费线程名的功能（线程规则 / S7 / RT）
+/// 启用时才需要。纯包级绑定靠继承与 affinity_sync 维持，不必逐轮遍历 task
+fn discover_targets(tracked: &HashMap<i32, String>, cfg: &AppConfig) -> Vec<i32> {
+    tracked
+        .iter()
+        .filter(|(_, pkg)| cfg.needs_comm(pkg))
+        .map(|(&pid, _)| pid)
+        .collect()
 }
 
 /// 全量重建：清空缓存与跟踪状态后遍历 /proc
@@ -116,9 +121,9 @@ fn proc_scan(cfg: &AppConfig, state: &mut ProcScanState) {
     let _ = proc_walk(
         cfg,
         |_| true,
-        |pid, pkg, has_thread_rules| {
+        |pid, pkg| {
             state.tracked_pids.insert(pid, pkg.to_string());
-            proc_tasks(pid, pkg, has_thread_rules, cfg, state);
+            proc_tasks(pid, pkg, cfg.needs_comm(pkg), cfg, state);
         },
     );
 
@@ -126,6 +131,9 @@ fn proc_scan(cfg: &AppConfig, state: &mut ProcScanState) {
     state.rescan_all = false;
     state.last_full = Instant::now();
     state.force_affinity = true;
+    // 缓存已重建，再对账 RT：进程在扫描窗口内退出、包被移出配置时，
+    // 旧的 RT 记录不能留着。仍符合条件的线程不受影响
+    rt::reconcile(cfg, &state.cache);
 }
 
 fn read_pid_set() -> HashSet<i32> {
@@ -145,7 +153,7 @@ fn read_pid_set() -> HashSet<i32> {
 fn proc_tasks(
     pid: i32,
     pkg: &str,
-    has_thread_rules: bool,
+    need_comm: bool,
     cfg: &AppConfig,
     state: &mut ProcScanState,
 ) -> usize {
@@ -155,7 +163,7 @@ fn proc_tasks(
         if state.known_tids.insert(tid, pid).is_some() {
             continue;
         }
-        let thread_name = if has_thread_rules {
+        let thread_name = if need_comm {
             tid_comm(tid).unwrap_or_default()
         } else {
             String::new()
@@ -171,4 +179,45 @@ fn proc_tasks(
         }
     }
     added
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::SchedMode;
+
+    /// 只需要包级规则、但开启了动态调度的应用：必须能被发现新线程
+    #[test]
+    fn dynamic_pkg_is_discovered_without_thread_rules() {
+        let mut cfg = AppConfig::empty();
+        cfg.pkgs.insert("com.a".into());
+        cfg.sched = SchedMode::On;
+        cfg.sched_pkgs.insert("com.a".into());
+
+        let mut tracked = HashMap::new();
+        tracked.insert(100, "com.a".to_string());
+        assert_eq!(discover_targets(&tracked, &cfg), vec![100]);
+    }
+
+    /// 关闭 S7 / RT 后不再为包级应用逐轮遍历 task
+    #[test]
+    fn static_pkg_is_not_rescanned() {
+        let mut cfg = AppConfig::empty();
+        cfg.pkgs.insert("com.a".into());
+        cfg.sched_pkgs.insert("com.a".into());
+
+        let mut tracked = HashMap::new();
+        tracked.insert(100, "com.a".to_string());
+        assert!(discover_targets(&tracked, &cfg).is_empty());
+    }
+
+    /// 有线级规则的包始终需要线程名
+    #[test]
+    fn thread_rule_pkg_is_always_discovered() {
+        let mut cfg = AppConfig::empty();
+        cfg.has_thread_rules.insert("com.b".into());
+        let mut tracked = HashMap::new();
+        tracked.insert(200, "com.b".to_string());
+        assert_eq!(discover_targets(&tracked, &cfg), vec![200]);
+    }
 }

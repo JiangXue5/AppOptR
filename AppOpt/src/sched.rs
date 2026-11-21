@@ -3,8 +3,10 @@
 //! 设计见 `docs/S7_负载感知调度策略设计.md`。三档模式：
 //!
 //! - `off`（默认）：`tick` 立即返回，不读 `/proc/stat`、不产生系统调用。
-//! - `shadow`：照常采样与判定，只把「本可迁移」记进计数与环形缓冲，不改亲和性。
-//! - `on`：全部约束满足时才返回一次 `Move`，由调用方提交 `sched_setaffinity`。
+//! - `shadow`：照常采样与判定，只把「本可迁移」记进计数与环形缓冲，不改亲和性，
+//!   也**不产出** `Move`——决策层就把它截断，不依赖执行层再拦一次。
+//! - `on`：返回候选 `Move`，但状态只在 `settle` 收到 `AffinityOutcome::Set`
+//!   之后才提交，失败不会伪造 `moved` 与落点。
 //!
 //! 边界：只在规则给出的允许集合**内部**换簇，不扩大集合；只动 `Worker` / `Background`；
 //! 不写 cpuset 目录；采样依附主循环，不新增线程。
@@ -14,6 +16,7 @@ use std::fs;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use crate::apply_affinity::AffinityOutcome;
 use crate::cache::ProcCache;
 use crate::config::{AppConfig, SchedMode};
 use crate::cpuset::{CpuSet, CpuTopology};
@@ -95,10 +98,15 @@ impl ThreadState {
 }
 
 /// 待提交的迁移。`tick` 只产出不执行，避免与缓存借用纠缠。
+/// 目标簇与线程名一起带上，`settle` 提交状态时不必回读缓存
 #[derive(Clone)]
 pub struct Move {
     pub tid: i32,
+    /// 目标簇下标，成功提交后写入 `ThreadState::cur`
+    pub target: u8,
     pub cpus: CpuSet,
+    /// 仅用于日志与环形缓冲
+    pub comm: String,
 }
 
 /// 供 Web 与日志读取的只读快照
@@ -110,8 +118,10 @@ pub struct SchedSnapshot {
     pub ticks: u64,
     /// shadow 下「本可迁移」累计次数
     pub would: u64,
-    /// on 下实际提交次数
+    /// on 下真实提交成功的次数
     pub moved: u64,
+    /// 系统调用失败（EPERM/EINVAL 等），不计入 moved
+    pub failed: u64,
     /// 因角色、目标簇核数等约束被拒的线程次
     pub blocked: u64,
     /// 三簇负载千分比，-1 为不可用
@@ -127,6 +137,7 @@ pub struct SchedState {
     ticks: u64,
     would: u64,
     moved: u64,
+    failed: u64,
     blocked: u64,
     threads: HashMap<i32, ThreadState>,
     /// 上一轮每簇累计时间，用于差分
@@ -157,6 +168,7 @@ impl SchedState {
             ticks: 0,
             would: 0,
             moved: 0,
+            failed: 0,
             blocked: 0,
             threads: HashMap::new(),
             prev: None,
@@ -235,8 +247,53 @@ impl SchedState {
         self.decide(cfg, cache, load, now)
     }
 
-    pub fn forget(&mut self, tid: i32) {
-        self.threads.remove(&tid);
+    /// 迁移执行结果回填。只有真正写入成功才提交落点、`own` 与 `moved`；
+    /// 失败时保留旧状态并进入冷却，避免每秒重试同一个必然失败的调用
+    pub fn settle(&mut self, m: &Move, outcome: AffinityOutcome) {
+        match outcome {
+            AffinityOutcome::Set => {
+                if let Some(st) = self.threads.get_mut(&m.tid) {
+                    st.cur = Some(m.target);
+                    st.own = true;
+                    st.applied = m.cpus;
+                    st.last_move = Some(Instant::now());
+                }
+                self.moved += 1;
+                let line = format!(
+                    "S7: {}({}) → {}（{}‰）",
+                    m.comm,
+                    m.tid,
+                    cluster_label(m.target),
+                    self.load[m.target as usize]
+                );
+                println!("{}", line);
+                self.push_ring(line);
+            }
+            AffinityOutcome::Gone => {
+                // 线程已退出：连状态一起清掉，避免 tid 复用时继承旧落点
+                self.threads.remove(&m.tid);
+            }
+            AffinityOutcome::Failed => {
+                self.failed += 1;
+                if let Some(st) = self.threads.get_mut(&m.tid) {
+                    st.last_move = Some(Instant::now());
+                }
+                let line = format!(
+                    "S7: {}({}) 迁移到 {} 失败，保持原亲和性",
+                    m.comm,
+                    m.tid,
+                    cluster_label(m.target)
+                );
+                self.push_ring(line);
+            }
+        }
+    }
+
+    fn push_ring(&mut self, line: String) {
+        if self.ring.len() >= RING_CAP {
+            self.ring.pop_front();
+        }
+        self.ring.push_back(line);
     }
 
     pub fn snapshot(&self) -> SchedSnapshot {
@@ -246,6 +303,7 @@ impl SchedState {
             ticks: self.ticks,
             would: self.would,
             moved: self.moved,
+            failed: self.failed,
             blocked: self.blocked,
             load: self.load,
             last: self.ring.back().cloned().unwrap_or_default(),
@@ -357,36 +415,28 @@ impl SchedState {
                 continue;
             };
 
-            let prev = st.cur;
+            // 从这里开始分叉：shadow 只把候选记进 would / 环形缓冲，
+            // 绝不产出 Move；on 只产出候选，状态等 settle 确认后再提交
+            st.streak = 0;
+            if self.mode == SchedMode::On {
+                out.push(Move {
+                    tid,
+                    target,
+                    cpus,
+                    comm: entry.comm.clone(),
+                });
+                continue;
+            }
+
+            // shadow：把候选记为「已观测」，否则同一线程每轮都会被重复计数
+            self.would += 1;
             st.cur = Some(target);
             st.last_move = Some(now);
-            if self.mode == SchedMode::On {
-                st.own = true;
-                st.applied = cpus;
-                self.moved += 1;
-            } else {
-                self.would += 1;
-            }
-
             let line = format!(
-                "S7: {}({}) {} → {}（负载 {}‰ → {}‰）",
-                entry.comm,
-                tid,
-                prev.map(cluster_label).unwrap_or("允许集合"),
-                CLUSTER_NAME[target as usize],
-                prev.map(|c| load[c as usize]).unwrap_or(base),
-                load[target as usize]
+                "S7(影子): {}({}) 允许集合 → {}（负载 {}‰ → {}‰）",
+                entry.comm, tid, CLUSTER_NAME[target as usize], base, load[target as usize]
             );
-            // 同一线程受 10s 冷却限制，不会刷屏；shadow 只计数不打日志
-            if self.mode == SchedMode::On {
-                println!("{}", line);
-            }
-            if self.ring.len() >= RING_CAP {
-                self.ring.pop_front();
-            }
-            self.ring.push_back(line);
-
-            out.push(Move { tid, cpus });
+            self.push_ring(line);
         }
 
         // 缓存里已消失的线程不再保留状态。无条件清理而不是「超过阈值才清」：
@@ -407,24 +457,32 @@ impl SchedState {
             return false;
         }
         // 超过上限时轮转取样，避免高位 pid 永远轮不到
-        let start = self.active_cursor % total;
-        self.active_cursor = (start + MAX_ACTIVE_PIDS) % total;
+        let (start, next) = rotate_start(total, self.active_cursor, MAX_ACTIVE_PIDS);
+        self.active_cursor = next;
 
         // 保留未被本轮检查的 pid 的上次值，否则它们下次被抽到时没有基准
-        let mut next = std::mem::take(&mut self.active);
-        next.retain(|pid, _| pids.binary_search(pid).is_ok());
+        let mut next_active = std::mem::take(&mut self.active);
+        next_active.retain(|pid, _| pids.binary_search(pid).is_ok());
         let mut active = false;
         for k in 0..total.min(MAX_ACTIVE_PIDS) {
             let pid = pids[(start + k) % total];
             let Some(t) = pid_ticks(pid) else { continue };
-            if next.get(&pid).is_some_and(|prev| t > *prev) {
+            if next_active.get(&pid).is_some_and(|prev| t > *prev) {
                 active = true;
             }
-            next.insert(pid, t);
+            next_active.insert(pid, t);
         }
-        self.active = next;
+        self.active = next_active;
         active
     }
+}
+
+/// 取样窗口：返回本轮起始下标与下一轮游标。pid 数超过 `MAX_ACTIVE_PIDS` 时
+/// 按窗口平移，保证所有 pid 在若干轮内都被检查到；增删 pid 只会改变取模基数，
+/// 不会把游标重置回 0
+fn rotate_start(total: usize, cursor: usize, max: usize) -> (usize, usize) {
+    let start = cursor % total;
+    (start, (start + max) % total)
 }
 
 /// 读取 `/proc/stat` 每个在线核的累计时间。汇总行 `cpu ` 的序号为空，自然被跳过。
@@ -679,6 +737,34 @@ mod tests {
         c
     }
 
+    /// 预置 `first_seen` 到过去，绕开 2s 最小驻留，让判定当轮就能成型
+    fn state_for(cache: &ProcCache, mode: SchedMode) -> SchedState {
+        let mut st = SchedState::new();
+        st.set_mode(mode);
+        let now = Instant::now();
+        for &tid in cache.tasks.keys() {
+            st.threads.insert(
+                tid,
+                ThreadState {
+                    first_seen: now - Duration::from_secs(5),
+                    ..ThreadState::new(now)
+                },
+            );
+        }
+        st
+    }
+
+    /// p-core + hp-core 的允许集合，负载让 hp 明显更低
+    fn span_cache(name: &str) -> (AppConfig, ProcCache) {
+        let cfg = cfg_with(name, "com.test.game=p-core,hp-core\n");
+        let t = topo();
+        let mut cpus = CpuSet::new();
+        cpus.or(&t.p_core);
+        cpus.or(&t.hp_core);
+        let cache = cache_with("com.test.game", "Thread-7", cpus);
+        (cfg, cache)
+    }
+
     #[test]
     fn parse_stat_skips_summary_and_keeps_online() {
         let s = "cpu  100 0 100 800 0 0 0 0 0 0\ncpu0 10 0 10 80 0 0 0 0 0 0\ncpu1 20 0 20 160 0 0 0 0 0 0\nintr 1\n";
@@ -832,6 +918,110 @@ mod tests {
         // shadow 不产生 Move，但 would 只累计一次
         assert_eq!(st.would, 1);
         assert_eq!(st.moved, 0);
+    }
+
+    /// 核心隔离断言：shadow 无论跑多少轮都不能产出可执行迁移，
+    /// 也不能把自己标记成「写过亲和性」
+    #[test]
+    fn shadow_never_yields_moves() {
+        let (cfg, cache) = span_cache("shadow_moves");
+        let mut st = state_for(&cache, SchedMode::Shadow);
+        let mut moves = 0;
+        for _ in 0..12 {
+            moves += st
+                .tick_at(&cfg, &cache, [-1, 600, 300], Instant::now())
+                .len();
+        }
+        assert_eq!(moves, 0, "shadow 不得产出任何 Move");
+        assert_eq!(st.would, 1);
+        assert_eq!(st.moved, 0);
+        let th = st.threads.get(&1001).unwrap();
+        assert!(!th.own, "shadow 不能把线程标记为已迁移");
+        assert_eq!(th.applied.count(), 0, "shadow 不能记录写入过的集合");
+    }
+
+    /// on 模式照旧产出候选，但状态要等回填成功才提交
+    #[test]
+    fn on_mode_only_commits_after_confirmation() {
+        let (cfg, cache) = span_cache("on_confirm");
+        let mut st = state_for(&cache, SchedMode::On);
+        let now = Instant::now();
+        assert!(st.tick_at(&cfg, &cache, [-1, 600, 200], now).is_empty());
+        assert!(st.tick_at(&cfg, &cache, [-1, 600, 200], now).is_empty());
+        let mv = st.tick_at(&cfg, &cache, [-1, 600, 200], now);
+        assert_eq!(mv.len(), 1);
+        assert_eq!(mv[0].cpus.to_range_string(), "7");
+        // 尚未回填：moved 与落点都还是旧的
+        assert_eq!(st.moved, 0);
+        assert!(!st.threads[&1001].own);
+        assert_eq!(st.threads[&1001].cur, None);
+
+        st.settle(&mv[0], AffinityOutcome::Set);
+        assert_eq!(st.moved, 1);
+        let th = &st.threads[&1001];
+        assert!(th.own);
+        assert_eq!(th.cur, Some(2));
+        assert_eq!(th.applied.to_range_string(), "7");
+    }
+
+    /// EPERM/EINVAL 这类失败不能伪装成迁移成功
+    #[test]
+    fn failed_move_keeps_old_state_and_counts_failure() {
+        let (cfg, cache) = span_cache("move_failed");
+        let mut st = state_for(&cache, SchedMode::On);
+        let now = Instant::now();
+        st.tick_at(&cfg, &cache, [-1, 600, 200], now);
+        st.tick_at(&cfg, &cache, [-1, 600, 200], now);
+        let mv = st.tick_at(&cfg, &cache, [-1, 600, 200], now);
+        assert_eq!(mv.len(), 1);
+
+        st.settle(&mv[0], AffinityOutcome::Failed);
+        assert_eq!(st.moved, 0, "失败不能计入 moved");
+        assert_eq!(st.failed, 1);
+        let th = &st.threads[&1001];
+        assert!(!th.own);
+        assert_eq!(th.cur, None, "失败必须保留旧落点");
+        // 冷却生效：下一轮不会立刻重试同一个注定失败的调用
+        assert!(th.last_move.is_some());
+    }
+
+    #[test]
+    fn gone_thread_is_forgotten_not_counted() {
+        let (cfg, cache) = span_cache("move_gone");
+        let mut st = state_for(&cache, SchedMode::On);
+        let now = Instant::now();
+        st.tick_at(&cfg, &cache, [-1, 600, 200], now);
+        st.tick_at(&cfg, &cache, [-1, 600, 200], now);
+        let mv = st.tick_at(&cfg, &cache, [-1, 600, 200], now);
+        assert_eq!(mv.len(), 1);
+
+        st.settle(&mv[0], AffinityOutcome::Gone);
+        assert_eq!(st.moved, 0);
+        assert!(!st.threads.contains_key(&1001));
+    }
+
+    /// 超过 MAX_ACTIVE_PIDS 时所有 pid 都必须轮到
+    #[test]
+    fn active_pid_rotation_covers_all() {
+        let total = 20;
+        let mut cursor = 0;
+        let mut seen = vec![false; total];
+        for _ in 0..total.div_ceil(MAX_ACTIVE_PIDS) {
+            let (start, next) = rotate_start(total, cursor, MAX_ACTIVE_PIDS);
+            for k in 0..MAX_ACTIVE_PIDS {
+                seen[(start + k) % total] = true;
+            }
+            cursor = next;
+        }
+        assert!(seen.iter().all(|v| *v), "存在永远轮不到的 pid");
+    }
+
+    #[test]
+    fn rotation_survives_pid_count_change() {
+        // 进程数变化只改变取模基数，游标不会退回 0 造成重复取样
+        assert_eq!(rotate_start(10, 8, 8), (8, 6));
+        assert_eq!(rotate_start(5, 9, 3), (4, 2));
+        assert_eq!(rotate_start(12, 6, 8), (6, 2));
     }
 
     #[test]

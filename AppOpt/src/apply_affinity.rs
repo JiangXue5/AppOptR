@@ -136,33 +136,47 @@ fn write_task(dir: &str, tid: i32, topo: &CpuTopology) {
     }
 }
 
-/// 对单线程应用亲和性，返回 true 表示 ESRCH 线程已退出
+/// 亲和性写入结果。必须把「线程已退出」和「设置失败」分开：
+/// 前者要清理状态，后者必须保留旧状态，绝不能当成迁移成功
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AffinityOutcome {
+    /// 内核已接受该集合，或线程本来就在目标集合上（短路）
+    Set,
+    /// ESRCH：线程已退出，调用方应清理缓存与调度状态
+    Gone,
+    /// EPERM、EINVAL 等：亲和性未改变，调用方不得提交新状态
+    Failed,
+}
+
+/// 对单线程应用亲和性。cpuset 目录只是辅助手段，成败以内核返回为准
 pub fn affinity_set(
     tid: i32,
     cpus: &CpuSet,
     cpuset_dir: &str,
     topo: &CpuTopology,
-) -> bool {
+) -> AffinityOutcome {
     // sched_getaffinity 短路，已符合目标零开销返回
     if let Some(curr) = CpuSet::get_affinity(tid)
-        && curr == *cpus {
-            return false;
-        }
+        && curr == *cpus
+    {
+        return AffinityOutcome::Set;
+    }
     if topo.cpuset_enabled {
         write_task(cpuset_dir, tid, topo);
     }
-    if let Err(e) = cpus.set_affinity(tid) {
-        return e.raw_os_error() == Some(libc::ESRCH);
+    match cpus.set_affinity(tid) {
+        Ok(()) => AffinityOutcome::Set,
+        Err(e) if e.raw_os_error() == Some(libc::ESRCH) => AffinityOutcome::Gone,
+        Err(_) => AffinityOutcome::Failed,
     }
-
-    false
 }
 
-/// 遍历 /proc 匹配目标进程，返回 匹配数与总进程数
+/// 遍历 /proc 匹配目标进程，返回 匹配数与总进程数。
+/// 是否读线程名交给调用方用 `cfg.needs_comm` 判断，这里不再传旧的包级标记
 pub(crate) fn proc_walk(
     cfg: &AppConfig,
     filter: impl Fn(i32) -> bool,
-    mut f: impl FnMut(i32, &str, bool),
+    mut f: impl FnMut(i32, &str),
 ) -> (usize, i32) {
     let Some(entries) = fs::read_dir("/proc").ok() else { return (0, 0) };
     let mut count = 0;
@@ -173,8 +187,50 @@ pub(crate) fn proc_walk(
         if !filter(pid) { continue; }
         let Some(pkg) = read_cmdline(pid).or_else(|| tid_comm(pid)) else { continue };
         if !cfg.pkgs.contains(&pkg) { continue; }
-        f(pid, &pkg, cfg.has_thread_rules.contains(&pkg));
+        f(pid, &pkg);
         count += 1;
     }
     (count, total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 内核 pid_max 上限 4194304，更大的 tid 必然不存在
+    const GHOST: i32 = 2_000_000_000;
+
+    fn self_tid() -> i32 {
+        unsafe { libc::syscall(libc::SYS_gettid) as i32 }
+    }
+
+    /// 已经符合目标集合时短路返回，不产生任何系统调用
+    #[test]
+    fn matching_set_short_circuits_to_set() {
+        let topo = CpuTopology::empty();
+        let tid = self_tid();
+        let curr = CpuSet::get_affinity(tid).expect("读取自身亲和性失败");
+        assert_eq!(affinity_set(tid, &curr, "", &topo), AffinityOutcome::Set);
+    }
+
+    /// EINVAL 等失败必须如实报告，不能被当成设置成功
+    #[test]
+    fn invalid_set_is_reported_as_failed() {
+        let topo = CpuTopology::empty();
+        let tid = self_tid();
+        // 空集合对内核是非法参数（EINVAL），不会改变当前亲和性
+        assert_eq!(
+            affinity_set(tid, &CpuSet::new(), "", &topo),
+            AffinityOutcome::Failed
+        );
+    }
+
+    /// 线程已退出与设置失败要分开，前者要清状态
+    #[test]
+    fn vanished_thread_is_reported_as_gone() {
+        let topo = CpuTopology::empty();
+        let mut one = CpuSet::new();
+        one.set(0);
+        assert_eq!(affinity_set(GHOST, &one, "", &topo), AffinityOutcome::Gone);
+    }
 }

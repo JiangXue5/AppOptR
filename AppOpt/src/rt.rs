@@ -17,6 +17,7 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 
+use crate::cache::ProcCache;
 use crate::config::{AppConfig, RtMatch};
 use crate::cpuset::CpuSet;
 use crate::roles::role_of;
@@ -125,35 +126,49 @@ impl RtState {
         if !self.enabled {
             return false;
         }
-        let policy = cfg.rt.policy(pkg);
-        let owned = self.own.contains_key(&tid);
-        match (owned, policy) {
-            // 已由本模块提升：按新配置复核，合格就保留，不合格立即降级
-            (true, Some((mode, max))) => {
-                let ok = matches(mode, comm, allowed) && self.count(pid) <= max as usize;
-                if !ok {
-                    self.drop_threads(&[tid]);
-                }
-            }
-            (true, None) => {
+        let Some((mode, max)) = cfg.rt.policy(pkg) else {
+            // 新配置里这个包已无 RT 资格：只收回自己提升过的线程
+            if self.own.contains_key(&tid) {
                 self.drop_threads(&[tid]);
             }
-            (false, Some((mode, max))) => {
-                // 外部模块或系统设置的 RR/FIFO：不接管，也不记录
-                if is_realtime(tid) {
-                    return false;
-                }
-                if !matches(mode, comm, allowed) {
-                    return false;
-                }
-                if self.count(pid) >= max as usize {
-                    return false;
-                }
-                return self.apply(tid, pid, pkg, comm, allowed);
-            }
-            (false, None) => {}
+            return false;
+        };
+
+        // 一次 getscheduler 同时回答两个问题：
+        // 1) 记录里的线程是否还在按 RT 运行（退出后 tid 复用 / 外部改回 CFS）
+        // 2) 还没接管的线程是否已被系统或其他模块设成 RR/FIFO
+        let realtime = is_realtime(tid);
+        let mut owned = self.own.contains_key(&tid);
+        if owned && !realtime {
+            // 记录已经失效。直接丢弃，避免把复用了该 tid 的新线程当成自己提升过的
+            self.own.remove(&tid);
+            owned = false;
         }
-        false
+
+        let eligible = matches(mode, comm, allowed);
+        let used = self.count(pid);
+        match action(owned, eligible, realtime && !owned, used, max) {
+            Action::Keep => {
+                // 线程名会因 rename 变化，规则集合也会随配置变化，
+                // 记录跟着更新，prune 才不会按旧名字旧集合误判
+                if let Some(a) = self.own.get_mut(&tid) {
+                    if a.comm != comm {
+                        a.comm = comm.to_string();
+                    }
+                    a.allowed = *allowed;
+                    a.pkg = pkg.to_string();
+                    a.pid = pid;
+                }
+                false
+            }
+            Action::Drop => {
+                self.drop_threads(&[tid]);
+                false
+            }
+            Action::Adopt => self.apply(tid, pid, pkg, comm, allowed),
+            // 外部 RT（不接管）或不符合策略/配额已满
+            Action::Foreign | Action::Skip => false,
+        }
     }
 
     /// 线程退出：只清记录，不调用 sched_setscheduler（线程已经不存在）
@@ -164,6 +179,28 @@ impl RtState {
     /// 进程退出：清理该 PID 下全部 RT 记录与配额
     pub fn release_pid(&mut self, pid: i32) {
         self.own.retain(|_, a| a.pid != pid);
+    }
+
+    /// 全量重扫后的对账：只处理自己提升过的线程。
+    /// 仍在缓存里且符合当前策略的保留，其余（线程/进程已退出、包被移出配置、
+    /// 规则变化后不再符合）放回 CFS。覆盖事件丢失与扫描窗口内的进程消失
+    pub fn reconcile(&mut self, cfg: &AppConfig, cache: &ProcCache) {
+        if self.own.is_empty() {
+            return;
+        }
+        let drop: Vec<i32> = self
+            .own
+            .iter()
+            .filter(|(tid, a)| match cache.tasks.get(tid) {
+                Some(e) => e.pkg != a.pkg || !eligible(cfg, &e.pkg, &e.comm, &e.cpus),
+                None => true,
+            })
+            .map(|(&tid, _)| tid)
+            .collect();
+        let n = self.drop_threads(&drop);
+        if n > 0 {
+            println!("RT: 全量重扫后回滚 {} 个不再符合条件的线程", n);
+        }
     }
 
     /// 配置切回关闭时把已提升线程放回 CFS
@@ -202,11 +239,19 @@ impl RtState {
     }
 
     fn apply(&mut self, tid: i32, pid: i32, pkg: &str, comm: &str, allowed: &CpuSet) -> bool {
-        let param = libc::sched_param { sched_priority: 1 };
+        // 用零初始化再赋优先级：aarch64-musl 的 sched_param 带 SCHED_DEADLINE 字段，
+        // 结构体字面量在部分 target 上无法编译
+        let mut param: libc::sched_param = unsafe { std::mem::zeroed() };
+        param.sched_priority = 1;
         let ret =
             unsafe { libc::sched_setscheduler(tid, libc::SCHED_RR | SCHED_RESET_ON_FORK, &param) };
         if ret != 0 {
             let e = io::Error::last_os_error();
+            // 线程在取到 tid 之后、调用之前退出：正常的竞态，不是环境不支持，
+            // 不能因此关闭全局闸门（否则 RT 会莫名其妙整体失效）
+            if e.raw_os_error() == Some(libc::ESRCH) {
+                return false;
+            }
             // EPERM / SELinux 拒绝：继续尝试只会每次热更新刷日志，直接全局关闭
             self.enabled = false;
             eprintln!(
@@ -227,11 +272,24 @@ impl RtState {
         true
     }
 
-    /// 备份原值并写入配置值。已有备份时只更新值，不覆盖原值
+    /// 备份原值并写入配置值。已有备份时只更新值，不覆盖原值；
+    /// 若外部在两次配置之间改过这个全局参数，把现值当作新的原值再写
     fn ensure_timeslice(&mut self, ms: u32) {
-        if let Some(old) = &self.pending_restore {
-            if self.applied_ms == Some(ms) {
+        let current = read_timeslice();
+        if let Some(old) = self.pending_restore.clone() {
+            if self.applied_ms == Some(ms) && current == Some(ms) {
                 return;
+            }
+            // 外部改过：以现值为原值，恢复时还给它，而不是用我们记的旧值覆盖
+            if current != self.applied_ms
+                && let Some(c) = current
+            {
+                let cur = c.to_string();
+                if let Some(p) = backup_path() {
+                    let _ = fs::write(&p, format!("{}\n", cur));
+                }
+                self.pending_restore = Some(cur);
+                println!("RT: 时间片被外部改为 {} ms，作为新的原值记录", c);
             }
             // 原值只在第一次保存，这里只改当前值；失败则放弃后续尝试
             if fs::write(RR_TIMESLICE_PATH, format!("{}\n", ms)).is_err() {
@@ -240,7 +298,11 @@ impl RtState {
                 return;
             }
             self.applied_ms = Some(ms);
-            println!("RT: 时间片调整为 {} ms（原值 {} ms 保持不变）", ms, old);
+            println!(
+                "RT: 时间片调整为 {} ms（原值 {} ms 保持不变）",
+                ms,
+                self.pending_restore.as_deref().unwrap_or(&old)
+            );
             return;
         }
         let Some(path) = backup_path() else {
@@ -283,16 +345,60 @@ impl RtState {
             self.applied_ms = None;
             return;
         };
-        let _ = fs::write(RR_TIMESLICE_PATH, format!("{}\n", old));
+        // 只还原自己写进去的值。外部已经把参数改成别的值时不覆盖，
+        // 只清理记录与备份，避免「卸载模块顺手改掉别人的配置」
+        if owns_current(self.applied_ms) {
+            let _ = fs::write(RR_TIMESLICE_PATH, format!("{}\n", old));
+            println!("RT: 时间片已恢复为 {} ms", old.trim());
+        } else {
+            eprintln!(
+                "RT: 时间片已被外部修改，保留现值不覆盖（原值 {} ms）",
+                old.trim()
+            );
+        }
         if let Some(p) = backup_path() {
             let _ = fs::remove_file(&p);
         }
         self.applied_ms = None;
-        println!("RT: 时间片已恢复为 {} ms", old.trim());
     }
 }
 
-/// 该线程在新配置下是否仍有资格。`note` 与 `prune` 共用，避免两处判定漂移
+/// 单个候选线程的处理结论。抽成纯函数，所有权与配额语义可以脱离系统调用验证
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Action {
+    /// 本模块提升过且仍符合策略：保留
+    Keep,
+    /// 本模块提升过但不再符合策略：撤销
+    Drop,
+    /// 外部设置的 RR/FIFO：不接管、不记录、不降级
+    Foreign,
+    /// 符合策略且有名额：提升
+    Adopt,
+    /// 不符合策略或配额已满
+    Skip,
+}
+
+/// `owned` 表示记录在本模块表里，`foreign` 表示内核里已经是 RR/FIFO 但不是本模块设的
+fn action(owned: bool, eligible: bool, foreign: bool, used: usize, max: u8) -> Action {
+    if owned {
+        // 配额同理：上限下调后由 prune 收敛，这里只防止记录与配置长期不一致
+        return if eligible && used <= max as usize {
+            Action::Keep
+        } else {
+            Action::Drop
+        };
+    }
+    if foreign {
+        return Action::Foreign;
+    }
+    if eligible && used < max as usize {
+        Action::Adopt
+    } else {
+        Action::Skip
+    }
+}
+
+/// 该线程在新配置下是否仍有资格。`note` 与 `prune`、`reconcile` 共用，避免三处判定漂移
 fn eligible(cfg: &AppConfig, pkg: &str, comm: &str, allowed: &CpuSet) -> bool {
     match cfg.rt.policy(pkg) {
         Some((mode, _)) => matches(mode, comm, allowed),
@@ -320,8 +426,27 @@ fn is_realtime(tid: i32) -> bool {
     policy == libc::SCHED_FIFO || policy == libc::SCHED_RR
 }
 
+fn read_timeslice() -> Option<u32> {
+    fs::read_to_string(RR_TIMESLICE_PATH)
+        .ok()?
+        .trim()
+        .parse::<u32>()
+        .ok()
+}
+
+/// 当前内核值是否仍是本模块写入的那个。外部改过就说明所有权已不属于我们，
+/// 恢复时不能无脑覆盖
+fn owns_current(applied: Option<u32>) -> bool {
+    owned_value(read_timeslice(), applied)
+}
+
+fn owned_value(current: Option<u32>, applied: Option<u32>) -> bool {
+    current.is_some() && current == applied
+}
+
 fn demote(tid: i32) -> bool {
-    let param = libc::sched_param { sched_priority: 0 };
+    let mut param: libc::sched_param = unsafe { std::mem::zeroed() };
+    param.sched_priority = 0;
     unsafe { libc::sched_setscheduler(tid, libc::SCHED_OTHER, &param) == 0 }
 }
 
@@ -365,6 +490,13 @@ pub fn prepare(cfg: &AppConfig) {
 pub fn prune(cfg: &AppConfig) {
     if let Some(s) = crate::lock_ignore_poison(&RT).as_mut() {
         s.prune(cfg);
+    }
+}
+
+/// 全量扫描后调用。缓存是唯一可信的「还活着的受管线程」来源
+pub fn reconcile(cfg: &AppConfig, cache: &ProcCache) {
+    if let Some(s) = crate::lock_ignore_poison(&RT).as_mut() {
+        s.reconcile(cfg, cache);
     }
 }
 
@@ -435,7 +567,13 @@ pub fn snapshot() -> RtSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache::TaskEntry;
     use crate::config::{RtConfig, RtScope};
+
+    /// 内核 pid_max 上限 4194304，用更大的 tid 保证不存在，
+    /// 既验证失败路径，也不会误改测试机上的真实线程
+    const GHOST: i32 = 2_000_000_000;
+    const GHOST2: i32 = 2_000_000_001;
 
     fn cpus(n: usize) -> CpuSet {
         let mut s = CpuSet::new();
@@ -479,6 +617,17 @@ mod tests {
                 allowed,
             },
         );
+    }
+
+    fn entry(pid: i32, pkg: &str, comm: &str, cores: usize) -> TaskEntry {
+        TaskEntry {
+            pid,
+            pkg: pkg.to_string(),
+            cpus: cpus(cores),
+            cpuset_dir: String::new(),
+            is_thread_rule: false,
+            comm: comm.to_string(),
+        }
     }
 
     #[test]
@@ -682,5 +831,117 @@ mod tests {
         let s = state();
         assert!(s.own.is_empty());
         assert_eq!(s.count(1), 0);
+    }
+
+    /// 外部已有的 RR/FIFO 一律 Foreign：不接管、不入表、不降级
+    #[test]
+    fn foreign_threads_are_never_adopted() {
+        assert_eq!(action(false, true, true, 0, 2), Action::Foreign);
+        // 配额已满、或者不符合策略时，外部线程同样不能被改写
+        assert_eq!(action(false, false, true, 2, 2), Action::Foreign);
+    }
+
+    #[test]
+    fn adoption_respects_quota_and_policy() {
+        assert_eq!(action(false, true, false, 0, 2), Action::Adopt);
+        assert_eq!(action(false, true, false, 1, 2), Action::Adopt);
+        assert_eq!(action(false, true, false, 2, 2), Action::Skip);
+        assert_eq!(action(false, false, false, 0, 2), Action::Skip);
+    }
+
+    #[test]
+    fn owned_threads_are_kept_or_dropped_by_policy() {
+        assert_eq!(action(true, true, false, 1, 2), Action::Keep);
+        // 模式改成 names 后名字不再命中：立刻撤销自己设的 RT
+        assert_eq!(action(true, false, false, 1, 2), Action::Drop);
+        // 上限下调到低于当前数量
+        assert_eq!(action(true, true, false, 3, 2), Action::Drop);
+    }
+
+    /// 提升失败不能留下任何所有权记录
+    #[test]
+    fn failed_promotion_is_not_recorded() {
+        let cfg = cfg_of(
+            RtConfig {
+                scope: RtScope::Global,
+                ..RtConfig::default()
+            },
+            &["com.a"],
+        );
+        let mut s = state();
+        let ok = s.apply(GHOST, 100, "com.a", "RenderThread", &cpus(2));
+        let _ = cfg;
+        assert!(!ok);
+        assert!(s.own.is_empty());
+        assert_eq!(s.count(100), 0);
+        // ESRCH 只是线程刚好退出，不能把 RT 全局闸门关掉
+        assert!(s.enabled);
+    }
+
+    /// 全量重扫后：仍符合条件的保留，已消失的收回
+    #[test]
+    fn reconcile_keeps_live_and_drops_missing() {
+        let cfg = cfg_of(
+            RtConfig {
+                scope: RtScope::Global,
+                ..RtConfig::default()
+            },
+            &["com.a"],
+        );
+        let mut s = state();
+        adopt(&mut s, 10, 100, "com.a", "RenderThread", cpus(2));
+        adopt(&mut s, GHOST, 100, "com.a", "RenderThread", cpus(2));
+        let mut cache = crate::cache::ProcCache::new();
+        cache
+            .tasks
+            .insert(10, entry(100, "com.a", "RenderThread", 2));
+
+        s.reconcile(&cfg, &cache);
+        assert!(s.own.contains_key(&10), "仍符合条件的线程不能被降级");
+        assert!(!s.own.contains_key(&GHOST), "缓存里没有的线程必须收回");
+        assert_eq!(s.count(100), 1);
+    }
+
+    /// 全量扫描时包被移出配置，RT 记录不能留着
+    #[test]
+    fn reconcile_drops_pkg_removed_from_config() {
+        let cfg = cfg_of(RtConfig::default(), &[]);
+        let mut s = state();
+        adopt(&mut s, GHOST, 100, "com.gone", "RenderThread", cpus(2));
+        let mut cache = crate::cache::ProcCache::new();
+        cache
+            .tasks
+            .insert(GHOST, entry(100, "com.gone", "RenderThread", 2));
+
+        s.reconcile(&cfg, &cache);
+        assert!(s.own.is_empty());
+    }
+
+    /// 线程退出后 tid 被复用：新线程继承的是 CFS，不能被当成自己提升过的
+    #[test]
+    fn reused_tid_does_not_inherit_ownership() {
+        let cfg = cfg_of(
+            RtConfig {
+                scope: RtScope::Global,
+                ..RtConfig::default()
+            },
+            &["com.a"],
+        );
+        let mut s = state();
+        // 旧记录存在，但 GHOST2 在内核里不是 RR（不存在或已复用为普通线程）
+        adopt(&mut s, GHOST2, 100, "com.a", "RenderThread", cpus(2));
+        let ok = s.note(GHOST2, 100, "com.a", "RenderThread", &cpus(2), &cfg);
+        // 记录作废后按新线程走一遍提升流程，失败（线程不存在）不改写状态
+        assert!(!ok);
+        assert!(s.own.is_empty(), "失效记录必须先丢弃，不能继续算作已提升");
+    }
+
+    /// 只有内核值仍是自己写的才恢复，外部改过就保留现值
+    #[test]
+    fn timeslice_is_only_restored_when_still_ours() {
+        assert!(owned_value(Some(3), Some(3)));
+        assert!(!owned_value(Some(5), Some(3)));
+        assert!(!owned_value(None, Some(3)));
+        assert!(!owned_value(Some(3), None));
     }
 }

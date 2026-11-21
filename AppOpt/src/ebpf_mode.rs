@@ -9,7 +9,7 @@ use std::thread;
 use aya::maps::{Array as AyaArray, HashMap as AyaHashMap, Map, PerCpuArray as AyaPerCpuArray};
 use aya::{programs::TracePoint as AyaTracePoint, Ebpf, EbpfLoader, Pod};
 
-use crate::apply_affinity::{affinity_set, proc_walk, task_tids, tid_comm};
+use crate::apply_affinity::{affinity_set, proc_walk, task_tids, tid_comm, AffinityOutcome};
 use crate::cache::ProcCache;
 use crate::config::{AppConfig, CURRENT_CONFIG};
 use crate::cpuset::CpuSet;
@@ -520,7 +520,9 @@ pub fn reconcile(state: &mut EbpfState, cfg: &AppConfig) {
     full_scan(cfg, state);
 }
 
-/// 应用亲和性并写 APPLIED_MAP，返回 true 表示 tid 已退出
+/// 应用亲和性并写 APPLIED_MAP，返回 true 表示 tid 已退出。
+/// APPLIED_MAP 的语义是「已被本模块接管」，设置失败也保持接管关系，
+/// 否则该线程的 EXIT 事件不再上报，缓存会一直留到下次 reconcile
 fn affinity_apply(
     tid: i32,
     cpus: &CpuSet,
@@ -528,11 +530,13 @@ fn affinity_apply(
     cfg: &AppConfig,
     bpf: &mut Ebpf,
 ) -> bool {
-    let dead = affinity_set(tid, cpus, cpuset_dir, &cfg.topo);
-    if !dead {
-        applied_set(bpf, tid, cpus);
+    match affinity_set(tid, cpus, cpuset_dir, &cfg.topo) {
+        AffinityOutcome::Gone => true,
+        _ => {
+            applied_set(bpf, tid, cpus);
+            false
+        }
     }
-    dead
 }
 
 /// 事件派发，按 event_type 增量处理 FORK/RENAME/EXEC/EXIT
@@ -596,6 +600,9 @@ pub fn affinity_check(state: &mut EbpfState, cfg: &AppConfig) {
     let dead_tids = state.cache.affinity_sync(&cfg.topo);
     for tid in dead_tids {
         applied_del(&mut state.bpf, tid);
+        // 这里的 tid 已经 ESRCH。EXIT 事件丢失时这是唯一能收回 RT 记录与配额的路径，
+        // 不处理会让配额被永久占用
+        rt::forget(tid);
     }
 }
 
@@ -604,10 +611,12 @@ pub fn full_scan(cfg: &AppConfig, state: &mut EbpfState) {
     state.cache.clear();
     applied_clear(&mut state.bpf);
 
-    proc_walk(cfg, |_| true, |pid, pkg, has_thread_rules| {
+    proc_walk(cfg, |_| true, |pid, pkg| {
         let Some(tids) = task_tids(pid) else { return };
+        // 线程名按需读取：线程规则、S7 角色、RT 匹配任一需要才读
+        let need_comm = cfg.needs_comm(pkg);
         for tid in tids {
-            let t_name = if has_thread_rules {
+            let t_name = if need_comm {
                 tid_comm(tid).unwrap_or_default()
             } else {
                 String::new()
@@ -622,6 +631,8 @@ pub fn full_scan(cfg: &AppConfig, state: &mut EbpfState) {
     });
     state.cfg_sig = cfg.pkg_sig.clone();
     state.cfg_policy_sig = cfg.policy_sig;
+    // 缓存重建后再对账 RT：扫描期间退出的进程、被移出配置的包不能再留着 RT 记录
+    rt::reconcile(cfg, &state.cache);
 }
 
 /// 比对两轮逐包指纹，返回（新增或变更、已删除）的包名
@@ -671,13 +682,14 @@ pub fn config_rescan(new: &AppConfig, state: &mut EbpfState) {
 
     if !targets.is_empty() {
         let target_set: HashSet<&str> = targets.iter().map(|s| s.as_str()).collect();
-        proc_walk(new, |_| true, |pid, pkg, has_thread_rules| {
+        proc_walk(new, |_| true, |pid, pkg| {
             if !target_set.contains(pkg) {
                 return;
             }
             let Some(tids) = task_tids(pid) else { return };
+            let need_comm = new.needs_comm(pkg);
             for tid in tids {
-                let t_name = if has_thread_rules {
+                let t_name = if need_comm {
                     tid_comm(tid).unwrap_or_default()
                 } else {
                     String::new()
@@ -693,6 +705,8 @@ pub fn config_rescan(new: &AppConfig, state: &mut EbpfState) {
     }
 
     state.cfg_sig = new.pkg_sig.clone();
+    // 被移除的包已从缓存清掉，这里收回它们的 RT 记录
+    rt::reconcile(new, &state.cache);
     println!(
         "eBPF: 规则增量重建 {} 个应用，移除 {} 个应用的绑定记录",
         targets.len(),
@@ -734,6 +748,19 @@ mod tests {
         removed.sort();
         assert_eq!(changed, vec!["com.b".to_string()]);
         assert_eq!(removed, vec!["com.a".to_string()]);
+    }
+
+    /// 必须与 AppOpt-ebpf/src/main.rs 的 ProcEvent 完全一致，否则事件解析错位
+    #[test]
+    fn event_layout_matches_kernel_definition() {
+        assert_eq!(std::mem::size_of::<EbpfProcEvent>(), 28);
+        assert_eq!(std::mem::align_of::<EbpfProcEvent>(), 4);
+        assert_eq!(EBPF_EVENT_FORK, 1);
+        assert_eq!(EBPF_EVENT_EXEC, 2);
+        assert_eq!(EBPF_EVENT_RENAME, 3);
+        assert_eq!(EBPF_EVENT_EXIT, 4);
+        // 偏移注入结构同样是三个 u32
+        assert_eq!(std::mem::size_of::<EbpfOffsets>(), 12);
     }
 
     #[test]
