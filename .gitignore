@@ -13,3 +13,6 @@ Cargo.lock
 # 构建产物
 /dist/
 /.build/
+
+# 运行时生成的设置文件
+AppOpt.json
