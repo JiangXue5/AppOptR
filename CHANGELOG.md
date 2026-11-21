@@ -1,5 +1,36 @@
 # AppOptR 变更记录
 
+## 2.3.1（2026-11-21）
+
+RT 从「设置页手填包名」改为「规则页一键开关」，参数不再暴露。
+
+### RT 交互
+
+- `POST /api/rt/toggle`：只收 `pkg` 与 `enabled`，一次写盘完成 `@rt=per_app` 与
+  `@rt.app=<包> on auto`。原子替换避免配置线程读到只改一半的文件。
+- 不写 `@rt.max` / `@rt.timeslice`，沿用缺省 2 线程 / 3 ms，等价于 AsoulOpt 的 `rt=1`。
+- 关闭最后一个启用条目时把 `@rt` 收回 `off`。此前只关条目会让 `rt_active()` 仍为真，
+  内核时间片一直被改写，等于给别人的 RR 线程也换了时间片。
+- 重新打开时保留手工调过的模式与上限（`off names:RenderThread 5` → `on names:RenderThread 5`）。
+- `@rt=global` 下拒绝按包开关（409）。global 表示所有应用都在 RT，单个包的 off 没有意义，
+  自动改写成 per_app 会静默改变其它应用的行为。
+- `/api/rules` 增加每包 `rt` 状态与顶层 `rt_scope`，规则页不再额外请求 `/api/rt`。
+- 设置页移除上限、时间片输入与「＋ 应用」入口，只留「关闭 / 按规则开启」。
+
+### 配置迁移
+
+- `module/applist.asoulopt.conf`：`tools/asopt2appopt.py --full` 的产物，
+  324 个应用 / 9720 条线程规则，随模块安装但不自动启用。
+- README 补齐 `@sched`、`@rt`、`@rt.max`、`@rt.timeslice`、`@rt.app` 指令表。
+
+### 验证
+
+- `cargo test`：123 passed / 0 failed / 1 ignored（新增 `rt_toggle_*` 两个用例）。
+- clippy 零告警；双架构 musl 静态构建通过。
+- 沙箱实测：debug 与 release 静态二进制均能加载 9720 条迁移规则；
+  Web 面板点击 RT 按钮后按钮转橙、`applist.conf` 写入 `@rt.app=... on auto` 与 `@rt=per_app`；
+  global 模式返回 409 及中文提示；关闭最后一个条目后 `@rt=off`。
+
 ## 2.3.0（2026-11-21）
 
 本版本按审计路线 S0–S7 完成构建、生命周期、事件路径、Proc 发现、CPU 拓扑与规则引擎修复。
