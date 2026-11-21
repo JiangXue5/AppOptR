@@ -138,6 +138,9 @@ pub struct SchedState {
     ring: VecDeque<String>,
     /// 轮转游标，保证线程数超过 MAX_PROBE 时仍能全覆盖
     cursor: usize,
+    /// 活跃判定的轮转游标：被管理 pid 超过 MAX_ACTIVE_PIDS 时
+    /// 固定取前 N 个会让高位 pid 永远不参与判定
+    active_cursor: usize,
     state: &'static str,
 }
 
@@ -161,6 +164,7 @@ impl SchedState {
             active: HashMap::new(),
             ring: VecDeque::new(),
             cursor: 0,
+            active_cursor: 0,
             state: "off",
         }
     }
@@ -385,10 +389,9 @@ impl SchedState {
             out.push(Move { tid, cpus });
         }
 
-        // 缓存里已消失的线程不再保留状态
-        if self.threads.len() > cache.tasks.len() + 64 {
-            self.threads.retain(|tid, _| cache.tasks.contains_key(tid));
-        }
+        // 缓存里已消失的线程不再保留状态。无条件清理而不是「超过阈值才清」：
+        // 残留状态会被复用的 tid 继承，导致新线程带着旧的落点与冷却时间
+        self.threads.retain(|tid, _| cache.tasks.contains_key(tid));
         out
     }
 
@@ -398,13 +401,23 @@ impl SchedState {
         let mut pids: Vec<i32> = cache.tasks.values().map(|e| e.pid).collect();
         pids.sort_unstable();
         pids.dedup();
-        pids.truncate(MAX_ACTIVE_PIDS);
+        let total = pids.len();
+        if total == 0 {
+            self.active.clear();
+            return false;
+        }
+        // 超过上限时轮转取样，避免高位 pid 永远轮不到
+        let start = self.active_cursor % total;
+        self.active_cursor = (start + MAX_ACTIVE_PIDS) % total;
 
-        let mut next = HashMap::with_capacity(pids.len());
+        // 保留未被本轮检查的 pid 的上次值，否则它们下次被抽到时没有基准
+        let mut next = std::mem::take(&mut self.active);
+        next.retain(|pid, _| pids.binary_search(pid).is_ok());
         let mut active = false;
-        for pid in pids {
+        for k in 0..total.min(MAX_ACTIVE_PIDS) {
+            let pid = pids[(start + k) % total];
             let Some(t) = pid_ticks(pid) else { continue };
-            if self.active.get(&pid).is_some_and(|prev| t > *prev) {
+            if next.get(&pid).is_some_and(|prev| t > *prev) {
                 active = true;
             }
             next.insert(pid, t);
