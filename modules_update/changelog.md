@@ -1,3 +1,20 @@
+### v2.3.0更新日志
+- 新增 S7 负载感知调度（`@sched=off|shadow|on`）：按簇级负载在规则允许集合内迁移 Worker/Background 线程，
+  默认关闭；`shadow` 只统计不迁移，`on` 才真正生效
+- 新增 RT 实时调度（`@rt=off|global|per_app`）：`SCHED_RR|SCHED_RESET_ON_FORK`、优先级 1，
+  只管理自己提升的线程，线程退出即释放配额
+- 新增配置指令：`@sched`、`@rt`、`@rt.max`、`@rt.timeslice`、`@rt.app=<包> on|off [auto|names:] [上限]`
+- 修复：`shadow` 模式会真实修改线程亲和性
+- 修复：亲和性设置失败被当成成功迁移（EPERM/EINVAL 会计入 `sched_failed`）
+- 修复：RT 会接管系统或厂商已设置的 RR/FIFO 线程
+- 修复：线程退出后 RT 配额不释放、tid 复用后所有权被新线程继承
+- 修复：RT 熔断后已提升的线程与整机时间片残留
+- 修复：只有包级规则的应用无法使用 S7 / RT（线程名采集条件过窄）
+- 修复：活跃进程超过 8 个时后面的进程永远轮不到检查
+- 修复：arm64 交叉编译因 `sched_param` 结构体字面量失败
+- 设置页新增 S7 / RT 状态展示与 RT 配置卡片；`/api/config` 增加 `sched_*` 与 `rt` 字段
+- 新增 `tools/asopt2appopt.py`：把 AsoulOpt 的 asopt.conf 转成 AppOpt 配置
+
 ### v2.2.6更新日志
 - 修复已知问题
 
