@@ -263,6 +263,24 @@ pub struct CpuTopology {
     pub topo_degraded: bool,
 }
 
+#[cfg(test)]
+impl CpuTopology {
+    /// 空拓扑，仅供单元测试与空配置使用，不能参与真实决策
+    pub fn empty() -> Self {
+        Self {
+            present_cpus: CpuSet::new(),
+            present_str: String::new(),
+            mems_str: String::new(),
+            cpuset_enabled: false,
+            e_core: CpuSet::new(),
+            p_core: CpuSet::new(),
+            hp_core: CpuSet::new(),
+            topo_source: "fallback",
+            topo_degraded: true,
+        }
+    }
+}
+
 /// 读取 cpuN/online，节点缺失（如 CPU0）视为在线
 fn cpu_online(cpu: usize) -> bool {
     match fs::read_to_string(format!("/sys/devices/system/cpu/cpu{}/online", cpu)) {

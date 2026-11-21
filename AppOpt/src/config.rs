@@ -47,28 +47,116 @@ pub enum SchedMode {
     On = 2,
 }
 
-/// RT 提升范围。默认 off，与 `@sched` 同级但独立回滚
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
-pub enum RtMode {
+/// RT 全局模式。默认 off：升级后不改变任何现有设备的调度行为
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum RtScope {
     #[default]
     Off,
+    /// 全部已管理应用按同一套规则启用
+    Global,
+    /// 只对显式启用的应用生效
+    PerApp,
+}
+
+/// 单个应用（或 global 模式）的线程匹配方式
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub enum RtMatch {
     /// 角色为 Critical 且允许集合不超过 2 核
+    #[default]
     Auto,
     /// 显式线程名，支持 fnmatch
     Names(Vec<String>),
 }
 
-impl RtMode {
-    pub fn label(&self) -> String {
+impl RtMatch {
+    fn label(&self) -> String {
         match self {
-            RtMode::Off => "off".to_string(),
-            RtMode::Auto => "auto（仅 Critical，允许集合 ≤2 核）".to_string(),
-            RtMode::Names(v) => format!("{} 条线程名", v.len()),
+            RtMatch::Auto => "auto（仅 Critical，允许集合 ≤2 核）".to_string(),
+            RtMatch::Names(v) => format!("{} 条线程名", v.len()),
+        }
+    }
+}
+
+/// 分应用配置。缺省即关闭，`@rt.app` 未出现的包不会获得 RT
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct AppRt {
+    pub enabled: bool,
+    pub mode: RtMatch,
+    pub max_threads: u8,
+}
+
+/// 每进程 RT 线程上限的缺省值。2 个是经验值：再多就拿不到 CFS 的公平性
+pub const RT_DEFAULT_MAX: u8 = 2;
+/// 缺省 RR 时间片。内核默认 100 ms 对渲染线程过长
+pub const RT_DEFAULT_TIMESLICE: u32 = 3;
+/// 单进程 RT 线程上限的允许范围。超过 8 个等于放弃 CFS 公平性
+pub const RT_MAX_LIMIT: u8 = 8;
+/// 时间片允许范围（毫秒）
+pub const RT_TIMESLICE_LIMIT: u32 = 100;
+
+/// RT 总配置。`timeslice_ms` 是全局内核参数，不支持按应用设置，
+/// 因此在任何应用启用时统一生效，全部关闭时还原
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct RtConfig {
+    pub scope: RtScope,
+    /// global 模式下使用的线程匹配方式
+    pub global: RtMatch,
+    /// global 与分应用条目的缺省上限
+    pub max_per_app: u8,
+    pub timeslice_ms: u32,
+    pub apps: HashMap<String, AppRt>,
+}
+
+impl Default for RtConfig {
+    fn default() -> Self {
+        Self {
+            scope: RtScope::Off,
+            global: RtMatch::Auto,
+            max_per_app: RT_DEFAULT_MAX,
+            timeslice_ms: RT_DEFAULT_TIMESLICE,
+            apps: HashMap::new(),
+        }
+    }
+}
+
+impl RtConfig {
+    pub fn is_off(&self) -> bool {
+        self.scope == RtScope::Off
+    }
+
+    /// 是否存在「配置层面」启用的应用。时间片是否改写以此为闸门，
+    /// 与运行期是否真的提升了线程无关：没有启用 RT 时不该碰全局参数
+    pub fn any_enabled(&self) -> bool {
+        match self.scope {
+            RtScope::Off => false,
+            RtScope::Global => true,
+            RtScope::PerApp => self.apps.values().any(|a| a.enabled),
         }
     }
 
-    pub fn is_off(&self) -> bool {
-        matches!(self, RtMode::Off)
+    /// 该包是否有资格获得 RT，返回匹配方式与线程上限。
+    /// 这只回答「配置允许」，实际能否提升还要看规则允许集合与当前调度策略
+    pub fn policy(&self, pkg: &str) -> Option<(&RtMatch, u8)> {
+        match self.scope {
+            RtScope::Off => None,
+            RtScope::Global => Some((&self.global, self.max_per_app)),
+            RtScope::PerApp => self
+                .apps
+                .get(pkg)
+                .filter(|a| a.enabled)
+                .map(|a| (&a.mode, a.max_threads)),
+        }
+    }
+
+    pub fn label(&self) -> String {
+        match self.scope {
+            RtScope::Off => "off".to_string(),
+            RtScope::Global => format!("global（{}）", self.global.label()),
+            RtScope::PerApp => {
+                let n = self.apps.values().filter(|a| a.enabled).count();
+                format!("per_app（{} 个应用启用）", n)
+            }
+        }
     }
 }
 
@@ -92,9 +180,30 @@ pub struct AppConfig {
     pub sched_scope: SchedScope,
     /// S7 模式，off 时运行期零开销
     pub sched: SchedMode,
-    /// RT 提升范围
-    pub rt: RtMode,
+    /// RT 配置。off 时运行期不查询任何线程的调度策略
+    pub rt: RtConfig,
     pub topo: CpuTopology,
+}
+
+#[cfg(test)]
+impl AppConfig {
+    /// 空配置。单元测试与 RT 退出路径使用，不代表任何真实规则
+    pub fn empty() -> Self {
+        Self {
+            rules: Vec::new(),
+            pkgs: HashSet::new(),
+            has_thread_rules: HashSet::new(),
+            trunc_keys: HashSet::new(),
+            rule_index: HashMap::new(),
+            pkg_sig: HashMap::new(),
+            policy_sig: 0,
+            unmatched_all: false,
+            sched_scope: SchedScope::default(),
+            sched: SchedMode::Off,
+            rt: RtConfig::default(),
+            topo: CpuTopology::empty(),
+        }
+    }
 }
 
 /// 构建按包索引，保持规则原有顺序即保持原有并集语义
@@ -138,20 +247,40 @@ fn build_pkg_sig(rules: &[AffinityRule]) -> HashMap<String, u64> {
 
 /// 全局策略指纹：逐包指纹只覆盖规则本身，@unmatched / @sched / @rt 这类
 /// 影响所有包的开关变化不会体现在 pkg_sig 里，必须单独比对，
-/// 否则已缓存线程不会重新应用，`on → off` 也回滚不了
-fn build_policy_sig(unmatched_all: bool, sched: SchedMode, rt: &RtMode) -> u64 {
+/// 否则已缓存线程不会重新应用，`on → off` 也回滚不了。
+/// RT 的每一项都要进来：分应用开关、匹配方式、上限、时间片变化都要触发全量重扫
+fn build_policy_sig(unmatched_all: bool, sched: SchedMode, rt: &RtConfig) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     unmatched_all.hash(&mut h);
     (sched as u8).hash(&mut h);
-    match rt {
-        RtMode::Off => 0u8.hash(&mut h),
-        RtMode::Auto => 1u8.hash(&mut h),
-        RtMode::Names(v) => {
-            2u8.hash(&mut h);
+    (rt.scope as u8).hash(&mut h);
+    match &rt.global {
+        RtMatch::Auto => 0u8.hash(&mut h),
+        RtMatch::Names(v) => {
+            1u8.hash(&mut h);
             // 名字列表是 OR 语义，顺序无关，排序后再哈希避免误判变更
             let mut sorted: Vec<&str> = v.iter().map(|s| s.as_str()).collect();
             sorted.sort_unstable();
             sorted.hash(&mut h);
+        }
+    }
+    rt.max_per_app.hash(&mut h);
+    rt.timeslice_ms.hash(&mut h);
+    // 分应用表按包名排序后逐项哈希，保证与书写顺序无关
+    let mut apps: Vec<(&String, &AppRt)> = rt.apps.iter().collect();
+    apps.sort_by(|a, b| a.0.cmp(b.0));
+    for (pkg, a) in apps {
+        pkg.hash(&mut h);
+        a.enabled.hash(&mut h);
+        a.max_threads.hash(&mut h);
+        match &a.mode {
+            RtMatch::Auto => 0u8.hash(&mut h),
+            RtMatch::Names(v) => {
+                1u8.hash(&mut h);
+                let mut sorted: Vec<&str> = v.iter().map(|s| s.as_str()).collect();
+                sorted.sort_unstable();
+                sorted.hash(&mut h);
+            }
         }
     }
     h.finish()
@@ -402,6 +531,86 @@ fn add_rule(
     true
 }
 
+/// 逗号分隔的线程名模式，供 `@rt` 与 `@rt.app` 共用
+fn split_names(s: &str) -> Option<Vec<String>> {
+    let names: Vec<String> = s
+        .split(',')
+        .map(str::trim)
+        .filter(|x| !x.is_empty() && x.len() < MAX_THREAD_LEN)
+        .map(str::to_string)
+        .collect();
+    if names.is_empty() { None } else { Some(names) }
+}
+
+/// 解析 `@rt.app=<包名> <模式> [上限]`。
+/// 模式为 `auto` / `names:RenderThread,RHI*` / `off`，省略时按 auto 处理；
+/// 上限省略时用 `@rt.max`，与配置行顺序无关
+fn parse_rt_app(arg: &str, default_max: u8) -> Option<(String, AppRt)> {
+    let toks: Vec<&str> = arg.split_whitespace().collect();
+    let pkg = *toks.first()?;
+    if pkg.is_empty() || pkg.len() >= MAX_PKG_LEN {
+        return None;
+    }
+    let mut app = AppRt {
+        enabled: true,
+        mode: RtMatch::Auto,
+        max_threads: default_max,
+    };
+    let mut rest = &toks[1..];
+
+    // 可选的状态段。写 off 时保留后面的模式，用户再打开不必重填
+    if let Some(&first) = rest.first() {
+        match first {
+            "on" | "true" | "1" => rest = &rest[1..],
+            "off" | "false" | "0" => {
+                app.enabled = false;
+                rest = &rest[1..];
+            }
+            _ => {}
+        }
+    }
+
+    // 模式段，省略时按 auto
+    if let Some(&m) = rest.first() {
+        if let Ok(n) = m.parse::<u8>() {
+            if !(1..=RT_MAX_LIMIT).contains(&n) {
+                return None;
+            }
+            app.max_threads = n;
+            rest = &rest[1..];
+        } else {
+            match m {
+                "auto" => {
+                    app.mode = RtMatch::Auto;
+                    rest = &rest[1..];
+                }
+                "names" => {
+                    app.mode = RtMatch::Names(split_names(rest.get(1)?)?);
+                    rest = &rest[2..];
+                }
+                _ => {
+                    app.mode = RtMatch::Names(split_names(m.strip_prefix("names:")?)?);
+                    rest = &rest[1..];
+                }
+            }
+        }
+    }
+
+    // 剩下的唯一一个 token 是上限
+    if let Some(&n) = rest.first() {
+        let n = n.parse::<u8>().ok()?;
+        if !(1..=RT_MAX_LIMIT).contains(&n) {
+            return None;
+        }
+        app.max_threads = n;
+        rest = &rest[1..];
+    }
+    if !rest.is_empty() {
+        return None;
+    }
+    Some((pkg.to_string(), app))
+}
+
 /// 加载配置文件，返回 None 表示未变化或解析失败
 pub fn load_config(
     config_file: &str,
@@ -431,7 +640,9 @@ pub fn load_config(
     let mut unmatched_all = false;
     // 动态调度默认全关，配置里不写就与 2.3.0 行为一致
     let mut sched = SchedMode::Off;
-    let mut rt = RtMode::Off;
+    let mut rt = RtConfig::default();
+    // 分应用条目先收集原文，等 @rt.max 解析完再统一构造，避免配置行顺序影响缺省上限
+    let mut rt_apps: Vec<String> = Vec::new();
 
     for line in content.lines() {
         let p = line.trim();
@@ -458,22 +669,31 @@ pub fn load_config(
                 ("sched", "off") => sched = SchedMode::Off,
                 ("sched", "shadow") => sched = SchedMode::Shadow,
                 ("sched", "on") => sched = SchedMode::On,
-                ("rt", "off") => rt = RtMode::Off,
-                ("rt", "auto") => rt = RtMode::Auto,
-                // 名字列表：逗号分隔的 fnmatch 模式
-                ("rt", v) if !v.is_empty() => {
-                    let names: Vec<String> = v
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty() && s.len() < MAX_THREAD_LEN)
-                        .map(str::to_string)
-                        .collect();
-                    if names.is_empty() {
-                        fail_cnt += 1;
-                    } else {
-                        rt = RtMode::Names(names);
-                    }
+                ("rt", "off") => rt.scope = RtScope::Off,
+                ("rt", "global") => rt.scope = RtScope::Global,
+                ("rt", "per_app" | "per-app" | "perapp") => rt.scope = RtScope::PerApp,
+                // 兼容旧写法：@rt=auto / @rt=Name1,Name2 等价于 global 模式
+                ("rt", "auto") => {
+                    rt.scope = RtScope::Global;
+                    rt.global = RtMatch::Auto;
                 }
+                ("rt.max", v) => match v.parse::<u8>() {
+                    Ok(n) if (1..=RT_MAX_LIMIT).contains(&n) => rt.max_per_app = n,
+                    _ => fail_cnt += 1,
+                },
+                ("rt.timeslice", v) => match v.parse::<u32>() {
+                    Ok(n) if (1..=RT_TIMESLICE_LIMIT).contains(&n) => rt.timeslice_ms = n,
+                    _ => fail_cnt += 1,
+                },
+                // 分应用条目：@rt.app=com.x auto 2 / names:RenderThread,RHI* / off
+                ("rt.app", v) if !v.is_empty() => rt_apps.push(v.to_string()),
+                ("rt", v) if !v.is_empty() => match split_names(v) {
+                    Some(names) => {
+                        rt.scope = RtScope::Global;
+                        rt.global = RtMatch::Names(names);
+                    }
+                    None => fail_cnt += 1,
+                },
                 _ => fail_cnt += 1,
             }
             continue;
@@ -572,6 +792,16 @@ pub fn load_config(
         fail_cnt += 1;
     }
 
+    // 分应用条目此时构造：@rt.max 已解析完，缺省上限与书写顺序无关
+    for arg in &rt_apps {
+        match parse_rt_app(arg, rt.max_per_app) {
+            Some((pkg, app)) => {
+                rt.apps.insert(pkg, app);
+            }
+            None => fail_cnt += 1,
+        }
+    }
+
     *last_mtime = mtime;
     PARSE_FAILS.store(fail_cnt, Ordering::Relaxed);
 
@@ -634,7 +864,36 @@ pub fn load_config(
         }
     }
     if !rt.is_off() {
-        println!("RT 调度: {}", rt.label());
+        println!(
+            "RT 调度: {}，每应用上限 {}，RR 时间片 {} ms",
+            rt.label(),
+            rt.max_per_app,
+            rt.timeslice_ms
+        );
+        // per_app 里配了但没有任何亲和性规则的包不会进入决策路径，提前说明比事后排查省事
+        if rt.scope == RtScope::PerApp {
+            let mut orphan: Vec<&str> = rt
+                .apps
+                .iter()
+                .filter(|(p, a)| a.enabled && !pkgs.contains(*p))
+                .map(|(p, _)| p.as_str())
+                .collect();
+            if !orphan.is_empty() {
+                orphan.sort_unstable();
+                let sample = orphan
+                    .iter()
+                    .take(3)
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                eprintln!(
+                    "提示: {} 个应用配置了 RT 但没有亲和性规则，不会生效：{}{}",
+                    orphan.len(),
+                    sample,
+                    if orphan.len() > 3 { " 等" } else { "" }
+                );
+            }
+        }
     }
 
     Some(AppConfig {
@@ -961,14 +1220,78 @@ mod tests {
 
     #[test]
     fn rt_directive_parses_auto_and_names() {
-        assert_eq!(cfg_of("r_off", "@rt=off\ncom.a=0-1\n").rt, RtMode::Off);
-        assert_eq!(cfg_of("r_auto", "@rt=auto\ncom.a=0-1\n").rt, RtMode::Auto);
-        match cfg_of("r_names", "@rt=RenderThread,RHI*\ncom.a=0-1\n").rt {
-            RtMode::Names(v) => {
+        assert!(cfg_of("r_off", "@rt=off\ncom.a=0-1\n").rt.is_off());
+        let auto = cfg_of("r_auto", "@rt=auto\ncom.a=0-1\n");
+        assert_eq!(auto.rt.scope, RtScope::Global);
+        assert_eq!(auto.rt.global, RtMatch::Auto);
+        // 旧写法 @rt=名字列表 等价于 global + names
+        let named = cfg_of("r_names", "@rt=RenderThread,RHI*\ncom.a=0-1\n");
+        assert_eq!(named.rt.scope, RtScope::Global);
+        match named.rt.global {
+            RtMatch::Names(v) => {
                 assert_eq!(v, vec!["RenderThread".to_string(), "RHI*".to_string()])
             }
             other => panic!("期望名字列表，得到 {:?}", other),
         }
+    }
+
+    #[test]
+    fn rt_per_app_parses_entries() {
+        let cfg = cfg_of(
+            "r_perapp",
+            "@rt=per_app\n@rt.max=1\n@rt.app=com.a auto 2\n@rt.app=com.b names:RenderThread,RHI* 1\n@rt.app=com.c off\n@rt.app=com.d\ncom.a=0-1\n",
+        );
+        assert_eq!(cfg.rt.scope, RtScope::PerApp);
+        assert_eq!(cfg.rt.apps.len(), 4);
+        let a = &cfg.rt.apps["com.a"];
+        assert!(a.enabled);
+        assert_eq!(a.mode, RtMatch::Auto);
+        assert_eq!(a.max_threads, 2);
+        let b = &cfg.rt.apps["com.b"];
+        assert_eq!(
+            b.mode,
+            RtMatch::Names(vec!["RenderThread".to_string(), "RHI*".to_string()])
+        );
+        assert_eq!(b.max_threads, 1);
+        assert!(!cfg.rt.apps["com.c"].enabled);
+        // 省略模式按 auto，省略上限取 @rt.max
+        let d = &cfg.rt.apps["com.d"];
+        assert!(d.enabled);
+        assert_eq!(d.mode, RtMatch::Auto);
+        assert_eq!(d.max_threads, 1);
+    }
+
+    #[test]
+    fn rt_app_entry_is_order_independent_of_max() {
+        // @rt.max 写在条目之后，缺省上限仍应取 4
+        let cfg = cfg_of(
+            "r_order",
+            "@rt=per_app\n@rt.app=com.a\n@rt.max=4\ncom.a=0-1\n",
+        );
+        assert_eq!(cfg.rt.apps["com.a"].max_threads, 4);
+    }
+
+    #[test]
+    fn rt_disabled_entry_keeps_mode() {
+        // 关闭时保留模式，再打开不必重填
+        let cfg = cfg_of(
+            "r_keep",
+            "@rt=per_app\n@rt.app=com.a off names:RenderThread,RHI* 3\ncom.a=0-1\n",
+        );
+        let a = &cfg.rt.apps["com.a"];
+        assert!(!a.enabled);
+        assert_eq!(
+            a.mode,
+            RtMatch::Names(vec!["RenderThread".to_string(), "RHI*".to_string()])
+        );
+        assert_eq!(a.max_threads, 3);
+        assert!(cfg.rt.policy("com.a").is_none());
+    }
+
+    #[test]
+    fn rt_bad_entry_counts_as_failure() {
+        let cfg = cfg_of("r_bad", "@rt=per_app\n@rt.app=com.a turbo\ncom.a=0-1\n");
+        assert!(cfg.rt.apps.is_empty());
     }
 
     #[test]
@@ -983,5 +1306,14 @@ mod tests {
         let n1 = cfg_of("sig_n1", "@rt=A,B\ncom.a=0-1\n");
         let n2 = cfg_of("sig_n2", "@rt=B,A\ncom.a=0-1\n");
         assert_eq!(n1.policy_sig, n2.policy_sig);
+        // 分应用开关、上限、时间片都要触发重建
+        let p1 = cfg_of("sig_p1", "@rt=per_app\n@rt.app=com.a on\ncom.a=0-1\n");
+        let p2 = cfg_of("sig_p2", "@rt=per_app\n@rt.app=com.a off\ncom.a=0-1\n");
+        let p3 = cfg_of("sig_p3", "@rt=per_app\n@rt.app=com.a on 3\ncom.a=0-1\n");
+        let t = cfg_of("sig_t", "@rt=global\n@rt.timeslice=5\ncom.a=0-1\n");
+        let g = cfg_of("sig_g", "@rt=global\ncom.a=0-1\n");
+        assert_ne!(p1.policy_sig, p2.policy_sig);
+        assert_ne!(p1.policy_sig, p3.policy_sig);
+        assert_ne!(g.policy_sig, t.policy_sig);
     }
 }

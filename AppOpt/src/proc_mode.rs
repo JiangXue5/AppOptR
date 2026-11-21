@@ -165,7 +165,7 @@ fn proc_tasks(
             .task_apply(tid, pid, pkg, &thread_name, cfg, |_, _, _| false);
         if ok {
             if let Some(e) = state.cache.tasks.get(&tid) {
-                rt::note(tid, pid, &e.comm, &e.cpus, cfg);
+                rt::note(tid, pid, &e.pkg, &e.comm, &e.cpus, cfg);
             }
             added += 1;
         }

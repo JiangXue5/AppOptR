@@ -586,7 +586,7 @@ fn event_apply(
     });
     // 规则命中且亲和性写入成功后再考虑 RT，避免把没被管理的线程提升
     if ok && let Some(e) = cache.tasks.get(&tid) {
-        rt::note(tid, pid, &e.comm, &e.cpus, cfg);
+        rt::note(tid, pid, &e.pkg, &e.comm, &e.cpus, cfg);
     }
     ok
 }
@@ -616,7 +616,7 @@ pub fn full_scan(cfg: &AppConfig, state: &mut EbpfState) {
                 affinity_apply(tid, cpus, cpuset_dir, cfg, &mut state.bpf)
             });
             if ok && let Some(e) = state.cache.tasks.get(&tid) {
-                rt::note(tid, pid, &e.comm, &e.cpus, cfg);
+                rt::note(tid, pid, &e.pkg, &e.comm, &e.cpus, cfg);
             }
         }
     });
@@ -686,7 +686,7 @@ pub fn config_rescan(new: &AppConfig, state: &mut EbpfState) {
                     affinity_apply(tid, cpus, dir, new, &mut state.bpf)
                 });
                 if ok && let Some(e) = state.cache.tasks.get(&tid) {
-                    rt::note(tid, pid, &e.comm, &e.cpus, new);
+                    rt::note(tid, pid, &e.pkg, &e.comm, &e.cpus, new);
                 }
             }
         });

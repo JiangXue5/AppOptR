@@ -92,6 +92,22 @@ struct InstanceLock {
     _file: fs::File,
 }
 
+/// 退出标志。信号处理函数里只做原子写，真正的清理放回主循环
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_exit_signal(_sig: libc::c_int) {
+    SHUTDOWN.store(true, Ordering::Release);
+}
+
+/// 注册 SIGTERM / SIGINT。模块停止一般靠 pkill，不接这个信号
+/// RT 时间片就只能等下次启动恢复
+fn install_exit_handler() {
+    unsafe {
+        libc::signal(libc::SIGTERM, on_exit_signal as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGINT, on_exit_signal as *const () as libc::sighandler_t);
+    }
+}
+
 /// 同一 cpuset 目录只允许一个进程管理，不同 -b 名称各自成锁、仍可并行。
 ///
 /// 锁文件与可执行文件同目录（模块安装后即模块目录），文件内的 PID 仅用于冲突提示。
@@ -221,6 +237,8 @@ fn main() {
 
     // 锁内先恢复上次异常退出留下的 RT 时间片，避免多实例互相覆盖备份
     rt::init();
+    // 正常退出（SIGTERM/SIGINT）也要还原时间片，否则只能等下次启动兜底
+    install_exit_handler();
 
     // 先设置 cpuset 路径再初始化拓扑，init_cpu_topo 会创建 BASE_CPUSET 目录
     set_base_cpuset(&cpuset_name);
@@ -301,6 +319,11 @@ fn main() {
     }
 
     loop {
+        if SHUTDOWN.load(Ordering::Acquire) {
+            println!("收到退出信号，正在还原 RT 状态");
+            rt::shutdown();
+            break;
+        }
         // 先 swap CONFIG_UPDATED 再获取 cfg 防止漏更新
         let config_changed = CONFIG_UPDATED.swap(false, Ordering::AcqRel);
         let Some(cfg) = lock_ignore_poison(&CURRENT_CONFIG).clone() else {
@@ -314,6 +337,8 @@ fn main() {
         // 这里同时清空 S7 状态，让已迁移线程按规则重新落地
         if config_changed {
             sched_state.set_mode(cfg.sched);
+            // 先按新配置复核 RT 所有权，再决定时间片是否需要改写或还原
+            rt::prune(&cfg);
             rt::prepare(&cfg);
         }
 
