@@ -21,7 +21,8 @@ use crate::ebpf_mode::ebpf_probe;
 use crate::config::{RtMatch, RtScope};
 use crate::rt;
 use crate::rule_edit::{
-    rt_app_set, rt_configure, rule_delete, rule_delete_pkg, rule_rename, rule_upsert, RuleEdit,
+    rt_app_set, rt_configure, rt_toggle, rule_delete, rule_delete_pkg, rule_rename, rule_upsert,
+    RuleEdit,
 };
 use crate::sched::SCHED_SNAPSHOT;
 use crate::{lock_ignore_poison, EBPF_GAVE_UP, MAX_PKG_LEN, MAX_THREAD_LEN};
@@ -286,6 +287,7 @@ fn dispatch(out: &mut TcpStream, req: &Request) {
         ("POST", "/api/config") => config_set_api(req),
         ("POST", "/api/rt") => rt_api(req),
         ("POST", "/api/rt/app") => rt_app_api(req),
+        ("POST", "/api/rt/toggle") => rt_toggle_api(req),
         ("POST", "/api/suggest") => suggest_api(req),
         _ => err_json(404, "not found"),
     };
@@ -370,11 +372,14 @@ fn rules_json() -> String {
     let Some(cfg) = current_cfg() else {
         return json!({ "rules": [] }).to_string();
     };
+    // 规则页每行一个 RT 按钮，状态必须跟规则一起下发，否则要多一次往返
+    let per_app = cfg.rt.scope == RtScope::PerApp;
     let mut groups: Vec<serde_json::Value> = Vec::new();
     let mut index: HashMap<&str, usize> = HashMap::new();
     for r in &cfg.rules {
         let gi = *index.entry(r.pkg.as_str()).or_insert_with(|| {
-            groups.push(json!({ "pkg": r.pkg, "items": [] }));
+            let rt = per_app && cfg.rt.apps.get(&r.pkg).is_some_and(|a| a.enabled);
+            groups.push(json!({ "pkg": r.pkg, "items": [], "rt": rt }));
             groups.len() - 1
         });
         groups[gi]["items"]
@@ -382,7 +387,7 @@ fn rules_json() -> String {
             .unwrap()
             .push(json!({ "thread": r.thread, "spec": spec_name(&r.cpus, &cfg.topo) }));
     }
-    json!({ "rules": groups }).to_string()
+    json!({ "rules": groups, "rt_scope": rt_scope_str(cfg.rt.scope) }).to_string()
 }
 
 /// 名称校验
@@ -803,6 +808,43 @@ fn rt_app_api(req: &Request) -> (u16, String) {
         RuleEdit::Ok => {
             config_reload_now();
             (200, json!({ "ok": true }).to_string())
+        }
+        RuleEdit::Malformed => err_json(409, "配置文件存在未闭合块，请修复后重试"),
+        _ => err_json(500, "配置文件写入失败"),
+    }
+}
+
+/// 规则页的「一键 RT」：只传包名与开关，参数取缺省（auto / 2 线程 / 3 ms）。
+/// 设置页不再暴露细项，需要手工调参时直接改配置文件
+fn rt_toggle_api(req: &Request) -> (u16, String) {
+    let Ok(v) = serde_json::from_slice::<Value>(&req.body) else {
+        return err_json(400, "请求体不是合法 JSON");
+    };
+    let Some(pkg) = v["pkg"].as_str().map(str::trim) else {
+        return err_json(400, "缺少 pkg 字段");
+    };
+    if !token_ok(pkg, MAX_PKG_LEN) || pkg.chars().any(char::is_whitespace) {
+        return err_json(400, "包名含有非法字符");
+    }
+    let enabled = v["enabled"].as_bool().unwrap_or(true);
+
+    // global 模式下所有应用都在 RT，单个包的开关没有意义，
+    // 直接改写成 per_app 会静默改变其它应用的行为，因此要求先显式切模式
+    if current_cfg().is_some_and(|c| c.rt.scope == RtScope::Global) {
+        return err_json(
+            409,
+            "当前为「全部应用」模式，请先在设置中切到「按规则开启」",
+        );
+    }
+
+    let file = lock_ignore_poison(&CONFIG_FILE).clone();
+    match rt_toggle(&file, pkg, enabled) {
+        RuleEdit::Ok => {
+            config_reload_now();
+            (
+                200,
+                json!({ "ok": true, "pkg": pkg, "enabled": enabled }).to_string(),
+            )
         }
         RuleEdit::Malformed => err_json(409, "配置文件存在未闭合块，请修复后重试"),
         _ => err_json(500, "配置文件写入失败"),

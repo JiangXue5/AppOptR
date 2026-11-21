@@ -584,6 +584,76 @@ pub fn rt_app_set(path: &str, pkg: &str, spec: &str) -> RuleEdit {
     file_write(path, &lines)
 }
 
+/// `@rt.app=<包名> on|off ...` 的开关状态。省略状态时按 on 处理，
+/// 与 `parse_rt_app` 的缺省一致
+fn rt_app_state(line: &str) -> Option<bool> {
+    let (_, v) = directive_parts(line)?;
+    let mut it = v.split_whitespace();
+    it.next()?;
+    match it.next() {
+        Some("off") => Some(false),
+        Some("on") => Some(true),
+        // 只有包名或直接跟模式，都算开启
+        _ => Some(true),
+    }
+}
+
+/// 规则页「一键 RT」：一次加锁、一次写盘完成范围切换与条目写入。
+///
+/// 不写 `@rt.max` / `@rt.timeslice`，沿用配置缺省（每应用 2 线程、3 ms），
+/// 与 AsoulOpt 的 `rt=1` 等价。关闭最后一个启用条目时把 `@rt` 收回 off，
+/// 否则 `rt_active()` 仍为真，内核时间片会一直被改写。
+pub fn rt_toggle(path: &str, pkg: &str, enabled: bool) -> RuleEdit {
+    let _guard = crate::lock_ignore_poison(&WRITE_LOCK);
+    let mut lines = read_lines(path);
+
+    // 保留手工调过的模式与上限：`off` 只是状态位，重新打开时恢复原参数
+    let keep = lines.iter().find_map(|l| {
+        if rt_app_pkg(l) != Some(pkg) {
+            return None;
+        }
+        let (_, v) = directive_parts(l)?;
+        let mut it = v.split_whitespace();
+        it.next()?;
+        it.next()?;
+        let rest = it.collect::<Vec<_>>().join(" ");
+        (!rest.is_empty()).then_some(rest)
+    });
+    let part = keep.unwrap_or_else(|| "auto".to_string());
+    let spec = format!("{} {}", if enabled { "on" } else { "off" }, part);
+
+    let new_line = format!("@rt.app={} {}", pkg, spec);
+    let mut found = false;
+    let mut i = 0;
+    while i < lines.len() {
+        if rt_app_pkg(&lines[i]) == Some(pkg) {
+            if !found {
+                lines[i] = with_comment(&new_line, &lines[i]);
+                found = true;
+            } else {
+                lines.remove(i);
+                continue;
+            }
+        }
+        i += 1;
+    }
+    if !found {
+        insert_directive(&mut lines, new_line);
+    }
+
+    if enabled {
+        directive_put(&mut lines, "rt", Some("per_app"));
+    } else {
+        let any_on = lines
+            .iter()
+            .any(|l| rt_app_pkg(l).is_some() && rt_app_state(l) == Some(true));
+        if !any_on {
+            directive_put(&mut lines, "rt", Some("off"));
+        }
+    }
+    file_write(path, &lines)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -649,6 +719,74 @@ mod tests {
         assert!(matches!(rt_app_set(&conf, "com.a", ""), RuleEdit::Ok));
         let s = fs::read_to_string(&conf).unwrap();
         assert!(!s.contains("@rt.app=com.a"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rt_toggle_opens_with_defaults_and_restores_scope() {
+        let dir = format!("/tmp/appopt_rt_toggle_{}", std::process::id());
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let conf = format!("{}/applist.conf", dir);
+        fs::write(&conf, "com.a=0-1\ncom.b=0-1\n").unwrap();
+
+        // 首次开启：写 per_app + on auto，不写 max/timeslice，沿用缺省 2/3
+        assert!(matches!(rt_toggle(&conf, "com.a", true), RuleEdit::Ok));
+        let s = fs::read_to_string(&conf).unwrap();
+        assert!(s.contains("@rt=per_app"));
+        assert!(s.contains("@rt.app=com.a on auto"));
+        assert!(!s.contains("@rt.max"));
+        assert!(!s.contains("@rt.timeslice"));
+
+        // 第二个应用：不重复写 @rt，各自一条
+        assert!(matches!(rt_toggle(&conf, "com.b", true), RuleEdit::Ok));
+        let s = fs::read_to_string(&conf).unwrap();
+        assert_eq!(s.matches("@rt=").count(), 1);
+        assert_eq!(s.matches("@rt.app=").count(), 2);
+
+        // 关掉一个：条目变 off，仍留 per_app（com.b 还在开）
+        assert!(matches!(rt_toggle(&conf, "com.a", false), RuleEdit::Ok));
+        let s = fs::read_to_string(&conf).unwrap();
+        assert!(s.contains("@rt.app=com.a off auto"));
+        assert!(s.contains("@rt=per_app"));
+
+        // 关掉最后一个：@rt 收回 off，避免空转改写内核时间片
+        assert!(matches!(rt_toggle(&conf, "com.b", false), RuleEdit::Ok));
+        let s = fs::read_to_string(&conf).unwrap();
+        assert!(s.contains("@rt=off"));
+        assert_eq!(s.matches("@rt=").count(), 1);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rt_toggle_keeps_custom_mode_and_dedups() {
+        let dir = format!("/tmp/appopt_rt_toggle2_{}", std::process::id());
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let conf = format!("{}/applist.conf", dir);
+        // 手工调过的模式与上限，按钮开关不应覆盖
+        fs::write(
+            &conf,
+            "@rt=per_app\n@rt.app=com.a off names:RenderThread,RHI* 5\ncom.a=0-1\n",
+        )
+        .unwrap();
+
+        assert!(matches!(rt_toggle(&conf, "com.a", true), RuleEdit::Ok));
+        let s = fs::read_to_string(&conf).unwrap();
+        assert!(s.contains("@rt.app=com.a on names:RenderThread,RHI* 5"));
+        assert_eq!(s.matches("@rt.app=com.a").count(), 1);
+
+        // 重复开启不堆行
+        assert!(matches!(rt_toggle(&conf, "com.a", true), RuleEdit::Ok));
+        assert_eq!(
+            fs::read_to_string(&conf)
+                .unwrap()
+                .matches("@rt.app=com.a")
+                .count(),
+            1
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

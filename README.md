@@ -45,15 +45,36 @@ http://appopt.suto.top
 | 指令 | 取值 | 默认 | 说明 |
 |------|------|------|------|
 | `@unmatched` | `keep` / `all` | `keep` | 包内有线程规则但某线程未命中、且包无包级规则时的行为。`keep` 保持该线程原有亲和性；`all` 沿用 2.2.x 行为设为全部核心。 |
+| `@sched` | `off` / `shadow` / `on` | `off` | S7 负载感知：`shadow` 只判定不迁移，`on` 才真正改亲和性。 |
+| `@rt` | `off` / `global` / `per_app` | `off` | RT 调度范围。`global` 对全部受管应用生效，`per_app` 只对 `@rt.app` 里显式开启的包生效。 |
+| `@rt.max` | 1–8 | `2` | 每应用最多提升多少个线程。 |
+| `@rt.timeslice` | 1–100 | `3` | RR 时间片（毫秒），全局内核参数，仅在至少一个应用启用时写入。 |
+| `@rt.app` | `<包名> on\|off [auto\|names:名1,名2] [上限]` | — | 单个应用的 RT 条目。参数省略时按 `auto` 与 `@rt.max`。 |
 
 ```
 @unmatched=all
+@sched=on
+@rt=per_app
+@rt.app=com.example.game on auto 2
 com.example.game {
+  MainThread=6-7
   RenderThread=6-7
 }
 ```
 
+**RT 的推荐用法**：不用手写 `@rt.app`。设置页「RT 实时调度」选「按规则开启」，
+再在规则页点每个应用右侧的 `RT` 按钮即可，参数固定为 AsoulOpt 的缺省值
+（`auto` / 2 线程 / 3 ms）。全部应用的 RT 都关掉后 `@rt` 自动回到 `off`。
+
 依赖 2.2.x「未匹配线程设为全部核心」行为的配置，升级后请显式加上 `@unmatched=all`。
+
+### AsoulOpt 配置迁移
+
+`tools/asopt2appopt.py` 把 AsoulOpt 的 `asopt.conf` 转成 AppOpt 规则，详见
+[docs/AsoulOpt_配置迁移.md](docs/AsoulOpt_配置迁移.md)。
+
+模块已附带 `applist.asoulopt.conf`（AsoulOpt 内置 324 个游戏的等价配置、9720 条规则），
+**不自动启用**；需要时在设置页把「规则配置文件」指向它，或复制覆盖 `applist.conf`。
 加载与决策细节见 [CHANGELOG.md](CHANGELOG.md)；负载感知调度仅完成设计，见
 [docs/S7_负载感知调度策略设计.md](docs/S7_负载感知调度策略设计.md)。
 

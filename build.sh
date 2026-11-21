@@ -178,6 +178,7 @@ package() {
 	mkdir -p "$stage/bin/$abi" "$stage/webroot"
 	# 模块脚本与配置保持原样，不做任何改写
 	cp "$ROOT/module/module.prop" "$ROOT/module/applist.conf" \
+		"$ROOT/module/applist.asoulopt.conf" \
 		"$ROOT/module/customize.sh" "$ROOT/module/service.sh" "$stage/"
 	cp -r "$ROOT/module/META-INF" "$stage/"
 	cp "$ROOT/web/index.html" "$stage/webroot/index.html"

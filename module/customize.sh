@@ -172,6 +172,10 @@ module_instructions() {
 	ui_print "------------------------------------------"
 	ui_print "Web 管理面板："
 	ui_print "http://127.0.0.1:8889"
+	ui_print "------------------------------------------"
+	ui_print "内置 AsoulOpt 等价配置（324 个游戏，不自动启用）："
+	ui_print "/data/adb/modules/AppOpt/applist.asoulopt.conf"
+	ui_print "需要时在 Web 设置页把『规则配置文件』改为该路径"
 	ui_print "********************************************"
 }
 copy_default_rules() {

@@ -150,3 +150,31 @@ RT 调度: per_app（2 个应用启用），每应用上限 2，RR 时间片 3 m
 真机上还需要确认：`hp-core` / `p-core` / `e-core` 是否被正确识别（看
 `CPU 拓扑: ... 依据=capacity`），以及目标线程是否真的落在预期核上
 （`adb shell taskset -p <tid>`）。
+
+## 七、随模块附带的现成配置
+
+`module/applist.asoulopt.conf` 是本工具 `--full` 的产物（324 个应用、9720 条线程
+规则），随模块一起安装到 `/data/adb/modules/AppOpt/applist.asoulopt.conf`。
+
+**它不会自动生效**，避免升级模块时覆盖你自己写的规则。要启用二选一：
+
+1. Web 设置页 →「规则配置文件」改为 `/data/adb/modules/AppOpt/applist.asoulopt.conf`
+   （即时切换，原文件保留）；
+2. `cp /data/adb/modules/AppOpt/applist.asoulopt.conf /data/adb/modules/AppOpt/applist.conf`。
+
+二者都是全量替换，不与你现有规则合并。想合并请按第五节用脚本生成后手工拼接。
+
+## 八、RT 与 AsoulOpt 的对应关系
+
+AsoulOpt 的 `rt=1` 是「给这个包的渲染线程套 SCHED_RR」。AppOpt 把它拆成两步：
+
+- **范围**：设置页「RT 实时调度」选「按规则开启」（写 `@rt=per_app`）；
+- **应用**：规则页每个应用右侧的 `RT` 按钮，点一下写 `@rt.app=<包名> on auto`。
+
+参数固定为 AsoulOpt 的缺省值：自动挑选 Critical 线程、每应用最多 2 个、RR 时间片
+3 ms。设置页不再暴露上限与时间片输入，需要改时直接编辑配置文件里的
+`@rt.max` / `@rt.timeslice`。全部应用的 RT 都关掉后 `@rt` 自动回到 `off`，
+内核时间片随之还原。
+
+注意 RT 的生效前提：该应用的允许核心不超过 2 个（`auto` 只认这种线程），
+否则只登记不提升。
