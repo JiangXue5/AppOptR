@@ -203,6 +203,8 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div class="hint">检查间隔（秒），影响 /proc 扫描与配置轮询频率</div>
 <div class="hint">未匹配线程：<span id="c-unmatched">-</span></div>
 <div class="hint">可跨簇调度的规则：<span id="c-cross">-</span></div>
+<div class="hint">S7 动态分配：<span id="c-sched">-</span></div>
+<div class="hint">RT 调度：<span id="c-rt">-</span></div>
 </div>
 <div class="card">
 <div class="card-title">cpuset</div>
@@ -687,6 +689,14 @@ async function loadCfg(){
     $('c-cpuset-on').textContent=d.cpuset_enabled?'已启用':'不可用';
     $('c-unmatched').textContent=d.unmatched==='all'?'all（未命中规则的线程设为全部核心）':'keep（未命中规则的线程保持原亲和性）';
     $('c-cross').textContent=d.cluster_levels<2?'不适用（当前识别为 '+d.cluster_levels+' 个核心层）':d.cross_rules+' / '+d.rules_total+' 条，'+d.cross_pkgs+' 个包';
+    $('c-sched').textContent=(()=>{
+      const names=['off','shadow','on'];
+      const m=names[d.sched_mode]||'off';
+      if(!d.sched_mode)return 'off（不采样）';
+      const load=(d.sched_load||[]).map(v=>v<0?'-':Math.round(v/10)+'%').join(' / ');
+      return m+' · '+d.sched_state+' · 本可迁移 '+d.sched_would+' 次 · 已迁移 '+d.sched_moved+' 次 · e/p/hp '+(load||'-');
+    })();
+    $('c-rt').textContent=d.rt||'off';
   }catch(e){toast(e.message)}
 }
 document.querySelectorAll('#seg-mode button').forEach(b=>b.onclick=async()=>{

@@ -19,6 +19,7 @@ use crate::config::{
 use crate::cpuset::{base_cpuset, create_cpuset_dir, parse_cpu_spec, CpuSet, CpuTopology, DEFAULT_CPUSET_NAME};
 use crate::ebpf_mode::ebpf_probe;
 use crate::rule_edit::{rule_delete, rule_delete_pkg, rule_rename, rule_upsert, RuleEdit};
+use crate::sched::SCHED_SNAPSHOT;
 use crate::{lock_ignore_poison, EBPF_GAVE_UP, MAX_PKG_LEN, MAX_THREAD_LEN};
 
 pub const WEB_PORT: u16 = 8889;
@@ -171,12 +172,11 @@ fn origin_allowed(origin: &str) -> bool {
     }
     // 回环来源允许任意端口，但 host 之后必须是结尾或 ":端口"，避免 127.0.0.1.evil 这类前缀伪装
     for prefix in ["http://127.0.0.1", "http://localhost"] {
-        if let Some(rest) = origin.strip_prefix(prefix) {
-            if rest.is_empty()
-                || (rest.starts_with(':') && rest[1..].bytes().all(|b| b.is_ascii_digit()))
-            {
-                return true;
-            }
+        if let Some(rest) = origin.strip_prefix(prefix)
+            && (rest.is_empty()
+                || (rest.starts_with(':') && rest[1..].bytes().all(|b| b.is_ascii_digit())))
+        {
+            return true;
         }
     }
     false
@@ -584,6 +584,24 @@ fn config_json() -> String {
     let unmatched = if cfg.as_ref().is_some_and(|c| c.unmatched_all) { "all" } else { "keep" };
     let scope = cfg.as_ref().map(|c| c.sched_scope).unwrap_or_default();
     let rules_total = cfg.as_ref().map(|c| c.rules.len()).unwrap_or(0);
+    let rt = cfg
+        .as_ref()
+        .map(|c| c.rt.label())
+        .unwrap_or_else(|| "off".to_string());
+    let (s_mode, s_state, s_ticks, s_would, s_moved, s_blocked, s_load, s_last) =
+        match lock_ignore_poison(&SCHED_SNAPSHOT).clone() {
+            Some(s) => (
+                s.mode,
+                s.state,
+                s.ticks,
+                s.would,
+                s.moved,
+                s.blocked,
+                s.load.to_vec(),
+                s.last,
+            ),
+            None => (0, "off", 0, 0, 0, 0, vec![-1, -1, -1], String::new()),
+        };
     json!({
         "mode": MODE_FORCE.load(Ordering::Relaxed),
         "mode_active": if stats.is_some_and(|s| s.ebpf) { "ebpf" } else { "proc" },
@@ -597,6 +615,15 @@ fn config_json() -> String {
         "cross_rules": scope.rules,
         "cross_pkgs": scope.pkgs,
         "rules_total": rules_total,
+        "rt": rt,
+        "sched_mode": s_mode,
+        "sched_state": s_state,
+        "sched_ticks": s_ticks,
+        "sched_would": s_would,
+        "sched_moved": s_moved,
+        "sched_blocked": s_blocked,
+        "sched_load": s_load,
+        "sched_last": s_last,
     })
     .to_string()
 }
