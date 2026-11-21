@@ -121,6 +121,13 @@
   环境问题才整体停用 RT。
 - **修复**：时间片只还原自己写入的值。外部在运行期改过 `sched_rr_timeslice_ms` 时，
   以现值为新的原值记录；关闭时若发现当前值已不是自己写的，只清记录不覆盖。
+- **修复**：时间片闸门从 `RtConfig::any_enabled()` 改为 `AppConfig::rt_active()`。
+  旧实现在 `@rt=global` 下无条件返回 true，规则文件里一个包都没有时也会改写整机
+  `sched_rr_timeslice_ms`。现在 global 要求至少有一个受管包，per_app 要求启用的
+  应用确实在规则文件里。
+- **整理**：资格判定收敛为单个 `eligible(mode, comm, allowed)`。`note` 之前直接用
+  `matches()`，与 `prune` / `reconcile` 走的 `eligible()` 是两条路径，文档却写着
+  「共用」。现在三处都取一次 `cfg.rt.policy(pkg)` 再调同一个函数。
 - `SCHED_RR | SCHED_RESET_ON_FORK`、优先级 1 保持不变；只改 `sched_rr_timeslice_ms`，
   不动 `sched_rt_runtime_us` / `sched_rt_period_us`——改 RT 预算是整机行为。
 

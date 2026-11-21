@@ -70,7 +70,7 @@ impl RtState {
     /// 配置加载后调用。只有存在实际启用的应用时才改写全局时间片，
     /// 全部关闭时还原；已有备份的情况下只改值，绝不重新读取"原值"
     pub fn prepare(&mut self, cfg: &AppConfig) {
-        if !cfg.rt.any_enabled() {
+        if !cfg.rt_active() {
             self.demote_all();
             self.restore_timeslice();
             return;
@@ -90,7 +90,11 @@ impl RtState {
         let mut drop: Vec<i32> = Vec::new();
         let mut quota: HashMap<(i32, String), Vec<i32>> = HashMap::new();
         for (&tid, a) in &self.own {
-            if !eligible(cfg, &a.pkg, &a.comm, &a.allowed) {
+            let Some((mode, _)) = cfg.rt.policy(&a.pkg) else {
+                drop.push(tid);
+                continue;
+            };
+            if !eligible(mode, &a.comm, &a.allowed) {
                 drop.push(tid);
                 continue;
             }
@@ -145,9 +149,9 @@ impl RtState {
             owned = false;
         }
 
-        let eligible = matches(mode, comm, allowed);
+        let qualified = eligible(mode, comm, allowed);
         let used = self.count(pid);
-        match action(owned, eligible, realtime && !owned, used, max) {
+        match action(owned, qualified, realtime && !owned, used, max) {
             Action::Keep => {
                 // 线程名会因 rename 变化，规则集合也会随配置变化，
                 // 记录跟着更新，prune 才不会按旧名字旧集合误判
@@ -192,7 +196,13 @@ impl RtState {
             .own
             .iter()
             .filter(|(tid, a)| match cache.tasks.get(tid) {
-                Some(e) => e.pkg != a.pkg || !eligible(cfg, &e.pkg, &e.comm, &e.cpus),
+                Some(e) => {
+                    e.pkg != a.pkg
+                        || !cfg
+                            .rt
+                            .policy(&e.pkg)
+                            .is_some_and(|(mode, _)| eligible(mode, &e.comm, &e.cpus))
+                }
                 None => true,
             })
             .map(|(&tid, _)| tid)
@@ -398,16 +408,10 @@ fn action(owned: bool, eligible: bool, foreign: bool, used: usize, max: u8) -> A
     }
 }
 
-/// 该线程在新配置下是否仍有资格。`note` 与 `prune`、`reconcile` 共用，避免三处判定漂移
-fn eligible(cfg: &AppConfig, pkg: &str, comm: &str, allowed: &CpuSet) -> bool {
-    match cfg.rt.policy(pkg) {
-        Some((mode, _)) => matches(mode, comm, allowed),
-        None => false,
-    }
-}
-
-/// 匹配方式判定。Auto 用允许集合限制核数：超过 2 核说明线程本来就能跑大核
-fn matches(mode: &RtMatch, comm: &str, allowed: &CpuSet) -> bool {
+/// 线程在给定匹配方式下是否具备 RT 资格。`note` / `prune` / `reconcile`
+/// 都调这一个函数，三处不会各自解释一次 `RtMatch`。
+/// Auto 用允许集合限制核数：超过 2 核说明线程本来就能跑大核，不需要 RT
+fn eligible(mode: &RtMatch, comm: &str, allowed: &CpuSet) -> bool {
     match mode {
         RtMatch::Auto => allowed.count() <= 2 && role_of(comm).rt_candidate(),
         RtMatch::Names(patterns) => patterns.iter().any(|p| fnmatch(p, comm)),
@@ -592,6 +596,13 @@ mod tests {
         cfg
     }
 
+    /// prune / reconcile 的取策略方式，测试里复用同一路径
+    fn eligible_in(cfg: &AppConfig, pkg: &str, comm: &str, allowed: &CpuSet) -> bool {
+        cfg.rt
+            .policy(pkg)
+            .is_some_and(|(mode, _)| eligible(mode, comm, allowed))
+    }
+
     fn names(v: &[&str]) -> RtMatch {
         RtMatch::Names(v.iter().map(|s| (*s).to_string()).collect())
     }
@@ -634,8 +645,8 @@ mod tests {
     fn default_is_off() {
         let rt = RtConfig::default();
         assert!(rt.is_off());
-        assert!(!rt.any_enabled());
         assert!(rt.policy("com.a").is_none());
+        assert!(!cfg_of(rt, &["com.a"]).rt_active());
     }
 
     #[test]
@@ -646,7 +657,9 @@ mod tests {
         };
         assert!(rt.policy("com.a").is_some());
         assert!(rt.policy("com.not.installed").is_some());
-        assert!(rt.any_enabled());
+        assert!(cfg_of(rt.clone(), &["com.a"]).rt_active());
+        // 一个受管包都没有时没有线程会被提升，不该改写全局时间片
+        assert!(!cfg_of(rt, &[]).rt_active());
     }
 
     #[test]
@@ -665,7 +678,9 @@ mod tests {
         );
         assert!(rt.policy("com.a").is_some());
         assert!(rt.policy("com.b").is_none());
-        assert!(rt.any_enabled());
+        assert!(cfg_of(rt.clone(), &["com.a"]).rt_active());
+        // 应用启用了但没写进规则文件：没有受管线程，同样不碰时间片
+        assert!(!cfg_of(rt, &["com.b"]).rt_active());
     }
 
     #[test]
@@ -682,24 +697,24 @@ mod tests {
                 max_threads: 2,
             },
         );
-        assert!(!rt.any_enabled());
+        assert!(!cfg_of(rt, &["com.a"]).rt_active());
     }
 
     #[test]
     fn auto_requires_critical_and_small_set() {
-        assert!(matches(&RtMatch::Auto, "RenderThread", &cpus(2)));
+        assert!(eligible(&RtMatch::Auto, "RenderThread", &cpus(2)));
         // 允许集合超过 2 核，线程本来就能跑大核，不需要 RT
-        assert!(!matches(&RtMatch::Auto, "RenderThread", &cpus(3)));
+        assert!(!eligible(&RtMatch::Auto, "RenderThread", &cpus(3)));
         // Worker 变 RT 会挤掉 CFS
-        assert!(!matches(&RtMatch::Auto, "Thread-9", &cpus(1)));
+        assert!(!eligible(&RtMatch::Auto, "Thread-9", &cpus(1)));
     }
 
     #[test]
     fn names_use_fnmatch() {
         let m = names(&["RenderThread", "RHI*"]);
-        assert!(matches(&m, "RenderThread", &cpus(8)));
-        assert!(matches(&m, "RHIThread", &cpus(8)));
-        assert!(!matches(&m, "Thread-3", &cpus(8)));
+        assert!(eligible(&m, "RenderThread", &cpus(8)));
+        assert!(eligible(&m, "RHIThread", &cpus(8)));
+        assert!(!eligible(&m, "Thread-3", &cpus(8)));
     }
 
     #[test]
@@ -816,13 +831,13 @@ mod tests {
             ..RtConfig::default()
         };
         let auto = cfg_of(rt.clone(), &["com.a"]);
-        assert!(eligible(&auto, "com.a", "RenderThread", &cpus(2)));
+        assert!(eligible_in(&auto, "com.a", "RenderThread", &cpus(2)));
 
         // auto → names：不在列表里的线程失去资格，列表内的保留
         rt.global = names(&["GLThread"]);
         let named = cfg_of(rt, &["com.a"]);
-        assert!(!eligible(&named, "com.a", "RenderThread", &cpus(2)));
-        assert!(eligible(&named, "com.a", "GLThread", &cpus(8)));
+        assert!(!eligible_in(&named, "com.a", "RenderThread", &cpus(2)));
+        assert!(eligible_in(&named, "com.a", "GLThread", &cpus(8)));
     }
 
     #[test]

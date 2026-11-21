@@ -124,16 +124,6 @@ impl RtConfig {
         self.scope == RtScope::Off
     }
 
-    /// 是否存在「配置层面」启用的应用。时间片是否改写以此为闸门，
-    /// 与运行期是否真的提升了线程无关：没有启用 RT 时不该碰全局参数
-    pub fn any_enabled(&self) -> bool {
-        match self.scope {
-            RtScope::Off => false,
-            RtScope::Global => true,
-            RtScope::PerApp => self.apps.values().any(|a| a.enabled),
-        }
-    }
-
     /// 该包是否有资格获得 RT，返回匹配方式与线程上限。
     /// 这只回答「配置允许」，实际能否提升还要看规则允许集合与当前调度策略
     pub fn policy(&self, pkg: &str) -> Option<(&RtMatch, u8)> {
@@ -196,6 +186,21 @@ impl AppConfig {
         self.has_thread_rules.contains(pkg)
             || (self.sched != SchedMode::Off && self.sched_pkgs.contains(pkg))
             || self.rt.policy(pkg).is_some()
+    }
+
+    /// 是否存在真正会被管理的 RT 应用。全局时间片是否改写以此为闸门：
+    /// 光有 `@rt=global` 但列表里没有任何受管包时，一个线程都不会被提升，
+    /// 这时改 `sched_rr_timeslice_ms` 只会影响别人的 RR 线程
+    pub fn rt_active(&self) -> bool {
+        match self.rt.scope {
+            RtScope::Off => false,
+            RtScope::Global => !self.pkgs.is_empty(),
+            RtScope::PerApp => self
+                .rt
+                .apps
+                .iter()
+                .any(|(pkg, a)| a.enabled && self.pkgs.contains(pkg)),
+        }
     }
 }
 
