@@ -30,7 +30,7 @@ use crate::config::{
     AppConfig, CHECK_INTERVAL, CONFIG_FILE, CURRENT_CONFIG, SchedMode, config_loader, init_inotify,
     load_config,
 };
-use crate::cpuset::{init_cpu_topo, set_base_cpuset};
+use crate::cpuset::{CpuSet, init_cpu_topo, set_base_cpuset};
 use crate::ebpf_mode::{
     DROPPED_TOTAL, EbpfState, affinity_check, comm_map_init, config_rescan, ebpf_init,
     event_dispatch, full_scan, reconcile,
@@ -372,7 +372,17 @@ fn main() {
         // 模式切换必须立即生效：`on -> off` 依赖 policy_sig 变化触发全量重扫，
         // 这里同时清空 S7 状态，让已迁移线程按规则重新落地
         if config_changed {
-            sched_state.set_mode(cfg.sched);
+            // 离开 on（含 on -> shadow）必须丢掉缓存里的 S7 落点，
+            // 否则定期校验会一直按旧落点维持，等于模式没关掉
+            let switched = sched_state.set_mode(cfg.sched);
+            if switched && cfg.sched != SchedMode::On {
+                if let Some(es) = ebpf_state.as_mut() {
+                    es.cache.clear_sched();
+                }
+                if let Some(ps) = proc_state.as_mut() {
+                    ps.cache.clear_sched();
+                }
+            }
             // 先按新配置复核 RT 所有权，再决定时间片是否需要改写或还原
             rt::prune(&cfg);
             rt::prepare(&cfg);
@@ -501,7 +511,7 @@ fn main() {
         // S7 采样与迁移。off 时 tick 立即返回，只刷新一次快照供 Web 显示
         if sched_deadline.elapsed() >= sched::sample_period() {
             sched_deadline = Instant::now();
-            sched_state.set_mode(cfg.sched);
+            let _ = sched_state.set_mode(cfg.sched);
             let moves = if cfg.sched == SchedMode::On {
                 match (&ebpf_state, &proc_state) {
                     (Some(es), _) => sched_state.tick(&cfg, &es.cache),
@@ -591,11 +601,19 @@ fn apply_move_ebpf(es: &mut EbpfState, cfg: &AppConfig, m: &sched::Move) -> Affi
     // 失败时还会把线程留在一个比目标更宽的集合里
     match affinity_apply(m.tid, &m.cpus, None, &cfg.topo, ApplyReason::Sched, &m.comm).0 {
         AffinityOutcome::Set => {
+            // S7 只写 sched_setaffinity，cgroup 会把集合求交：返回 0 也可能被裁小。
+            // 读回不一致就不能记落点——定期校验会按一个内核根本不接受的集合维持，
+            // S7 又把「回读不一致」当成被规则拉回，每轮重置状态再迁一次
+            if CpuSet::get_affinity(m.tid).is_some_and(|a| a != m.cpus) {
+                return AffinityOutcome::Failed;
+            }
             // 同步缓存：affinity_sync 每 3*interval 秒会按 entry.cpus 重设，
             // 不改这里，迁移结果几秒后就被拉回规则值
             if let Some(e) = es.cache.tasks.get_mut(&m.tid) {
                 e.cpus = m.cpus;
             }
+            // 落点另存一份：缓存随时可能被全量重建，条目里的值活不过一次重扫
+            es.cache.note_sched(m.tid, m.cpus);
             AffinityOutcome::Set
         }
         AffinityOutcome::Gone => {
@@ -609,9 +627,13 @@ fn apply_move_ebpf(es: &mut EbpfState, cfg: &AppConfig, m: &sched::Move) -> Affi
 fn apply_move_proc(ps: &mut ProcScanState, cfg: &AppConfig, m: &sched::Move) -> AffinityOutcome {
     match affinity_apply(m.tid, &m.cpus, None, &cfg.topo, ApplyReason::Sched, &m.comm).0 {
         AffinityOutcome::Set => {
+            if CpuSet::get_affinity(m.tid).is_some_and(|a| a != m.cpus) {
+                return AffinityOutcome::Failed;
+            }
             if let Some(e) = ps.cache.tasks.get_mut(&m.tid) {
                 e.cpus = m.cpus;
             }
+            ps.cache.note_sched(m.tid, m.cpus);
             AffinityOutcome::Set
         }
         AffinityOutcome::Gone => {

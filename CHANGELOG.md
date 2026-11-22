@@ -1,5 +1,62 @@
 # AppOptR 变更记录
 
+## 2.3.10（2026-11-22）
+
+静态审计的 P1：**S7 的迁移活不过一个校验周期**。
+
+### 两条路径互相覆盖
+
+`apply_move_*` 迁移成功后写 `TaskEntry.cpus = m.cpus`，注释里写得很清楚：
+
+> 同步缓存：affinity_sync 每 3*interval 秒会按 entry.cpus 重设，不改这里，迁移结果几秒后就被拉回规则值
+
+但 2.3.8 为了解决「组把目标裁小」，把 `affinity_sync` 改成每轮从 `e.want` 重算：
+
+```rust
+let target = plan_target(&e.want, ...);
+e.cpus = target.cpus;   // ← S7 刚写进去的落点在这一行被覆盖
+```
+
+`want` 是规则原值，不会因为迁移而改变，于是 S7 迁到 4-7 的线程，下一个校验周期就被
+拉回 0-7。日志上 `moved` 在涨、线程实际落点却始终等于规则集合，S7 的 `settle` 与
+`affinity_sync` 反复争夺同一批线程。
+
+还有一处更隐蔽：proc 模式每 60 秒 `proc_scan` 会 `cache.clear()`，eBPF 模式配置变更
+也会 `full_scan` → `clear()`。落点如果只记在 `TaskEntry` 里，会连同条目一起丢掉，
+重建后按规则重新落地——S7 的迁移在 proc 模式下最长只能活 60 秒。
+
+### 修法：落点单独存，校验按落点维持
+
+- `ProcCache` 新增 `sched: HashMap<i32, CpuSet>`，`note_sched()` 记录 S7 成功写入的集合。
+  `clear()` 只清条目、保留落点，全量重建后仍能维持。
+- 定期校验与事件复核统一走 `plan_entry()`：落点**仍在当前规则集合内**且本次规划
+  没有把它裁小，就按落点维持；否则丢弃落点、回到 `want` 重算。三种丢弃条件分别对应
+  「规则被改小」「应用切后台组收紧」「关掉 S7」，都不会留下一个内核根本不接受的集合。
+- `purge_pkg` / `purge_pid` / `task_del` 同步清理落点，规则变更与线程退出不会留下幽灵。
+- 关闭 S7（`on → off` 或 `on → shadow`）时清空全部落点，线程按规则重新落地。
+  `set_mode()` 改为返回「是否真的切换」，避免主循环每秒调用时误清状态。
+- S7 迁移写后回读：`apply_move_*` 拿到 `Set` 后读一次 `sched_getaffinity`，
+  与目标不一致（被 cgroup 求交裁小）就返回 `Failed`，不记落点。
+  否则落点是个内核不接受集合，S7 每轮都把「回读不一致」当成被规则拉回并重置状态。
+
+### 测试
+
+新增 5 例，`cargo test` 152 passed / 0 failed / 1 ignored：
+
+| 测试 | 覆盖 |
+|------|------|
+| `sched_landing_survives_periodic_check` | 落点压过规则原值（修复前必失败） |
+| `stale_landing_is_dropped_when_rule_shrinks` | 规则改小后旧落点作废 |
+| `unreachable_landing_falls_back_to_rule` | 组不可达时回到规则值 |
+| `plan_entry_keeps_or_releases_landing_consistently` | 四种组合的取舍一致 |
+| `sched_landing_survives_cache_rebuild` | 全量重建后落点仍在，线程退出后清掉 |
+
+### 预期
+
+真机 `@sched=on` 时，`S7: Thread-x → p-core` 之后线程应稳定停在目标簇，
+不再出现「迁移日志每秒一条、实际落点始终是规则集合」；`无效绑定` 不应因校验而增加。
+若目标簇被系统组挡住，日志会记一次「迁移失败」并冷却 10 秒，而不是每轮重置状态。
+
 ## 2.3.9（2026-11-22）
 
 2.3.8 的日志第一行就把自己否定了：

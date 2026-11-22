@@ -118,29 +118,82 @@ fn fit_rule(want: &CpuSet, group: SysGroup, eff: Option<&str>) -> GroupFit {
     }
 }
 
+/// S7 落点能否作为本轮基准：必须是当前规则集合的子集。
+///
+/// 这是 S7 与定期校验之间的唯一契约。`want` 永远是规则原值，定期校验若直接
+/// 按 `want` 重算，S7 刚迁到 4-7 的线程下一个周期就被拉回 0-7，计数与落点
+/// 全部对不上。规则改小时旧落点越界，这里返回 `None`，交回规则重算
+fn landing_for(rule: &CpuSet, landing: Option<CpuSet>) -> Option<CpuSet> {
+    landing.filter(|s| s.subset_of(rule))
+}
+
+/// 单条线程本轮的目标：能维持 S7 落点就维持，否则回到规则值。
+///
+/// 返回的第二个值是该落点是否仍然有效，调用方据此决定要不要删除记录。
+/// 「落点有效」的判据有两条：仍在规则集合内，且这次规划没有把它裁小
+/// （迁不进自己的组时，被裁小的落点 S7 自己也维持不住，交回规则更稳定）
+fn plan_entry(
+    rule: &CpuSet,
+    landing: Option<CpuSet>,
+    group: SysGroup,
+    eff: Option<&str>,
+    respect: bool,
+    migrate: bool,
+) -> (Target, Option<CpuSet>) {
+    if let Some(s) = landing_for(rule, landing) {
+        let t = plan_target(&s, group, eff, respect, migrate);
+        if !t.blocked && (t.cpus == s || migrate) {
+            return (t, Some(s));
+        }
+    }
+    (plan_target(rule, group, eff, respect, migrate), None)
+}
+
 /// 双模式共用进程缓存，eBPF 事件驱动增量维护，proc 模式触发全量重建
 pub struct ProcCache {
     pub tasks: HashMap<i32, TaskEntry>,
+    /// S7 接管落点：tid → 上次迁移成功写入的集合。
+    ///
+    /// 必须单独存放，不能只记在 `TaskEntry` 里：proc 模式每 60 秒全量重建缓存，
+    /// eBPF 模式配置变更也会 `clear()`，落点存在条目上会连同条目一起丢掉，
+    /// 定期校验随后按规则原值重写，S7 的迁移活不过一个周期。
+    /// 规则改小、组不再可达、线程退出时由 `landing_for` 与 `purge_*` 清掉。
+    sched: HashMap<i32, CpuSet>,
 }
 
 impl ProcCache {
     pub fn new() -> Self {
         Self {
             tasks: HashMap::new(),
+            sched: HashMap::new(),
         }
     }
 
+    /// 只清线程条目，保留 S7 落点：全量重建后定期校验仍要按落点维持，
+    /// 否则每 60 秒就会把动态迁移拉回规则值一次
     pub fn clear(&mut self) {
         self.tasks.clear();
     }
 
     pub fn task_del(&mut self, tid: i32) {
         self.tasks.remove(&tid);
+        self.sched.remove(&tid);
+    }
+
+    /// S7 迁移成功。落点单独存，重建缓存后仍能维持
+    pub fn note_sched(&mut self, tid: i32, cpus: CpuSet) {
+        self.sched.insert(tid, cpus);
+    }
+
+    /// 关掉 S7 时清空全部落点，让线程按规则重新落地
+    pub fn clear_sched(&mut self) {
+        self.sched.clear();
     }
 
     /// 进程退出时清理其全部线程
     pub fn purge_pid(&mut self, pid: i32) {
         self.tasks.retain(|_, e| e.pid != pid);
+        self.sched.retain(|tid, _| self.tasks.contains_key(tid));
     }
 
     /// 包规则变更时清理该包全部线程，返回被清理的 tid 供调用方同步内核表
@@ -153,6 +206,8 @@ impl ProcCache {
             .collect();
         for tid in &stale {
             self.tasks.remove(tid);
+            // 规则变了，按旧规则迁出来的落点不再有效
+            self.sched.remove(tid);
         }
         stale
     }
@@ -204,13 +259,22 @@ impl ProcCache {
         let eff = path
             .as_deref()
             .and_then(crate::cpuset::group_effective_cached);
-        let target = plan_target(
+        // 规则变了（同一条目却算出不同集合）就丢掉旧的 S7 落点：
+        // 事件重放或重扫可能在 purge 之前撞上同一个 tid
+        if prev.is_some_and(|old| old.want != result.cpus) {
+            self.sched.remove(&tid);
+        }
+        let (target, keep) = plan_entry(
             &result.cpus,
+            self.sched.get(&tid).copied(),
             group,
             eff.as_deref(),
             cfg.sysgroup_respect,
             migrate,
         );
+        if keep.is_none() {
+            self.sched.remove(&tid);
+        }
         if let Some(eff) = &target.clipped {
             crate::diag::note_group_clip(group, &result.cpus, &target.cpus, eff);
         }
@@ -273,6 +337,10 @@ impl ProcCache {
         let mut dead_tids: Vec<i32> = Vec::new();
         let mut blocked_now = 0u64;
         let migrate = topo.cpuset_enabled && !crate::apply_affinity::cpuset_paused();
+        // 已退出的线程不会再有事件，落点留在这里只会慢慢堆积。
+        // 每轮按在线条目裁剪一次，成本是一次哈希遍历
+        self.sched.retain(|tid, _| self.tasks.contains_key(tid));
+        let sched = &mut self.sched;
         for (tid, e) in self.tasks.iter_mut() {
             // 组归属每轮都重看，不只在「已被拦住」时看。应用切后台时系统会把
             // 线程从 top-app 搬进 background(0-3)，规则却仍要 4-6，交集为空。
@@ -292,7 +360,20 @@ impl ProcCache {
             let eff = path
                 .as_deref()
                 .and_then(crate::cpuset::group_effective_cached);
-            let target = plan_target(&e.want, group, eff.as_deref(), respect, migrate);
+            // S7 接管过的线程按落点维持，不按规则原值重算：`want` 是规则集，
+            // 直接拿它算会把刚迁到 4-7 的线程拉回 0-7，迁移白做
+            let (target, keep) = plan_entry(
+                &e.want,
+                sched.get(tid).copied(),
+                group,
+                eff.as_deref(),
+                respect,
+                migrate,
+            );
+            if keep.is_none() && sched.contains_key(tid) {
+                // 落点已不可达（切后台、组收紧、规则改小）：接管作废
+                sched.remove(tid);
+            }
             e.group = group;
             e.cpus = target.cpus;
             e.blocked = target.blocked;
@@ -416,5 +497,112 @@ mod tests {
             fit_rule(&set_of("4-6"), SysGroup::Own, Some("0-3")),
             GroupFit::Open
         );
+    }
+
+    /// S7 与定期校验的契约：落点必须压过规则原值。
+    /// 修复前 `affinity_sync` 用 `e.want` 重算，S7 刚迁到 4-7 的线程
+    /// 下一个校验周期就被拉回 0-7，日志里 moved 在涨、落点却对不上
+    #[test]
+    fn sched_landing_survives_periodic_check() {
+        let rule = set_of("0-7");
+        let landing = landing_for(&rule, Some(set_of("4-7")));
+        assert_eq!(landing, Some(set_of("4-7")));
+        let t = plan_target(
+            &landing.unwrap_or(rule),
+            SysGroup::TopApp,
+            Some("0-7"),
+            true,
+            true,
+        );
+        assert!(!t.blocked);
+        assert_eq!(t.cpus.to_range_string(), "4-7");
+    }
+
+    /// 规则被改小后旧落点越界，必须交回规则重算，不能继续维持一个非法集合
+    #[test]
+    fn stale_landing_is_dropped_when_rule_shrinks() {
+        assert_eq!(landing_for(&set_of("0-3"), Some(set_of("4-7"))), None);
+        // 规则没变（或变大）时落点仍然有效
+        assert_eq!(
+            landing_for(&set_of("0-7"), Some(set_of("4-7"))),
+            Some(set_of("4-7"))
+        );
+    }
+
+    /// 落点被系统组挡住（应用切后台，组只剩 0-3）：接管作废，
+    /// 本轮就回到规则值并按规则裁剪，而不是每秒撞一次 EINVAL
+    #[test]
+    fn unreachable_landing_falls_back_to_rule() {
+        let rule = set_of("0-7");
+        let landing = landing_for(&rule, Some(set_of("4-6"))).unwrap();
+        assert!(plan_target(&landing, SysGroup::Background, Some("0-3"), true, false).blocked);
+        let t = plan_target(&rule, SysGroup::Background, Some("0-3"), true, false);
+        assert!(!t.blocked);
+        assert_eq!(t.cpus.to_range_string(), "0-3");
+    }
+
+    /// 周期校验的完整决策：落点该留就留，该丢就丢，不能只对一半
+    #[test]
+    fn plan_entry_keeps_or_releases_landing_consistently() {
+        // 规则没变、组能容纳：维持 S7 落点
+        let (t, keep) = plan_entry(
+            &set_of("0-7"),
+            Some(set_of("4-7")),
+            SysGroup::TopApp,
+            Some("0-7"),
+            true,
+            true,
+        );
+        assert_eq!(keep, Some(set_of("4-7")));
+        assert_eq!(t.cpus.to_range_string(), "4-7");
+
+        // 规则改小：落点越界，回到规则值
+        let (t2, keep2) = plan_entry(
+            &set_of("0-3"),
+            Some(set_of("4-7")),
+            SysGroup::TopApp,
+            Some("0-7"),
+            true,
+            true,
+        );
+        assert!(keep2.is_none());
+        assert_eq!(t2.cpus.to_range_string(), "0-3");
+
+        // 组收紧且迁不进自己的组：落点会被裁小，S7 自己也维持不住，交回规则
+        let (t3, keep3) = plan_entry(
+            &set_of("0-7"),
+            Some(set_of("4-7")),
+            SysGroup::Foreground,
+            Some("0-5"),
+            true,
+            false,
+        );
+        assert!(keep3.is_none());
+        assert_eq!(t3.cpus.to_range_string(), "0-5");
+
+        // 能迁组时落点仍成立：迁进 AppOpt/4-7 后不再受系统组限制
+        let (t4, keep4) = plan_entry(
+            &set_of("0-7"),
+            Some(set_of("4-7")),
+            SysGroup::Foreground,
+            Some("0-5"),
+            true,
+            true,
+        );
+        assert_eq!(keep4, Some(set_of("4-7")));
+        assert_eq!(t4.cpus.to_range_string(), "4-7");
+    }
+
+    /// proc 模式每 60 秒全量重建缓存，eBPF 模式配置变更也会 `clear()`。
+    /// 落点若只记在条目里，重建一次就被规则值覆盖，S7 的迁移活不过一个周期
+    #[test]
+    fn sched_landing_survives_cache_rebuild() {
+        let mut cache = ProcCache::new();
+        cache.note_sched(4321, set_of("4-7"));
+        cache.clear();
+        assert_eq!(cache.sched.get(&4321).copied(), Some(set_of("4-7")));
+        // 线程退出后不再保留
+        cache.task_del(4321);
+        assert!(cache.sched.get(&4321).is_none());
     }
 }

@@ -355,10 +355,13 @@ impl SchedState {
     }
 
     /// 模式切换时清空状态：`on -> off` 必须让已迁移线程重新按规则落地，
-    /// 否则线程停在上次的落点，回滚不彻底
-    pub fn set_mode(&mut self, mode: SchedMode) {
+    /// 否则线程停在上次的落点，回滚不彻底。
+    ///
+    /// 返回是否真的切换了模式：调用方据此决定要不要丢弃缓存里的 S7 落点。
+    /// 模式没变时不能清状态——主循环每秒都会调一次，清了等于每秒重置 S7
+    pub fn set_mode(&mut self, mode: SchedMode) -> bool {
         if self.mode == mode {
-            return;
+            return false;
         }
         self.mode = mode;
         self.threads.clear();
@@ -369,6 +372,7 @@ impl SchedState {
             SchedMode::Off => "off",
             _ => "采样预热",
         };
+        true
     }
 
     /// 主循环每轮调用。off 模式零开销直接返回。
