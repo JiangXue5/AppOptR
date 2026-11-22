@@ -80,7 +80,6 @@ struct Request {
     path: String,
     host: String,
     origin: String,
-    fetch_site: String,
     content_type: String,
     body: Vec<u8>,
     keep_alive: bool,
@@ -128,13 +127,8 @@ fn request_read(reader: &mut BufReader<TcpStream>) -> Option<Request> {
     let path = parts.next()?.split('?').next().unwrap_or("").to_string();
     let version = parts.next().unwrap_or("HTTP/1.1").to_string();
 
-    let (mut host, mut origin, mut site, mut ctype, mut len) = (
-        String::new(),
-        String::new(),
-        String::new(),
-        String::new(),
-        0usize,
-    );
+    let (mut host, mut origin, mut ctype, mut len) =
+        (String::new(), String::new(), String::new(), 0usize);
     let mut conn = String::new();
     for h in lines {
         let Some((k, v)) = h.split_once(':') else {
@@ -144,7 +138,6 @@ fn request_read(reader: &mut BufReader<TcpStream>) -> Option<Request> {
         match k.trim().to_ascii_lowercase().as_str() {
             "host" => host = v.to_ascii_lowercase(),
             "origin" => origin = v.to_ascii_lowercase(),
-            "sec-fetch-site" => site = v.to_ascii_lowercase(),
             "content-type" => ctype = v.to_ascii_lowercase(),
             "content-length" => len = v.parse().unwrap_or(usize::MAX),
             "connection" => conn = v.to_ascii_lowercase(),
@@ -170,7 +163,6 @@ fn request_read(reader: &mut BufReader<TcpStream>) -> Option<Request> {
         path,
         host,
         origin,
-        fetch_site: site,
         content_type: ctype,
         body,
         keep_alive,
@@ -234,6 +226,19 @@ fn resp_send(
     let _ = out.flush();
 }
 
+/// 请求来源判定。抽成纯函数，便于覆盖「不带 Sec-Fetch-Site 的客户端」这类边界。
+///
+/// 曾经用 `Sec-Fetch-Site` 作为同源依据：不带该头就算同源。这个头是客户端自己
+/// 填的，curl 只要不填、再带一个恶意 Origin 就能写配置，比浏览器更容易通过。
+/// 现在只认两件事——Origin 为空 / `null`（本机工具、file:// 页面），或命中白名单
+/// （回环与 KernelSU WebUI 容器）。其余一律 403
+fn origin_ok(host: &str, origin: &str, method: &str, ctype: &str) -> bool {
+    let host_ok = matches!(host, "127.0.0.1" | "localhost");
+    host_ok
+        && (origin.is_empty() || origin == "null" || origin_allowed(origin))
+        && (method != "POST" || ctype.starts_with("application/json"))
+}
+
 fn dispatch(out: &mut TcpStream, req: &Request) {
     let port_str = format!(":{}", WEB_PORT);
     let host = req
@@ -241,15 +246,9 @@ fn dispatch(out: &mut TcpStream, req: &Request) {
         .strip_suffix(&port_str)
         .unwrap_or(req.host.as_str());
     let host_ok = matches!(host, "127.0.0.1" | "localhost");
-    // 同源请求不带 Origin 或为 null；WebUI 容器来源的 Sec-Fetch-Site 必然是 cross-site
-    let same_site = req.origin.is_empty()
-        || req.origin == "null"
-        || matches!(req.fetch_site.as_str(), "" | "none" | "same-origin");
     let cross_webui = origin_allowed(&req.origin);
     let cors = cross_webui.then_some(req.origin.as_str());
-    let origin_ok = host_ok
-        && (same_site || cross_webui)
-        && (req.method != "POST" || req.content_type.starts_with("application/json"));
+    let allowed = origin_ok(host, &req.origin, req.method.as_str(), &req.content_type);
 
     // 预检不携带业务语义，只回放行头；来源不在白名单时直接拒绝
     if req.method == "OPTIONS" {
@@ -265,7 +264,7 @@ fn dispatch(out: &mut TcpStream, req: &Request) {
         return;
     }
 
-    if !origin_ok {
+    if !allowed {
         resp_send(
             out,
             403,
@@ -427,6 +426,13 @@ fn pkg_shape_ok(pkg: &str) -> bool {
     !(pkg.contains('{') && pkg.ends_with('}'))
 }
 
+/// 线程名最终写成 `\t名字=集合`。`{` `}` `=` 会改变配置结构：
+/// `a{b` 会被读成包 a 的线程 b（幽灵规则，解析器不报错），`}` 会提前闭合规则块，
+/// `=` 会让集合解析从错误的位置开始。包名不能一起拉黑——`pkg {` 是块语法的开头
+fn thread_token_ok(s: &str, max: usize) -> bool {
+    token_ok(s, max) && !s.bytes().any(|b| matches!(b, b'{' | b'}' | b'='))
+}
+
 fn rule_api(req: &Request) -> (u16, String) {
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(&req.body) else {
         return err_json(400, "请求体不是合法 JSON");
@@ -441,7 +447,9 @@ fn rule_api(req: &Request) -> (u16, String) {
     let Some(cfg) = current_cfg() else {
         return err_json(500, "配置未就绪");
     };
-    if !token_ok(pkg, MAX_PKG_LEN) || (!thread.is_empty() && !token_ok(thread, MAX_THREAD_LEN)) {
+    if !token_ok(pkg, MAX_PKG_LEN)
+        || (!thread.is_empty() && !thread_token_ok(thread, MAX_THREAD_LEN))
+    {
         return err_json(400, "名称含有非法字符");
     }
     if thread.is_empty() && !pkg_shape_ok(pkg) {
@@ -1345,6 +1353,49 @@ mod tests {
         assert!(origin_allowed("https://mui.kernelsu.org"));
         assert!(origin_allowed("http://localhost:8080"));
         assert!(origin_allowed("http://127.0.0.1:5000"));
+    }
+
+    /// 不带 Sec-Fetch-Site 的客户端不能因为「缺头」被当成同源。
+    /// 修复前 curl 带 `Origin: https://evil.example` 能直接写规则
+    #[test]
+    fn origin_requires_whitelist_even_without_fetch_site() {
+        assert!(origin_ok("127.0.0.1", "", "GET", ""));
+        assert!(origin_ok("localhost", "null", "POST", "application/json"));
+        assert!(origin_ok(
+            "127.0.0.1",
+            "https://mui.kernelsu.org",
+            "POST",
+            "application/json"
+        ));
+        assert!(origin_ok(
+            "127.0.0.1",
+            "http://127.0.0.1:8889",
+            "POST",
+            "application/json"
+        ));
+        // 恶意 Origin：不再因为没带 Sec-Fetch-Site 而放行
+        assert!(!origin_ok("127.0.0.1", "https://evil.example", "GET", ""));
+        assert!(!origin_ok(
+            "127.0.0.1",
+            "https://evil.example",
+            "POST",
+            "application/json"
+        ));
+        // Host 不是回环、POST 不是 JSON，仍然拒绝
+        assert!(!origin_ok("10.0.0.2", "", "GET", ""));
+        assert!(!origin_ok("127.0.0.1", "", "POST", "text/plain"));
+    }
+
+    /// `a{b` 会被写成包 a 的线程 b，`}` 会提前闭合块，`=` 会让集合错位
+    #[test]
+    fn thread_name_rejects_block_syntax() {
+        assert!(thread_token_ok("RenderThread", MAX_THREAD_LEN));
+        assert!(thread_token_ok("Thread-1", MAX_THREAD_LEN));
+        for bad in ["a{b", "a}b", "a=b", "{", "}", "="] {
+            assert!(!thread_token_ok(bad, MAX_THREAD_LEN), "{bad}");
+        }
+        // 包名不受影响：`pkg {` 是块语法
+        assert!(token_ok("com.example.game", MAX_PKG_LEN));
     }
 
     #[test]

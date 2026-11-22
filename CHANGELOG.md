@@ -1,5 +1,61 @@
 # AppOptR 变更记录
 
+## 2.4.0（2026-11-22）
+
+2.3.10 之后剩下的四项审计项一起合入。都不改绑核与 RT 的主链路，主要是「状态什么时候失效」和「入口能不能被绕过」。
+
+### S9：规则热更新叫不醒休眠中的 S7
+
+2.3.8 给 S7 加了空转降频：连续 30 轮「探到线程、零迁移、全是允许集合不足」后，
+判定间隔拉到 30 秒。但 `set_mode()` 在模式未变时直接返回，而热更新往往只改规则、
+模式仍是 `on`——`idle_rounds` 与 `last_decide` 原样保留，新规则最坏要等 30 秒才参与判定。
+
+现在配置变更调用 `note_config_change()`，只清 `idle_rounds` 与 `last_decide`，
+不动线程落点、冷却与冻结：重建整套 S7 状态会让刚稳定的线程重新抖动。
+
+### S10：`core_ctl` 不再默认改内核参数
+
+`service.sh` 启动时无条件把每个簇的 `min_cpus` 拉到 `max_cpus`，让核心常在线，
+代价是待机功耗与发热上升，而且停用模块没有任何恢复逻辑。
+
+改为**默认不动**，需要时在模块目录放一个空的 `keep_cores` 文件启用：
+
+```sh
+touch /data/adb/modules/AppOpt/keep_cores    # 启用
+rm /data/adb/modules/AppOpt/keep_cores       # 关闭，下次启动恢复
+```
+
+首次启用会把每个簇的 `min_cpus` 原值记进 `core_ctl.bak`（重复启动不会把已改过的值
+当成原值），删掉开关后按记录写回并删除备份。卸载模块时脚本不再执行，重启由内核恢复默认值。
+
+### F-1：不再用 `Sec-Fetch-Site` 判断同源
+
+原来 `same_site = Origin 为空 || Origin 为 null || Sec-Fetch-Site ∈ {空, none, same-origin}`。
+最后一项是客户端自填的：curl 不带这个头、再带一个恶意 `Origin`，反而比浏览器更容易通过。
+
+现在只认两件事：`Origin` 为空 / `null`（本机工具、file:// 页面），或命中白名单
+（回环任意端口、`https://mui.kernelsu.org`）。其余一律 403。浏览器 CSRF 链路此前已由
+CORS 预检封死，这次补的是非浏览器客户端那条缝。
+
+### F-2：线程名禁止 `{ } =`
+
+线程名最终写成 `\t名字=集合`。`a{b` 会被读成包 a 的线程 b（幽灵规则，`parse_fail=0`
+不报错），`}` 会提前闭合规则块，`=` 会让集合解析错位。新增 `thread_token_ok()`，
+只对线程名生效——包名不能一起拉黑，`pkg {` 是块语法的开头。
+
+### 测试
+
+`cargo test` **155 passed / 0 failed / 1 ignored**，新增 3 例：
+
+| 测试 | 覆盖 |
+|------|------|
+| `config_change_wakes_idle_scheduler` | 休眠档下热更新立刻恢复判定 |
+| `origin_requires_whitelist_even_without_fetch_site` | 不带 Sec-Fetch-Site 的恶意 Origin 被拒 |
+| `thread_name_rejects_block_syntax` | `{ } =` 全部拦截，包名不受影响 |
+
+`core_ctl` 分支在沙箱用临时目录跑过四轮：未启用不改动 → 启用拉到 max 并记录原值 →
+重复启动不覆盖原值 → 关闭后恢复并删除备份。
+
 ## 2.3.10（2026-11-22）
 
 静态审计的 P1：**S7 的迁移活不过一个校验周期**。

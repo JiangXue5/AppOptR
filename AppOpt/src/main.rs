@@ -372,6 +372,9 @@ fn main() {
         // 模式切换必须立即生效：`on -> off` 依赖 policy_sig 变化触发全量重扫，
         // 这里同时清空 S7 状态，让已迁移线程按规则重新落地
         if config_changed {
+            // 只改规则时模式不变，set_mode 会直接返回；不单独唤醒，
+            // 新规则最坏要等一个休眠间隔（30 秒）才参与判定
+            sched_state.note_config_change();
             // 离开 on（含 on -> shadow）必须丢掉缓存里的 S7 落点，
             // 否则定期校验会一直按旧落点维持，等于模式没关掉
             let switched = sched_state.set_mode(cfg.sched);

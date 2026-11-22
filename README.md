@@ -81,6 +81,19 @@ com.example.game {
 [docs/S7_负载感知调度策略设计.md](docs/S7_负载感知调度策略设计.md)。
 
 
+### 内核调参（可选）
+
+`core_ctl` 会在空闲时把整个 CPU 簇下电。部分机型上，绑到该簇的线程会被系统挤回小核，
+表现为「规则写了大核、实际落点却在小核」。模块**默认不改动**内核参数，需要时手动开启：
+
+```sh
+touch /data/adb/modules/AppOpt/keep_cores    # 启用：把每个簇的 min_cpus 拉到 max_cpus
+rm /data/adb/modules/AppOpt/keep_cores       # 关闭：下次启动按 core_ctl.bak 恢复原值
+```
+
+代价是核心常在线，待机功耗与发热会上升。原值记录在模块目录的 `core_ctl.bak`；
+升级模块时该文件可能被覆盖，重新 `touch keep_cores` 即可。
+
 ### 命令行参数
 
 | 参数 | 说明 | 默认值 |

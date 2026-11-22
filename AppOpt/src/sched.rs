@@ -375,6 +375,17 @@ impl SchedState {
         true
     }
 
+    /// 配置热更新后清掉空转降频，让新规则下一轮就参与判定。
+    ///
+    /// 不能复用 `set_mode`：改的通常只是规则，模式仍是 `on`，它会直接返回，
+    /// `idle_rounds` 与 `last_decide` 原样保留——新规则最坏要等 30 秒
+    /// （休眠档间隔）才被看见。这里只清节奏，不动线程状态：落点、冷却、
+    /// 冻结都还有效，重建整套 S7 状态反而会让刚稳定的线程重新抖动
+    pub fn note_config_change(&mut self) {
+        self.idle_rounds = 0;
+        self.last_decide = None;
+    }
+
     /// 主循环每轮调用。off 模式零开销直接返回。
     pub fn tick(&mut self, cfg: &AppConfig, cache: &ProcCache) -> Vec<Move> {
         if self.mode == SchedMode::Off {
@@ -940,6 +951,21 @@ mod tests {
 
     /// 规则只覆盖单簇时，S7 每秒仍在扫 64 个线程。连续几轮全跳过必须降频，
     /// 否则「开了 S7 就掉帧」里有一部分就是 S7 自己在读 /proc
+    /// 规则热更新必须立刻把 S7 从降频/休眠里叫醒，否则新规则最坏等 30 秒
+    #[test]
+    fn config_change_wakes_idle_scheduler() {
+        let mut st = SchedState::new();
+        st.set_mode(SchedMode::On);
+        let t0 = Instant::now();
+        st.idle_rounds = DEAD_ROUNDS;
+        st.last_decide = Some(t0);
+        assert!(st.should_idle(t0 + Duration::from_secs(1)));
+        st.note_config_change();
+        assert!(!st.should_idle(t0 + Duration::from_secs(1)));
+        assert_eq!(st.idle_rounds, 0);
+        assert!(st.last_decide.is_none());
+    }
+
     #[test]
     fn idle_rounds_throttle_single_cluster_rules() {
         let mut st = SchedState::new();
