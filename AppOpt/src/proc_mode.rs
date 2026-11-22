@@ -9,6 +9,10 @@ use crate::rt;
 
 /// 全量校验周期：兜底 PID 复用、tid 复用与差分漏检
 const FULL_CHECK: Duration = Duration::from_secs(60);
+/// 每轮重读 comm 的线程数。引擎通常在创建线程后才改名，而 /proc 模式
+/// 没有 rename 事件；发现线程时若还没命名，线程规则就会永远落不上。
+/// 按游标轮转，常见规模（<200 线程）几轮内覆盖一遍
+const COMM_RECHECK: usize = 32;
 
 pub struct ProcScanState {
     pub cache: ProcCache,
@@ -22,6 +26,8 @@ pub struct ProcScanState {
     /// 请求一次全量重建（配置变更、模式切换、eBPF 回退）
     pub rescan_all: bool,
     last_full: Instant,
+    /// comm 轮转抽查游标
+    recheck_cursor: usize,
 }
 
 impl ProcScanState {
@@ -34,6 +40,7 @@ impl ProcScanState {
             force_affinity: true,
             rescan_all: true,
             last_full: Instant::now(),
+            recheck_cursor: 0,
         }
     }
 
@@ -99,6 +106,53 @@ pub fn cache_sync(cfg: &AppConfig, state: &mut ProcScanState) {
     }
 
     state.known_pids = current;
+    recheck_names(cfg, state);
+}
+
+/// 轮转重读线程名，补上没有 rename 事件时漏掉的改名。
+/// 只读 comm 与规则重算，不在扫描线程里直接写亲和性，避免双写竞争
+fn recheck_names(cfg: &AppConfig, state: &mut ProcScanState) {
+    let mut tids: Vec<i32> = state.known_tids.keys().copied().collect();
+    if tids.is_empty() {
+        return;
+    }
+    tids.sort_unstable();
+    let total = tids.len();
+    let n = total.min(COMM_RECHECK);
+    let start = state.recheck_cursor % total;
+    state.recheck_cursor = (start + n) % total;
+
+    let mut changed = 0;
+    for k in 0..n {
+        let tid = tids[(start + k) % total];
+        let Some(&pid) = state.known_tids.get(&tid) else {
+            continue;
+        };
+        let Some(e) = state.cache.tasks.get(&tid) else {
+            continue;
+        };
+        let pkg = e.pkg.clone();
+        let Some(comm) = tid_comm(tid) else { continue };
+        if comm == e.comm {
+            continue;
+        }
+        if state
+            .cache
+            .task_apply(tid, pid, &pkg, &comm, cfg, |_, _, _| false)
+        {
+            changed += 1;
+            if let Some(e) = state.cache.tasks.get(&tid) {
+                rt::note(tid, pid, &e.pkg, &e.comm, &e.cpus, cfg);
+            }
+        } else if let Some(e) = state.cache.tasks.get_mut(&tid) {
+            // 改名后没命中任何规则：亲和性保持不变，但名字要更新，
+            // 否则 S7 角色判定会一直拿旧名字当 Unknown
+            e.comm = comm;
+        }
+    }
+    if changed > 0 {
+        state.force_affinity = true;
+    }
 }
 
 /// 需要每轮发现新线程的进程：只有消费线程名的功能（线程规则 / S7 / RT）

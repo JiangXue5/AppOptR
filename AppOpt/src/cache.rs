@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::apply_affinity::{AffinityOutcome, affinity_set};
+use crate::apply_affinity::{AffinityOutcome, ApplyReason, affinity_apply};
 use crate::config::AppConfig;
 use crate::cpuset::{CpuSet, CpuTopology};
 use crate::rule_match::{comm_to_pkg, thread_affinity};
@@ -108,14 +108,22 @@ impl ProcCache {
     /// 遍历 tasks 应用亲和性，返回 dead_tids 供 eBPF 调用方清理 APPLIED_MAP。
     /// 只有 ESRCH 才算退出，设置失败（EPERM/EINVAL）的线程保留在缓存里等下一轮
     pub fn affinity_sync(&mut self, topo: &CpuTopology) -> Vec<i32> {
-        let dead_tids: Vec<i32> = self
-            .tasks
-            .iter()
-            .filter(|(tid, e)| {
-                affinity_set(**tid, &e.cpus, &e.cpuset_dir, topo) == AffinityOutcome::Gone
-            })
-            .map(|(tid, _)| *tid)
-            .collect();
+        let mut dead_tids: Vec<i32> = Vec::new();
+        for (tid, e) in self.tasks.iter() {
+            // 只有「读回与期望不一致」才会真写，写入次数就是被外部改写的线程数
+            let (outcome, _) = affinity_apply(
+                *tid,
+                &e.cpus,
+                Some(&e.cpuset_dir),
+                topo,
+                ApplyReason::Sync,
+                &e.comm,
+            );
+            // 线程已退出与设置失败要分开：前者清缓存，后者保留等下一轮
+            if outcome == AffinityOutcome::Gone {
+                dead_tids.push(*tid);
+            }
+        }
         for tid in &dead_tids {
             self.task_del(*tid);
         }

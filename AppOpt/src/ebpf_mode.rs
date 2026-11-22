@@ -9,7 +9,9 @@ use std::thread;
 use aya::maps::{Array as AyaArray, HashMap as AyaHashMap, Map, PerCpuArray as AyaPerCpuArray};
 use aya::{programs::TracePoint as AyaTracePoint, Ebpf, EbpfLoader, Pod};
 
-use crate::apply_affinity::{affinity_set, proc_walk, task_tids, tid_comm, AffinityOutcome};
+use crate::apply_affinity::{
+    affinity_apply, proc_walk, task_tids, tid_comm, AffinityOutcome, ApplyReason,
+};
 use crate::cache::ProcCache;
 use crate::config::{AppConfig, CURRENT_CONFIG};
 use crate::cpuset::CpuSet;
@@ -523,14 +525,15 @@ pub fn reconcile(state: &mut EbpfState, cfg: &AppConfig) {
 /// 应用亲和性并写 APPLIED_MAP，返回 true 表示 tid 已退出。
 /// APPLIED_MAP 的语义是「已被本模块接管」，设置失败也保持接管关系，
 /// 否则该线程的 EXIT 事件不再上报，缓存会一直留到下次 reconcile
-fn affinity_apply(
+fn affinity_apply_task(
     tid: i32,
     cpus: &CpuSet,
     cpuset_dir: &str,
     cfg: &AppConfig,
     bpf: &mut Ebpf,
+    comm: &str,
 ) -> bool {
-    match affinity_set(tid, cpus, cpuset_dir, &cfg.topo) {
+    match affinity_apply(tid, cpus, Some(cpuset_dir), &cfg.topo, ApplyReason::Rule, comm).0 {
         AffinityOutcome::Gone => true,
         _ => {
             applied_set(bpf, tid, cpus);
@@ -586,7 +589,7 @@ fn event_apply(
     };
 
     let ok = cache.task_apply(tid, pid, &pkg, comm, cfg, |t, c, d| {
-        affinity_apply(t, c, d, cfg, bpf)
+        affinity_apply_task(t, c, d, cfg, bpf, comm)
     });
     // 规则命中且亲和性写入成功后再考虑 RT，避免把没被管理的线程提升
     if ok && let Some(e) = cache.tasks.get(&tid) {
@@ -622,7 +625,7 @@ pub fn full_scan(cfg: &AppConfig, state: &mut EbpfState) {
                 String::new()
             };
             let ok = state.cache.task_apply(tid, pid, pkg, &t_name, cfg, |tid, cpus, cpuset_dir| {
-                affinity_apply(tid, cpus, cpuset_dir, cfg, &mut state.bpf)
+                affinity_apply_task(tid, cpus, cpuset_dir, cfg, &mut state.bpf, &t_name)
             });
             if ok && let Some(e) = state.cache.tasks.get(&tid) {
                 rt::note(tid, pid, &e.pkg, &e.comm, &e.cpus, cfg);
@@ -695,7 +698,7 @@ pub fn config_rescan(new: &AppConfig, state: &mut EbpfState) {
                     String::new()
                 };
                 let ok = state.cache.task_apply(tid, pid, pkg, &t_name, new, |tid, cpus, dir| {
-                    affinity_apply(tid, cpus, dir, new, &mut state.bpf)
+                    affinity_apply_task(tid, cpus, dir, new, &mut state.bpf, &t_name)
                 });
                 if ok && let Some(e) = state.cache.tasks.get(&tid) {
                     rt::note(tid, pid, &e.pkg, &e.comm, &e.cpus, new);

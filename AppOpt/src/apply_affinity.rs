@@ -4,7 +4,7 @@ use std::io::Write as _;
 use std::os::unix::fs::FileExt;
 use std::sync::Mutex;
 
-use crate::{lock_ignore_poison, MAX_PKG_LEN, MAX_THREAD_LEN};
+use crate::{diag, lock_ignore_poison, MAX_PKG_LEN, MAX_THREAD_LEN};
 use crate::config::AppConfig;
 use crate::cpuset::{base_cpuset, create_cpuset_dir, CpuSet, CpuTopology};
 
@@ -101,8 +101,10 @@ pub fn reset_cpuset_dir_cache() {
     }
 }
 
-/// 把 tid 挂到 cpuset 子目录，目录缺失时重建一次（外部删除兜底）
-fn write_task(dir: &str, tid: i32, topo: &CpuTopology) {
+/// 把 tid 挂到 cpuset 子目录，目录缺失时重建一次（外部删除兜底）。
+/// 失败原因必须带出去：cpuset 写不进去时只剩 sched_setaffinity 兜底，
+/// 这往往就是「有时绑得住、有时绑不住」的那一半
+fn write_task(dir: &str, tid: i32, topo: &CpuTopology) -> Result<(), i32> {
     let base = base_cpuset();
     let path = if dir.is_empty() {
         format!("{}/tasks", base)
@@ -114,25 +116,26 @@ fn write_task(dir: &str, tid: i32, topo: &CpuTopology) {
             .append(true)
             .open(p)
             .and_then(|mut f| writeln!(f, "{}", tid))
-            .is_ok()
     };
+    let errno = |e: std::io::Error| e.raw_os_error().unwrap_or(0);
 
     // base 目录由 init_cpu_topo 负责，这里只追加 tasks
     if dir.is_empty() {
-        let _ = append(&path);
-        return;
+        return append(&path).map_err(errno);
     }
     if !dir_ready(dir, topo) {
         // 建不出目录（只读/权限），按原行为仅靠 sched_setaffinity
-        return;
+        return Err(0);
     }
-    if append(&path) {
-        return;
+    if append(&path).is_ok() {
+        return Ok(());
     }
     // 目录被外部删除：先失效再重建一次，重建后补写
     dir_invalidate(dir);
     if dir_ready(dir, topo) {
-        let _ = append(&path);
+        append(&path).map_err(errno)
+    } else {
+        Err(0)
     }
 }
 
@@ -148,28 +151,63 @@ pub enum AffinityOutcome {
     Failed,
 }
 
-/// 对单线程应用亲和性。cpuset 目录只是辅助手段，成败以内核返回为准
-pub fn affinity_set(
+/// 写入原因。诊断需要把「规则重扫」「定期校验」「S7 迁移」分开计数，
+/// 否则 once 一个失败，根本不知道是哪条路径在写
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ApplyReason {
+    Rule,
+    Sync,
+    Sched,
+}
+
+/// 对单线程应用亲和性。cpuset 目录只是辅助手段，成败以内核返回为准。
+/// 返回 `(结果, 是否真的写入)`：短路的「已一致」不算写入，
+/// 定期校验可以据此判断线程是否被外部改写
+pub fn affinity_apply(
     tid: i32,
     cpus: &CpuSet,
-    cpuset_dir: &str,
+    cpuset_dir: Option<&str>,
     topo: &CpuTopology,
-) -> AffinityOutcome {
+    reason: ApplyReason,
+    comm: &str,
+) -> (AffinityOutcome, bool) {
     // sched_getaffinity 短路，已符合目标零开销返回
     if let Some(curr) = CpuSet::get_affinity(tid)
         && curr == *cpus
     {
-        return AffinityOutcome::Set;
+        diag::note(reason, &AffinityOutcome::Set, false);
+        return (AffinityOutcome::Set, false);
     }
-    if topo.cpuset_enabled {
-        write_task(cpuset_dir, tid, topo);
+    // None 表示这条路径明确不碰 cpuset（S7 迁移）。cgroup 迁移比
+    // sched_setaffinity 重得多，每次动态迁移都做一遍只会放大抖动
+    if topo.cpuset_enabled
+        && let Some(dir) = cpuset_dir
+        && let Err(e) = write_task(dir, tid, topo)
+    {
+        diag::note_cpuset_failure(
+            if dir.is_empty() { "<base>" } else { dir },
+            (e != 0).then_some(e),
+        );
     }
     match cpus.set_affinity(tid) {
-        Ok(()) => AffinityOutcome::Set,
-        Err(e) if e.raw_os_error() == Some(libc::ESRCH) => AffinityOutcome::Gone,
-        Err(_) => AffinityOutcome::Failed,
+        Ok(()) => {
+            diag::note(reason, &AffinityOutcome::Set, true);
+            (AffinityOutcome::Set, true)
+        }
+        Err(e) => {
+            let errno = e.raw_os_error().unwrap_or(0);
+            if errno == libc::ESRCH {
+                diag::note(reason, &AffinityOutcome::Gone, false);
+                (AffinityOutcome::Gone, false)
+            } else {
+                diag::note(reason, &AffinityOutcome::Failed, false);
+                diag::note_failure(tid, comm, cpus, errno);
+                (AffinityOutcome::Failed, false)
+            }
+        }
     }
 }
+
 
 /// 遍历 /proc 匹配目标进程，返回 匹配数与总进程数。
 /// 是否读线程名交给调用方用 `cfg.needs_comm` 判断，这里不再传旧的包级标记
@@ -210,7 +248,10 @@ mod tests {
         let topo = CpuTopology::empty();
         let tid = self_tid();
         let curr = CpuSet::get_affinity(tid).expect("读取自身亲和性失败");
-        assert_eq!(affinity_set(tid, &curr, "", &topo), AffinityOutcome::Set);
+        assert_eq!(
+            affinity_apply(tid, &curr, None, &topo, ApplyReason::Rule, "").0,
+            AffinityOutcome::Set
+        );
     }
 
     /// EINVAL 等失败必须如实报告，不能被当成设置成功
@@ -220,7 +261,7 @@ mod tests {
         let tid = self_tid();
         // 空集合对内核是非法参数（EINVAL），不会改变当前亲和性
         assert_eq!(
-            affinity_set(tid, &CpuSet::new(), "", &topo),
+            affinity_apply(tid, &CpuSet::new(), None, &topo, ApplyReason::Rule, "").0,
             AffinityOutcome::Failed
         );
     }
@@ -231,6 +272,9 @@ mod tests {
         let topo = CpuTopology::empty();
         let mut one = CpuSet::new();
         one.set(0);
-        assert_eq!(affinity_set(GHOST, &one, "", &topo), AffinityOutcome::Gone);
+        assert_eq!(
+            affinity_apply(GHOST, &one, None, &topo, ApplyReason::Rule, "").0,
+            AffinityOutcome::Gone
+        );
     }
 }

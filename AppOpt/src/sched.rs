@@ -20,6 +20,7 @@ use crate::apply_affinity::AffinityOutcome;
 use crate::cache::ProcCache;
 use crate::config::{AppConfig, SchedMode};
 use crate::cpuset::{CpuSet, CpuTopology};
+use crate::diag;
 use crate::lock_ignore_poison;
 use crate::roles::role_of;
 use crate::rule_match::thread_affinity;
@@ -28,23 +29,48 @@ use crate::rule_match::thread_affinity;
 const SAMPLE_PERIOD: Duration = Duration::from_secs(1);
 /// 同一方向连续确认次数，抑制单次采样抖动
 const CONFIRM_TICKS: u8 = 3;
-/// 线程进入候选池后的最小观察时间
-const MIN_DWELL: Duration = Duration::from_secs(2);
+/// 线程进入候选池后的最小观察时间。刚创建的线程还在冷启动，
+/// 立刻迁移只会把它的初始化代码从缓存里赶走
+const MIN_DWELL: Duration = Duration::from_secs(5);
 /// 同一线程两次迁移之间的冷却
 const COOLDOWN: Duration = Duration::from_secs(10);
 /// 目标簇相对基准的负载差门槛，千分比（15 个百分点）
 const LOAD_GAP: i32 = 150;
-/// 单轮迁移上限，限制突发影响
-const MAX_MOVES: usize = 2;
+/// 单轮迁移上限。每秒最多迁一个：跨簇迁移必然丢缓存，
+/// 一次迁两个会让整帧的调度抖动叠加
+const MAX_MOVES: usize = 1;
 /// 单轮最多检查的线程数，超出部分由游标轮转覆盖
 const MAX_PROBE: usize = 64;
 /// 活跃判定最多读取的进程数，避免一次 tick 打爆 /proc
 const MAX_ACTIVE_PIDS: usize = 8;
 /// 决策环形缓冲保留条数
 const RING_CAP: usize = 8;
-/// 目标集合最小核数。1 核簇（常见于单超大核机型）也允许进入：
-/// 迁入后该簇负载上升，后续线程自然被 LOAD_GAP 拦住，无需额外配额
+/// 目标集合最小核数。1 核簇（常见于单超大核机型）也允许进入，
+/// 但配额单独收紧：单核簇最多放 1 个被迁线程
 const MIN_TARGET_CORES: usize = 1;
+/// 反悔冷却：刚从某簇迁出，60 秒内不再迁回去。1 核目标簇负载会被
+/// 单个线程瞬间打满，没有这道闸就会出现 p ↔ hp 每 10 秒来回跳
+const REVERSE_COOLDOWN: Duration = Duration::from_secs(90);
+/// 单线程迁移预算窗口
+const MOVE_WINDOW: Duration = Duration::from_secs(180);
+/// 窗口内允许的迁移次数，超过即冻结该线程直到它退出
+const MAX_MOVES_WINDOW: u8 = 3;
+
+/// 跳过原因下标，供 Web 与摘要读取
+pub const SKIP_ALLOW: usize = 0;
+pub const SKIP_ROLE: usize = 1;
+pub const SKIP_LOAD: usize = 2;
+pub const SKIP_DWELL: usize = 3;
+pub const SKIP_COOLDOWN: usize = 4;
+pub const SKIP_QUOTA: usize = 5;
+pub const SKIP_LABELS: [&str; 6] = [
+    "允许集合不足两层",
+    "线程角色不可迁移",
+    "目标没有明显更空",
+    "驻留时间不足",
+    "冷却中",
+    "目标簇配额已满",
+];
 
 const CLUSTER_NAME: [&str; 3] = ["e-core", "p-core", "hp-core"];
 
@@ -74,6 +100,13 @@ struct ThreadState {
     last_move: Option<Instant>,
     /// 最小驻留起点
     first_seen: Instant,
+    /// 上一次迁移的出发簇，用于拦住立刻迁回去
+    last_from: Option<u8>,
+    /// 迁移预算窗口起点与窗口内次数
+    window: Instant,
+    window_moves: u8,
+    /// 抖动过多被冻结：不再迁移，直到线程退出或规则重扫
+    frozen: bool,
 }
 
 impl ThreadState {
@@ -85,6 +118,10 @@ impl ThreadState {
             streak: 0,
             last_move: None,
             first_seen: now,
+            last_from: None,
+            window: now,
+            window_moves: 0,
+            frozen: false,
         }
     }
 
@@ -94,6 +131,10 @@ impl ThreadState {
         self.applied = CpuSet::new();
         self.streak = 0;
         self.last_move = None;
+        self.last_from = None;
+        self.window = Instant::now();
+        self.window_moves = 0;
+        self.frozen = false;
     }
 }
 
@@ -107,6 +148,105 @@ pub struct Move {
     pub cpus: CpuSet,
     /// 仅用于日志与环形缓冲
     pub comm: String,
+}
+
+/// 单个线程的判定结果。把「算」与「记」分开：`judge` 只碰线程状态，
+/// 统计与产出由调用方处理，避免同时借用 `self.threads` 与 `self.skip`
+enum Action {
+    /// 本轮什么都不做（已是最优、或在等确认）
+    Nothing,
+    /// 因某个原因跳过，下标见 `SKIP_LABELS`
+    Skip(usize),
+    /// 刚迁出又要迁回去，被反悔冷却拦住
+    Bounce,
+    /// shadow：记录但不执行
+    Shadow {
+        target: u8,
+        base: i32,
+        target_load: i32,
+    },
+    Move {
+        target: u8,
+        cpus: CpuSet,
+    },
+}
+
+/// 目标簇在 `placed` 已满时不再接收。单核簇只放一个，
+/// 多核簇放宽到两倍核数：Worker 与渲染线程抢同一个核才是掉帧的常见原因
+fn quota(target: u8, topo: &CpuTopology) -> u16 {
+    let cores = cluster_cores(target as usize, topo);
+    if cores <= 1 { 1 } else { (cores * 2) as u16 }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn judge(
+    st: &mut ThreadState,
+    home: &crate::rule_match::AffinityResult,
+    allow: &[bool; 3],
+    load: [i32; 3],
+    base: i32,
+    topo: &CpuTopology,
+    now: Instant,
+    placed: &[u16; 3],
+    mode: SchedMode,
+) -> Action {
+    if base < 0 {
+        return Action::Skip(SKIP_LOAD);
+    }
+    let Some(target) = pick_target(&load, allow, st.cur) else {
+        return Action::Skip(SKIP_LOAD);
+    };
+    if Some(target) == st.cur {
+        st.streak = 0;
+        return Action::Skip(SKIP_LOAD);
+    }
+    if base - load[target as usize] < LOAD_GAP {
+        st.streak = 0;
+        return Action::Skip(SKIP_LOAD);
+    }
+    if !target_ok(target, &load, allow, &home.cpus, topo) {
+        st.streak = 0;
+        return Action::Skip(SKIP_LOAD);
+    }
+    if st.first_seen.elapsed() < MIN_DWELL {
+        return Action::Skip(SKIP_DWELL);
+    }
+    if st
+        .last_move
+        .is_some_and(|t| now.duration_since(t) < COOLDOWN)
+    {
+        return Action::Skip(SKIP_COOLDOWN);
+    }
+    // 反悔冷却比普通冷却长：刚离开的簇不能马上回去
+    if st.last_from == Some(target)
+        && st
+            .last_move
+            .is_some_and(|t| now.duration_since(t) < REVERSE_COOLDOWN)
+    {
+        st.streak = 0;
+        return Action::Bounce;
+    }
+    if placed[target as usize] >= quota(target, topo) {
+        return Action::Skip(SKIP_QUOTA);
+    }
+
+    st.streak = st.streak.saturating_add(1);
+    if st.streak < CONFIRM_TICKS {
+        return Action::Nothing;
+    }
+    let Some(cpus) = target_cpus(target, &home.cpus, topo) else {
+        return Action::Skip(SKIP_LOAD);
+    };
+    st.streak = 0;
+    if mode == SchedMode::On {
+        Action::Move { target, cpus }
+    } else {
+        Action::Shadow {
+            target,
+            base,
+            target_load: load[target as usize],
+        }
+    }
 }
 
 /// 供 Web 与日志读取的只读快照
@@ -124,6 +264,12 @@ pub struct SchedSnapshot {
     pub failed: u64,
     /// 因角色、目标簇核数等约束被拒的线程次
     pub blocked: u64,
+    /// 各跳过原因计数，下标见 `SKIP_LABELS`
+    pub skip: [u64; 6],
+    /// 被反悔冷却拦住的次数
+    pub bounced: u64,
+    /// 抖动过多被冻结的线程数
+    pub frozen: u64,
     /// 三簇负载千分比，-1 为不可用
     pub load: [i32; 3],
     pub last: String,
@@ -139,6 +285,9 @@ pub struct SchedState {
     moved: u64,
     failed: u64,
     blocked: u64,
+    skip: [u64; 6],
+    bounced: u64,
+    frozen: u64,
     threads: HashMap<i32, ThreadState>,
     /// 上一轮每簇累计时间，用于差分
     prev: Option<[ClusterTimes; 3]>,
@@ -170,6 +319,9 @@ impl SchedState {
             moved: 0,
             failed: 0,
             blocked: 0,
+            skip: [0; 6],
+            bounced: 0,
+            frozen: 0,
             threads: HashMap::new(),
             prev: None,
             load: [-1; 3],
@@ -252,22 +404,53 @@ impl SchedState {
     pub fn settle(&mut self, m: &Move, outcome: AffinityOutcome) {
         match outcome {
             AffinityOutcome::Set => {
+                let now = Instant::now();
+                let mut from = None;
+                let mut freeze = false;
                 if let Some(st) = self.threads.get_mut(&m.tid) {
+                    from = st.cur;
+                    st.last_from = st.cur;
                     st.cur = Some(m.target);
                     st.own = true;
                     st.applied = m.cpus;
-                    st.last_move = Some(Instant::now());
+                    st.last_move = Some(now);
+                    // 预算窗口按线程滚动；窗口内迁移超限后冻结，避免跨簇抖动
+                    if st.window.elapsed() > MOVE_WINDOW {
+                        st.window = now;
+                        st.window_moves = 0;
+                    }
+                    st.window_moves = st.window_moves.saturating_add(1);
+                    if st.window_moves >= MAX_MOVES_WINDOW {
+                        st.frozen = true;
+                        freeze = true;
+                    }
                 }
                 self.moved += 1;
                 let line = format!(
-                    "S7: {}({}) → {}（{}‰）",
+                    "S7: {}({}) {} → {}（{}‰ → {}‰）",
                     m.comm,
                     m.tid,
+                    from.map(cluster_label).unwrap_or("规则集合"),
                     cluster_label(m.target),
+                    from.map(|c| self.load[c as usize]).unwrap_or(-1),
                     self.load[m.target as usize]
                 );
                 println!("{}", line);
-                self.push_ring(line);
+                self.push_ring(line.clone());
+                diag::note_sched(line);
+                if freeze {
+                    self.frozen += 1;
+                    let f = format!(
+                        "S7: {}({}) {} 秒内迁移 {} 次，已冻结（继续换簇只会放大抖动）",
+                        m.comm,
+                        m.tid,
+                        MOVE_WINDOW.as_secs(),
+                        MAX_MOVES_WINDOW
+                    );
+                    println!("{}", f);
+                    self.push_ring(f.clone());
+                    diag::note_sched(f);
+                }
             }
             AffinityOutcome::Gone => {
                 // 线程已退出：连状态一起清掉，避免 tid 复用时继承旧落点
@@ -279,12 +462,12 @@ impl SchedState {
                     st.last_move = Some(Instant::now());
                 }
                 let line = format!(
-                    "S7: {}({}) 迁移到 {} 失败，保持原亲和性",
+                    "S7: {}({}) 迁移到 {} 失败，保持原亲和性（详见同一时刻的绑核失败行）",
                     m.comm,
                     m.tid,
                     cluster_label(m.target)
                 );
-                self.push_ring(line);
+                diag::note_sched_failure(line);
             }
         }
     }
@@ -305,6 +488,9 @@ impl SchedState {
             moved: self.moved,
             failed: self.failed,
             blocked: self.blocked,
+            skip: self.skip,
+            bounced: self.bounced,
+            frozen: self.frozen,
             load: self.load,
             last: self.ring.back().cloned().unwrap_or_default(),
         }
@@ -331,6 +517,16 @@ impl SchedState {
         let start = self.cursor % total;
         self.cursor = (start + MAX_PROBE) % total;
 
+        // 每个簇当前放了几个被迁线程。配额与核数挂钩：单核簇只放 1 个，
+        // 其余簇放到 2 倍核数。没有这道闸，多个 Worker 挤进超大核会直接拖慢渲染
+        let mut placed = [0u16; 3];
+        for st in self.threads.values() {
+            if let Some(c) = st.cur {
+                placed[c as usize] = placed[c as usize].saturating_add(1);
+            }
+        }
+        let mode = self.mode;
+
         let mut out = Vec::new();
         for k in 0..total.min(MAX_PROBE) {
             if out.len() >= MAX_MOVES {
@@ -353,90 +549,79 @@ impl SchedState {
             };
             let allow = cluster_mask(&home.cpus, &cfg.topo);
             if allow.iter().filter(|x| **x).count() < 2 {
+                self.skip[SKIP_ALLOW] += 1;
                 continue;
             }
 
             let role = role_of(&entry.comm);
             if !role.movable() {
                 self.blocked += 1;
+                self.skip[SKIP_ROLE] += 1;
                 continue;
             }
 
-            let st = self
-                .threads
-                .entry(tid)
-                .or_insert_with(|| ThreadState::new(now));
-            // 只有真写过才能用「缓存里的集合与上次写入不一致」判定被规则重扫拉回
-            if st.own && entry.cpus != st.applied {
-                st.reset();
-            }
-
-            let base = if st.own {
-                st.cur.map(|c| load[c as usize]).unwrap_or(-1)
-            } else {
-                weighted_avg(&load, &allow, &cfg.topo)
-            };
-            if base < 0 {
-                continue;
-            }
-
-            let Some(target) = pick_target(&load, &allow, st.cur) else {
-                continue;
-            };
-            if Some(target) == st.cur {
-                st.streak = 0;
-                continue;
-            }
-            if base - load[target as usize] < LOAD_GAP {
-                st.streak = 0;
-                continue;
-            }
-            if !target_ok(target, &load, &allow, &home.cpus, &cfg.topo) {
-                self.blocked += 1;
-                continue;
-            }
-            if st.first_seen.elapsed() < MIN_DWELL {
-                continue;
-            }
-            if st
-                .last_move
-                .is_some_and(|t| now.duration_since(t) < COOLDOWN)
-            {
-                continue;
-            }
-
-            st.streak = st.streak.saturating_add(1);
-            if st.streak < CONFIRM_TICKS {
-                continue;
-            }
-            st.streak = 0;
-
-            let Some(cpus) = target_cpus(target, &home.cpus, &cfg.topo) else {
-                continue;
+            let action = {
+                let st = self
+                    .threads
+                    .entry(tid)
+                    .or_insert_with(|| ThreadState::new(now));
+                // 只有真写过才能用「缓存里的集合与上次写入不一致」判定被规则重扫拉回
+                if st.own && entry.cpus != st.applied {
+                    st.reset();
+                }
+                if st.frozen {
+                    Action::Nothing
+                } else {
+                    let base = if st.own {
+                        st.cur.map(|c| load[c as usize]).unwrap_or(-1)
+                    } else {
+                        weighted_avg(&load, &allow, &cfg.topo)
+                    };
+                    judge(st, &home, &allow, load, base, &cfg.topo, now, &placed, mode)
+                }
             };
 
-            // 从这里开始分叉：shadow 只把候选记进 would / 环形缓冲，
-            // 绝不产出 Move；on 只产出候选，状态等 settle 确认后再提交
-            st.streak = 0;
-            if self.mode == SchedMode::On {
-                out.push(Move {
-                    tid,
+            match action {
+                Action::Nothing => {}
+                Action::Skip(why) => {
+                    self.skip[why] += 1;
+                    if why == SKIP_ROLE {
+                        self.blocked += 1;
+                    }
+                }
+                Action::Bounce => self.bounced += 1,
+                Action::Shadow {
                     target,
-                    cpus,
-                    comm: entry.comm.clone(),
-                });
-                continue;
+                    base,
+                    target_load,
+                } => {
+                    self.would += 1;
+                    if let Some(st) = self.threads.get_mut(&tid) {
+                        st.cur = Some(target);
+                        st.last_move = Some(now);
+                    }
+                    let line = format!(
+                        "S7(影子): {}({}) 允许集合 → {}（负载 {}‰ → {}‰）",
+                        entry.comm, tid, CLUSTER_NAME[target as usize], base, target_load
+                    );
+                    self.push_ring(line.clone());
+                    diag::note_sched(line);
+                }
+                Action::Move { target, cpus } => {
+                    // shadow 只把候选记进 would / 环形缓冲，绝不产出 Move；
+                    // on 只产出候选，状态等 settle 确认后再提交
+                    if let Some(st) = self.threads.get_mut(&tid) {
+                        st.streak = 0;
+                    }
+                    placed[target as usize] = placed[target as usize].saturating_add(1);
+                    out.push(Move {
+                        tid,
+                        target,
+                        cpus,
+                        comm: entry.comm.clone(),
+                    });
+                }
             }
-
-            // shadow：把候选记为「已观测」，否则同一线程每轮都会被重复计数
-            self.would += 1;
-            st.cur = Some(target);
-            st.last_move = Some(now);
-            let line = format!(
-                "S7(影子): {}({}) 允许集合 → {}（负载 {}‰ → {}‰）",
-                entry.comm, tid, CLUSTER_NAME[target as usize], base, load[target as usize]
-            );
-            self.push_ring(line);
         }
 
         // 缓存里已消失的线程不再保留状态。无条件清理而不是「超过阈值才清」：
@@ -601,7 +786,9 @@ fn weighted_avg(load: &[i32; 3], allow: &[bool; 3], topo: &CpuTopology) -> i32 {
 /// 负载最低的可用簇。当前簇已是最低时保持不动，避免同负载下来回跳。
 fn pick_target(load: &[i32; 3], allow: &[bool; 3], cur: Option<u8>) -> Option<u8> {
     let mut best: Option<(i32, u8)> = None;
-    for i in 0..3 {
+    // 只在小核之上的两层里挑。e-core 是最低层，迁进去没有收益，
+    // 若先按全表选出 e-core 再被 target_ok 否决，整个线程这轮就白跑了
+    for i in 1..3 {
         if !allow[i] || load[i] < 0 {
             continue;
         }
@@ -1026,7 +1213,15 @@ mod tests {
         allowed.or(&t.p_core);
         allowed.or(&t.hp_core);
         assert_eq!(
-            crate::apply_affinity::affinity_set(tid, &allowed, "", &t),
+            crate::apply_affinity::affinity_apply(
+                tid,
+                &allowed,
+                None,
+                &t,
+                crate::apply_affinity::ApplyReason::Rule,
+                "Thread-7",
+            )
+            .0,
             AffinityOutcome::Set
         );
 
@@ -1108,6 +1303,7 @@ mod tests {
                 streak: 0,
                 last_move: Some(now),
                 first_seen: now - Duration::from_secs(5),
+                ..ThreadState::new(now)
             },
         );
         // 模拟规则重扫：缓存里的集合被改回允许集合
@@ -1116,6 +1312,88 @@ mod tests {
         let state = st.threads.get(&1001).unwrap();
         assert!(!state.own);
         assert_eq!(state.cur, None);
+    }
+
+    /// 刚从 hp 迁回 p，20 秒后又想回 hp：反悔冷却必须拦住，
+    /// 否则单核簇会被单个线程反复打满又放空
+    #[test]
+    fn reverse_move_is_bounced() {
+        let (cfg, cache) = span_cache("bounce");
+        let mut st = state_for(&cache, SchedMode::On);
+        let now = Instant::now();
+        {
+            let th = st.threads.get_mut(&1001).unwrap();
+            th.own = true;
+            th.cur = Some(1);
+            th.last_from = Some(2);
+            th.last_move = Some(now - Duration::from_secs(20));
+            // 缓存里的集合必须与 applied 一致，否则会被当成规则重扫而清空状态
+            th.applied = cache.tasks[&1001].cpus;
+        }
+        let mv = st.tick_at(&cfg, &cache, [-1, 600, 100], now);
+        assert!(mv.is_empty(), "反悔冷却内不得迁回");
+        assert_eq!(st.bounced, 1);
+    }
+
+    /// 预算窗口内迁移三次即冻结，且不再产出 Move
+    #[test]
+    fn repeated_moves_freeze_the_thread() {
+        let (cfg, cache) = span_cache("freeze");
+        let mut st = state_for(&cache, SchedMode::On);
+        let now = Instant::now();
+        for target in [2u8, 1, 2] {
+            st.threads.get_mut(&1001).unwrap().streak = CONFIRM_TICKS - 1;
+            let m = Move {
+                tid: 1001,
+                target,
+                cpus: CpuSet::new(),
+                comm: "Thread-7".into(),
+            };
+            st.settle(&m, AffinityOutcome::Set);
+        }
+        assert_eq!(st.frozen, 1);
+        assert!(st.threads[&1001].frozen);
+        assert!(
+            st.tick_at(&cfg, &cache, [-1, 900, 10], now).is_empty(),
+            "冻结后不得继续迁移"
+        );
+    }
+
+    /// 单核簇配额为 1：已有线程占住 hp 时，第二个线程必须被挡住
+    #[test]
+    fn single_core_cluster_quota_blocks_second_thread() {
+        let cfg = cfg_with("quota", "com.test.game=p-core,hp-core\n");
+        let t = topo();
+        let mut cpus = CpuSet::new();
+        cpus.or(&t.p_core);
+        cpus.or(&t.hp_core);
+        let mut cache = cache_with("com.test.game", "Thread-7", cpus);
+        cache.tasks.insert(
+            1002,
+            crate::cache::TaskEntry {
+                pid: 100,
+                pkg: "com.test.game".into(),
+                cpus,
+                cpuset_dir: String::new(),
+                is_thread_rule: false,
+                comm: "Thread-8".into(),
+            },
+        );
+        let mut st = state_for(&cache, SchedMode::On);
+        let now = Instant::now();
+        {
+            let th = st.threads.get_mut(&1002).unwrap();
+            th.cur = Some(2);
+            th.own = true;
+        }
+        for _ in 0..4 {
+            for th in st.threads.values_mut() {
+                th.first_seen = now - Duration::from_secs(5);
+            }
+            let _ = st.tick_at(&cfg, &cache, [-1, 700, 50], now);
+        }
+        assert!(st.skip[SKIP_QUOTA] >= 1, "单核簇配额没有生效");
+        assert!(st.threads[&1001].cur.is_none());
     }
 
     #[test]

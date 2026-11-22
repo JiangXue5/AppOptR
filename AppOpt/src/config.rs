@@ -881,7 +881,7 @@ pub fn load_config(
             println!("S7 动态分配: on（核心层仅 {} 个，不会生效）", scope.levels)
         }
         SchedMode::On => {
-            println!("S7 动态分配: on（仅 Worker/Background 让位，目标簇 ≥2 核）")
+            println!("S7 动态分配: on（仅 Worker/Background 让位，每秒最多迁移 1 个线程）")
         }
     }
     if !rt.is_off() {

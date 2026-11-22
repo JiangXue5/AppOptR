@@ -6,6 +6,7 @@ mod apply_affinity;
 mod cache;
 mod config;
 mod cpuset;
+mod diag;
 mod ebpf_mode;
 mod proc_mode;
 mod roles;
@@ -24,7 +25,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::apply_affinity::{affinity_set, AffinityOutcome};
+use crate::apply_affinity::{affinity_apply, AffinityOutcome, ApplyReason};
 use crate::config::{
     config_loader, init_inotify, load_config, AppConfig, SchedMode, CHECK_INTERVAL, CONFIG_FILE,
     CURRENT_CONFIG,
@@ -310,8 +311,13 @@ fn main() {
     // S7 状态。模式由配置驱动，off 时 tick 立即返回，不读 /proc/stat
     let mut sched_state = SchedState::new();
     let mut sched_deadline = Instant::now();
+    // 诊断：线程表与卡顿信号低频刷新，不新增线程也不改绑核行为
+    let mut jank = diag::JankSampler::new();
+    let mut diag_deadline = Instant::now();
+    let mut summary_deadline = Instant::now();
 
     println!("启动AppOpt服务 v{}", env!("CARGO_PKG_VERSION"));
+    diag::announce();
 
     // 恢复的强制 proc 模式无需 eBPF 初始化
     let mut ebpf_state: Option<EbpfState> =
@@ -501,6 +507,27 @@ fn main() {
             sched_state.publish();
         }
 
+        // 诊断快照：线程表回答「谁没绑住」，卡顿采样回答「绑了之后渲染线程还等不等 CPU」。
+        // 两件事都只在被管理线程上做，enumerate 上限由 diag 内部兜住
+        if diag_deadline.elapsed() >= Duration::from_secs(5) {
+            diag_deadline = Instant::now();
+            match (&ebpf_state, &proc_state) {
+                (Some(es), _) => {
+                    jank.sample(&es.cache);
+                    diag::publish_threads(&es.cache);
+                }
+                (None, Some(ps)) => {
+                    jank.sample(&ps.cache);
+                    diag::publish_threads(&ps.cache);
+                }
+                _ => {}
+            }
+        }
+        if summary_deadline.elapsed() >= diag::SUMMARY_GAP {
+            summary_deadline = Instant::now();
+            diag::periodic_summary();
+        }
+
         // web 状态统计，低频更新避免高频事件循环下的额外开销
         if WEB_ENABLED.load(Ordering::Relaxed)
             && web_stats_deadline.elapsed() >= Duration::from_secs(2)
@@ -527,13 +554,9 @@ fn main() {
 /// S7 迁移执行（eBPF 模式）：只改亲和性，不写 cpuset 目录，保持原有归属。
 /// 只有 `Set` 才同步缓存里的集合，失败保持旧值等下一轮
 fn apply_move_ebpf(es: &mut EbpfState, cfg: &AppConfig, m: &sched::Move) -> AffinityOutcome {
-    let dir = es
-        .cache
-        .tasks
-        .get(&m.tid)
-        .map(|e| e.cpuset_dir.clone())
-        .unwrap_or_default();
-    match affinity_set(m.tid, &m.cpus, &dir, &cfg.topo) {
+    // S7 只改绑核，不写 cpuset：cgroup 迁移会带来额外抖动，
+    // 失败时还会把线程留在一个比目标更宽的集合里
+    match affinity_apply(m.tid, &m.cpus, None, &cfg.topo, ApplyReason::Sched, &m.comm).0 {
         AffinityOutcome::Set => {
             // 同步缓存：affinity_sync 每 3*interval 秒会按 entry.cpus 重设，
             // 不改这里，迁移结果几秒后就被拉回规则值
@@ -551,13 +574,7 @@ fn apply_move_ebpf(es: &mut EbpfState, cfg: &AppConfig, m: &sched::Move) -> Affi
 }
 
 fn apply_move_proc(ps: &mut ProcScanState, cfg: &AppConfig, m: &sched::Move) -> AffinityOutcome {
-    let dir = ps
-        .cache
-        .tasks
-        .get(&m.tid)
-        .map(|e| e.cpuset_dir.clone())
-        .unwrap_or_default();
-    match affinity_set(m.tid, &m.cpus, &dir, &cfg.topo) {
+    match affinity_apply(m.tid, &m.cpus, None, &cfg.topo, ApplyReason::Sched, &m.comm).0 {
         AffinityOutcome::Set => {
             if let Some(e) = ps.cache.tasks.get_mut(&m.tid) {
                 e.cpus = m.cpus;

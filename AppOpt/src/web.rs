@@ -18,6 +18,7 @@ use crate::config::{
     RT_TIMESLICE_LIMIT,
 };
 use crate::cpuset::{base_cpuset, create_cpuset_dir, parse_cpu_spec, CpuSet, CpuTopology, DEFAULT_CPUSET_NAME};
+use crate::diag;
 use crate::ebpf_mode::ebpf_probe;
 use crate::config::{RtMatch, RtScope};
 use crate::rt;
@@ -281,6 +282,7 @@ fn dispatch(out: &mut TcpStream, req: &Request) {
         ("GET", "/api/status") => (200, status_json()),
         ("GET", "/api/rules") => (200, rules_json()),
         ("GET", "/api/config") => (200, config_json()),
+        ("GET", "/api/diag") => (200, diag_json()),
         ("GET", "/api/rt") => (200, rt_json()),
         ("POST", "/api/rule") => rule_api(req),
         ("POST", "/api/rule/del") => rule_del_api(req),
@@ -610,21 +612,15 @@ fn config_json() -> String {
         .as_ref()
         .map(|c| (c.rt.max_per_app, c.rt.timeslice_ms))
         .unwrap_or((crate::config::RT_DEFAULT_MAX, crate::config::RT_DEFAULT_TIMESLICE));
-    let (_s_mode, s_state, s_ticks, s_would, s_moved, s_failed, s_blocked, s_load, s_last) =
-        match lock_ignore_poison(&SCHED_SNAPSHOT).clone() {
-            Some(s) => (
-                s.mode,
-                s.state,
-                s.ticks,
-                s.would,
-                s.moved,
-                s.failed,
-                s.blocked,
-                s.load.to_vec(),
-                s.last,
-            ),
-            None => (0, "off", 0, 0, 0, 0, 0, vec![-1, -1, -1], String::new()),
-        };
+    let snap = lock_ignore_poison(&SCHED_SNAPSHOT).clone().unwrap_or_default();
+    let s_state = snap.state;
+    let s_ticks = snap.ticks;
+    let s_would = snap.would;
+    let s_moved = snap.moved;
+    let s_failed = snap.failed;
+    let s_blocked = snap.blocked;
+    let s_load = snap.load.to_vec();
+    let s_last = snap.last.clone();
     json!({
         "mode": MODE_FORCE.load(Ordering::Relaxed),
         "mode_active": if stats.is_some_and(|s| s.ebpf) { "ebpf" } else { "proc" },
@@ -650,6 +646,79 @@ fn config_json() -> String {
         "sched_blocked": s_blocked,
         "sched_load": s_load,
         "sched_last": s_last,
+        "sched_skip": snap.skip.to_vec(),
+        "sched_skip_labels": crate::sched::SKIP_LABELS.to_vec(),
+        "sched_bounced": snap.bounced,
+        "sched_frozen": snap.frozen,
+    })
+    .to_string()
+}
+
+/// 诊断面板数据。线程表取自主循环每 5 秒发布一次的快照，
+/// 因此这里的 `actual` 最多滞后 5 秒，够用来发现「一直没绑上」
+fn diag_json() -> String {
+    let d = diag::snapshot();
+    let snap = lock_ignore_poison(&SCHED_SNAPSHOT).clone().unwrap_or_default();
+    let threads: Vec<Value> = d
+        .threads
+        .iter()
+        .map(|t| {
+            json!({
+                "tid": t.tid,
+                "pkg": t.pkg,
+                "comm": t.comm,
+                "expect": t.expect,
+                "actual": t.actual,
+                "ok": t.ok,
+                "role": t.role,
+            })
+        })
+        .collect();
+    let jank: Vec<Value> = d
+        .jank
+        .iter()
+        .map(|j| {
+            json!({
+                "tid": j.tid,
+                "comm": j.comm,
+                "wait_ms": (j.wait_ms * 10.0).round() / 10.0,
+                "switches": j.switches,
+            })
+        })
+        .collect();
+    json!({
+        "affinity": {
+            "calls": d.aff.calls,
+            "writes": d.aff.writes,
+            "noop": d.aff.noop,
+            "gone": d.aff.gone,
+            "failed": d.aff.failed,
+            "eperm": d.aff.eperm,
+            "einval": d.aff.einval,
+            "enosys": d.aff.enosys,
+            "other": d.aff.other,
+            "cpuset_fail": d.aff.cpuset_fail,
+            "rule": d.aff.rule,
+            "sync": d.aff.sync,
+            "sched": d.aff.sched,
+            "line": diag::affinity_line(&d.aff),
+            "errno_line": d.aff.errno_line(),
+        },
+        "s7": {
+            "mode": snap.mode,
+            "state": snap.state,
+            "skip": snap.skip.to_vec(),
+            "skip_labels": crate::sched::SKIP_LABELS.to_vec(),
+            "bounced": snap.bounced,
+            "frozen": snap.frozen,
+            "moved": snap.moved,
+            "failed": snap.failed,
+            "blocked": snap.blocked,
+        },
+        "jank": jank,
+        "pressure": d.pressure,
+        "threads": threads,
+        "events": d.events,
     })
     .to_string()
 }
