@@ -256,6 +256,8 @@ pub struct SchedSnapshot {
     pub mode: u8,
     pub state: &'static str,
     pub ticks: u64,
+    /// 累计探测过的线程次（每轮最多 MAX_PROBE 个），用来判断判定是否真的在跑
+    pub probed: u64,
     /// shadow 下「本可迁移」累计次数
     pub would: u64,
     /// on 下真实提交成功的次数
@@ -281,6 +283,7 @@ pub static SCHED_SNAPSHOT: Mutex<Option<SchedSnapshot>> = Mutex::new(None);
 pub struct SchedState {
     mode: SchedMode,
     ticks: u64,
+    probed: u64,
     would: u64,
     moved: u64,
     failed: u64,
@@ -315,6 +318,7 @@ impl SchedState {
         Self {
             mode: SchedMode::Off,
             ticks: 0,
+            probed: 0,
             would: 0,
             moved: 0,
             failed: 0,
@@ -395,6 +399,9 @@ impl SchedState {
         now: Instant,
     ) -> Vec<Move> {
         self.ticks += 1;
+        self.probed = self
+            .probed
+            .saturating_add(cache.tasks.len().min(MAX_PROBE) as u64);
         self.load = load;
         self.decide(cfg, cache, load, now)
     }
@@ -484,6 +491,7 @@ impl SchedState {
             mode: self.mode as u8,
             state: self.state,
             ticks: self.ticks,
+            probed: self.probed,
             would: self.would,
             moved: self.moved,
             failed: self.failed,
@@ -915,6 +923,7 @@ mod tests {
             cpuset_dir: String::new(),
             is_thread_rule: false,
             comm: comm.to_string(),
+            applied: true,
         }
     }
 
@@ -1236,6 +1245,7 @@ mod tests {
                 cpuset_dir: String::new(),
                 is_thread_rule: false,
                 comm: "Thread-7".to_string(),
+                applied: true,
             },
         );
         let mut st = state_for(&cache, SchedMode::Shadow);
@@ -1377,6 +1387,7 @@ mod tests {
                 cpuset_dir: String::new(),
                 is_thread_rule: false,
                 comm: "Thread-8".into(),
+                applied: true,
             },
         );
         let mut st = state_for(&cache, SchedMode::On);

@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::time::{Duration, Instant};
 
-use crate::apply_affinity::{proc_walk, read_cmdline, task_tids, tid_comm};
+use crate::apply_affinity::{AffinityOutcome, proc_walk, read_cmdline, task_tids, tid_comm};
 use crate::cache::ProcCache;
 use crate::config::AppConfig;
 use crate::rt;
@@ -138,7 +138,9 @@ fn recheck_names(cfg: &AppConfig, state: &mut ProcScanState) {
         }
         if state
             .cache
-            .task_apply(tid, pid, &pkg, &comm, cfg, |_, _, _| false)
+            .task_apply(tid, pid, &pkg, &comm, cfg, |_, _, _, _| {
+                AffinityOutcome::Failed
+            })
         {
             changed += 1;
             if let Some(e) = state.cache.tasks.get(&tid) {
@@ -224,7 +226,9 @@ fn proc_tasks(
         };
         let ok = state
             .cache
-            .task_apply(tid, pid, pkg, &thread_name, cfg, |_, _, _| false);
+            .task_apply(tid, pid, pkg, &thread_name, cfg, |_, _, _, _| {
+                AffinityOutcome::Failed
+            });
         if ok {
             if let Some(e) = state.cache.tasks.get(&tid) {
                 rt::note(tid, pid, &e.pkg, &e.comm, &e.cpus, cfg);

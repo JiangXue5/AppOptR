@@ -3,10 +3,11 @@ use std::fs;
 use std::io::Write as _;
 use std::os::unix::fs::FileExt;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
-use crate::{diag, lock_ignore_poison, MAX_PKG_LEN, MAX_THREAD_LEN};
 use crate::config::AppConfig;
-use crate::cpuset::{base_cpuset, create_cpuset_dir, CpuSet, CpuTopology};
+use crate::cpuset::{CpuSet, CpuTopology, base_cpuset, create_cpuset_dir};
+use crate::{MAX_PKG_LEN, MAX_THREAD_LEN, diag, lock_ignore_poison};
 
 /// 栈上构建 /proc/{pid}/{suffix} 路径读取文件
 fn read_proc_file<'a>(pid: i32, suffix: &str, buf: &'a mut [u8]) -> Option<&'a [u8]> {
@@ -62,6 +63,123 @@ pub(crate) fn task_tids(pid: i32) -> Option<Vec<i32>> {
 /// 已就绪的 cpuset 子目录名。目录名由 CPU 集合派生，建成后内容不变，
 /// 每个线程每次命中都重复 mkdir/chmod/chown/写 cpus+mems 是纯浪费（5 次系统调用）
 static READY_DIRS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+/// 连续失败多少次后暂停尝试
+const CPUSET_TRIP_FAILS: u32 = 3;
+/// 暂停时长。半开放行一次试探，避免设备只是短暂异常就永久放弃 cpuset
+const CPUSET_PAUSE: Duration = Duration::from_secs(120);
+
+struct Breaker {
+    fails: u32,
+    until: Option<Instant>,
+    tripped: bool,
+}
+
+impl Breaker {
+    const fn new() -> Self {
+        Self {
+            fails: 0,
+            until: None,
+            tripped: false,
+        }
+    }
+
+    /// 是否允许再尝试写 cpuset。暂停到期后放行一次（半开），成功则彻底恢复
+    fn gate(&mut self, now: Instant) -> bool {
+        match self.until {
+            Some(t) if now < t => false,
+            Some(_) => {
+                self.until = None;
+                true
+            }
+            None => true,
+        }
+    }
+
+    /// 记一次失败，返回是否需要打熔断日志（只在首次熔断时）
+    fn failed(&mut self, now: Instant) -> bool {
+        self.fails = self.fails.saturating_add(1);
+        if self.fails < CPUSET_TRIP_FAILS {
+            return false;
+        }
+        // 半开试探再失败只延长暂停，不重复刷同一条熔断日志
+        let announce = !self.tripped;
+        self.tripped = true;
+        self.until = Some(now + CPUSET_PAUSE);
+        announce
+    }
+
+    fn ok(&mut self) {
+        *self = Self::new();
+    }
+
+    fn paused(&self, now: Instant) -> bool {
+        self.until.is_some_and(|t| now < t)
+    }
+}
+
+static BREAKER: Mutex<Breaker> = Mutex::new(Breaker::new());
+
+fn cpuset_gate() -> bool {
+    lock_ignore_poison(&BREAKER).gate(Instant::now())
+}
+
+fn cpuset_ok() {
+    lock_ignore_poison(&BREAKER).ok();
+}
+
+fn cpuset_failed(err: Option<i32>) {
+    let announce = lock_ignore_poison(&BREAKER).failed(Instant::now());
+    if announce {
+        diag::note_cpuset_tripped(err, CPUSET_TRIP_FAILS, CPUSET_PAUSE);
+    }
+}
+
+/// cpuset 是否处于熔断暂停中，供摘要行说明「没在重试」而不是「没失败」
+pub fn cpuset_paused() -> bool {
+    lock_ignore_poison(&BREAKER).paused(Instant::now())
+}
+
+/// 写进去又被裁掉的线程。这类线程每轮都会「读回不一致 → 再写 → 还是不一致」，
+/// 几百个线程反复迁移会持续打断正在跑渲染的核，是 S7 之外最大的抖动源。
+/// 对它们暂停重绑，保留内核当前值，等 cpuset 侧修好或线程重建
+pub(crate) const STUCK_PAUSE: Duration = Duration::from_secs(300);
+const STUCK_CAP: usize = 2048;
+
+static STUCK: Mutex<Option<std::collections::HashMap<i32, Instant>>> = Mutex::new(None);
+
+fn stuck_hit(tid: i32) -> bool {
+    let mut guard = lock_ignore_poison(&STUCK);
+    let map = guard.get_or_insert_with(std::collections::HashMap::new);
+    match map.get(&tid) {
+        Some(&until) if Instant::now() < until => true,
+        Some(_) => {
+            map.remove(&tid);
+            false
+        }
+        None => false,
+    }
+}
+
+fn stuck_mark(tid: i32) {
+    let mut guard = lock_ignore_poison(&STUCK);
+    let map = guard.get_or_insert_with(std::collections::HashMap::new);
+    if map.len() >= STUCK_CAP {
+        let now = Instant::now();
+        map.retain(|_, &mut until| until > now);
+    }
+    map.insert(tid, Instant::now() + STUCK_PAUSE);
+}
+
+/// 被暂停重绑的线程数，Web 诊断展示用
+pub fn stuck_count() -> usize {
+    let guard = lock_ignore_poison(&STUCK);
+    let now = Instant::now();
+    guard
+        .as_ref()
+        .map(|m| m.values().filter(|&&until| until > now).count())
+        .unwrap_or(0)
+}
 
 /// 判断子目录是否就绪，未就绪则创建一次；base cpuset 由 init_cpu_topo 负责，不在此重建
 fn dir_ready(dir: &str, topo: &CpuTopology) -> bool {
@@ -171,27 +289,54 @@ pub fn affinity_apply(
     reason: ApplyReason,
     comm: &str,
 ) -> (AffinityOutcome, bool) {
-    // sched_getaffinity 短路，已符合目标零开销返回
-    if let Some(curr) = CpuSet::get_affinity(tid)
-        && curr == *cpus
-    {
-        diag::note(reason, &AffinityOutcome::Set, false);
+    // 上一轮已经证明「写进去也会被裁」，这一轮别再动它：
+    // 反复迁移只会把线程在簇之间踢来踢去
+    if reason == ApplyReason::Sync && stuck_hit(tid) {
+        diag::note_stuck();
         return (AffinityOutcome::Set, false);
+    }
+    // sched_getaffinity 短路，已符合目标零开销返回
+    if let Some(curr) = CpuSet::get_affinity(tid) {
+        if curr == *cpus {
+            diag::note(reason, &AffinityOutcome::Set, false);
+            return (AffinityOutcome::Set, false);
+        }
+        // 只有定期校验能说明「绑定没坏、是被别人改回去了」。
+        // 记下期望/实际/所在 cpuset，才能区分被 cpuset 裁剪和被整体重置
+        if reason == ApplyReason::Sync {
+            diag::note_drift(tid, comm, cpus, &curr);
+        }
     }
     // None 表示这条路径明确不碰 cpuset（S7 迁移）。cgroup 迁移比
     // sched_setaffinity 重得多，每次动态迁移都做一遍只会放大抖动
     if topo.cpuset_enabled
         && let Some(dir) = cpuset_dir
-        && let Err(e) = write_task(dir, tid, topo)
+        && cpuset_gate()
     {
-        diag::note_cpuset_failure(
-            if dir.is_empty() { "<base>" } else { dir },
-            (e != 0).then_some(e),
-        );
+        match write_task(dir, tid, topo) {
+            Ok(()) => cpuset_ok(),
+            Err(e) => {
+                diag::note_cpuset_failure(
+                    tid,
+                    if dir.is_empty() { "<base>" } else { dir },
+                    (e != 0).then_some(e),
+                );
+                cpuset_failed((e != 0).then_some(e));
+            }
+        }
     }
     match cpus.set_affinity(tid) {
         Ok(()) => {
             diag::note(reason, &AffinityOutcome::Set, true);
+            // 定期校验必须回读确认：内核返回 0 不代表生效，cpuset 会把
+            // 写入的集合和 effective_cpus 求交，交集不足时下一次读回还是旧值
+            if reason == ApplyReason::Sync
+                && let Some(after) = CpuSet::get_affinity(tid)
+                && after != *cpus
+            {
+                stuck_mark(tid);
+                diag::note_ineffective(tid, comm, cpus, &after);
+            }
             (AffinityOutcome::Set, true)
         }
         Err(e) => {
@@ -208,7 +353,6 @@ pub fn affinity_apply(
     }
 }
 
-
 /// 遍历 /proc 匹配目标进程，返回 匹配数与总进程数。
 /// 是否读线程名交给调用方用 `cfg.needs_comm` 判断，这里不再传旧的包级标记
 pub(crate) fn proc_walk(
@@ -216,15 +360,25 @@ pub(crate) fn proc_walk(
     filter: impl Fn(i32) -> bool,
     mut f: impl FnMut(i32, &str),
 ) -> (usize, i32) {
-    let Some(entries) = fs::read_dir("/proc").ok() else { return (0, 0) };
+    let Some(entries) = fs::read_dir("/proc").ok() else {
+        return (0, 0);
+    };
     let mut count = 0;
     let mut total: i32 = 0;
     for entry in entries.flatten() {
-        let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else { continue };
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
+            continue;
+        };
         total += 1;
-        if !filter(pid) { continue; }
-        let Some(pkg) = read_cmdline(pid).or_else(|| tid_comm(pid)) else { continue };
-        if !cfg.pkgs.contains(&pkg) { continue; }
+        if !filter(pid) {
+            continue;
+        }
+        let Some(pkg) = read_cmdline(pid).or_else(|| tid_comm(pid)) else {
+            continue;
+        };
+        if !cfg.pkgs.contains(&pkg) {
+            continue;
+        }
         f(pid, &pkg);
         count += 1;
     }
@@ -264,6 +418,31 @@ mod tests {
             affinity_apply(tid, &CpuSet::new(), None, &topo, ApplyReason::Rule, "").0,
             AffinityOutcome::Failed
         );
+    }
+
+    /// 熔断必须「第三次失败才播报、暂停期满半开、半开再失败不重复刷屏」
+    #[test]
+    fn breaker_trips_after_three_failures_and_recovers() {
+        let mut b = Breaker::new();
+        let t0 = Instant::now();
+        assert!(b.gate(t0));
+        assert!(!b.failed(t0));
+        assert!(!b.failed(t0));
+        assert!(b.failed(t0), "第三次失败才熔断并播报");
+        assert!(!b.gate(t0));
+        assert!(b.paused(t0));
+
+        // 暂停期满放行一次试探
+        let later = t0 + CPUSET_PAUSE + Duration::from_secs(1);
+        assert!(b.gate(later));
+        // 试探再失败：重新计时，但不重复播报同一条熔断日志
+        assert!(!b.failed(later));
+        assert!(b.paused(later));
+
+        // 成功一次即彻底恢复
+        b.ok();
+        assert!(b.gate(later));
+        assert!(!b.paused(later));
     }
 
     /// 线程已退出与设置失败要分开，前者要清状态

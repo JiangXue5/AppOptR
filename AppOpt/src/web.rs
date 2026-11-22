@@ -3,31 +3,32 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::apply_affinity::{read_cmdline, reset_cpuset_dir_cache, task_tids};
 use crate::cache::ProcCache;
 use crate::config::{
-    config_reload_now, spec_like,
     CHECK_INTERVAL, CONFIG_FILE, CURRENT_CONFIG, FORCE_RELOAD, PARSE_FAILS, RT_MAX_LIMIT,
-    RT_TIMESLICE_LIMIT,
+    RT_TIMESLICE_LIMIT, config_reload_now, spec_like,
 };
-use crate::cpuset::{base_cpuset, create_cpuset_dir, parse_cpu_spec, CpuSet, CpuTopology, DEFAULT_CPUSET_NAME};
+use crate::config::{RtMatch, RtScope};
+use crate::cpuset::{
+    CpuSet, CpuTopology, DEFAULT_CPUSET_NAME, base_cpuset, create_cpuset_dir, parse_cpu_spec,
+};
 use crate::diag;
 use crate::ebpf_mode::ebpf_probe;
-use crate::config::{RtMatch, RtScope};
 use crate::rt;
 use crate::rule_edit::{
-    adv_configure, rt_app_set, rt_configure, rt_toggle, rule_delete, rule_delete_pkg, rule_rename,
-    rule_upsert, sched_set, RuleEdit,
+    RuleEdit, adv_configure, rt_app_set, rt_configure, rt_toggle, rule_delete, rule_delete_pkg,
+    rule_rename, rule_upsert, sched_set,
 };
 use crate::sched::SCHED_SNAPSHOT;
-use crate::{lock_ignore_poison, EBPF_GAVE_UP, MAX_PKG_LEN, MAX_THREAD_LEN};
+use crate::{EBPF_GAVE_UP, MAX_PKG_LEN, MAX_THREAD_LEN, lock_ignore_poison};
 
 pub const WEB_PORT: u16 = 8889;
 const INDEX_HTML: &str = include_str!("../../web/index.html");
@@ -127,11 +128,18 @@ fn request_read(reader: &mut BufReader<TcpStream>) -> Option<Request> {
     let path = parts.next()?.split('?').next().unwrap_or("").to_string();
     let version = parts.next().unwrap_or("HTTP/1.1").to_string();
 
-    let (mut host, mut origin, mut site, mut ctype, mut len) =
-        (String::new(), String::new(), String::new(), String::new(), 0usize);
+    let (mut host, mut origin, mut site, mut ctype, mut len) = (
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        0usize,
+    );
     let mut conn = String::new();
     for h in lines {
-        let Some((k, v)) = h.split_once(':') else { continue };
+        let Some((k, v)) = h.split_once(':') else {
+            continue;
+        };
         let v = v.trim();
         match k.trim().to_ascii_lowercase().as_str() {
             "host" => host = v.to_ascii_lowercase(),
@@ -228,7 +236,10 @@ fn resp_send(
 
 fn dispatch(out: &mut TcpStream, req: &Request) {
     let port_str = format!(":{}", WEB_PORT);
-    let host = req.host.strip_suffix(&port_str).unwrap_or(req.host.as_str());
+    let host = req
+        .host
+        .strip_suffix(&port_str)
+        .unwrap_or(req.host.as_str());
     let host_ok = matches!(host, "127.0.0.1" | "localhost");
     // 同源请求不带 Origin 或为 null；WebUI 容器来源的 Sec-Fetch-Site 必然是 cross-site
     let same_site = req.origin.is_empty()
@@ -296,7 +307,14 @@ fn dispatch(out: &mut TcpStream, req: &Request) {
         ("POST", "/api/suggest") => suggest_api(req),
         _ => err_json(404, "not found"),
     };
-    resp_send(out, status, "application/json", body.as_bytes(), !req.keep_alive, cors);
+    resp_send(
+        out,
+        status,
+        "application/json",
+        body.as_bytes(),
+        !req.keep_alive,
+        cors,
+    );
 }
 
 fn err_json(code: u16, msg: &str) -> (u16, String) {
@@ -429,7 +447,9 @@ fn rule_api(req: &Request) -> (u16, String) {
     if thread.is_empty() && !pkg_shape_ok(pkg) {
         return err_json(400, "包名含 { 且以 } 结尾时不支持包级规则，可改用线程规则");
     }
-    if cpus.is_empty() || cpus.len() >= 64 || !spec_like(cpus)
+    if cpus.is_empty()
+        || cpus.len() >= 64
+        || !spec_like(cpus)
         || parse_cpu_spec(cpus, &cfg.topo).count() == 0
     {
         return err_json(400, "无效的 CPU 规格");
@@ -477,9 +497,10 @@ fn rule_rename_api(req: &Request) -> (u16, String) {
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(&req.body) else {
         return err_json(400, "请求体不是合法 JSON");
     };
-    let (Some(old), Some(new)) =
-        (v["old"].as_str().map(str::trim), v["new"].as_str().map(str::trim))
-    else {
+    let (Some(old), Some(new)) = (
+        v["old"].as_str().map(str::trim),
+        v["new"].as_str().map(str::trim),
+    ) else {
         return err_json(400, "缺少 old 或 new 字段");
     };
     if !token_ok(old, MAX_PKG_LEN) || !token_ok(new, MAX_PKG_LEN) {
@@ -520,7 +541,10 @@ fn suggest_api(req: &Request) -> (u16, String) {
             if !token_ok(pkg, MAX_PKG_LEN) {
                 return err_json(400, "名称含有非法字符");
             }
-            suggest_threads(pkg, q).into_iter().map(|(n, _)| n).collect()
+            suggest_threads(pkg, q)
+                .into_iter()
+                .map(|(n, _)| n)
+                .collect()
         }
     };
     (200, json!({ "ok": true, "list": list }).to_string())
@@ -554,13 +578,22 @@ fn rank_top(counts: BTreeMap<String, usize>, lq: &str) -> Vec<(String, usize)> {
         .into_iter()
         .filter_map(|(n, c)| {
             let ln = n.to_ascii_lowercase();
-            let r = if ln.starts_with(lq) { 0 } else if ln.contains(lq) { 1 } else { 2 };
+            let r = if ln.starts_with(lq) {
+                0
+            } else if ln.contains(lq) {
+                1
+            } else {
+                2
+            };
             (r < 2).then_some((r, Reverse(c), n))
         })
         .collect();
     ranked.sort_unstable();
     ranked.truncate(20);
-    ranked.into_iter().map(|(_, Reverse(c), n)| (n, c)).collect()
+    ranked
+        .into_iter()
+        .map(|(_, Reverse(c), n)| (n, c))
+        .collect()
 }
 
 fn suggest_pkgs(q: &str) -> Vec<(String, usize)> {
@@ -598,7 +631,11 @@ fn config_json() -> String {
     let stats = lock_ignore_poison(&WEB_STATS).clone();
     let cfg = current_cfg();
     let cpuset_enabled = cfg.as_ref().is_some_and(|c| c.topo.cpuset_enabled);
-    let unmatched = if cfg.as_ref().is_some_and(|c| c.unmatched_all) { "all" } else { "keep" };
+    let unmatched = if cfg.as_ref().is_some_and(|c| c.unmatched_all) {
+        "all"
+    } else {
+        "keep"
+    };
     let scope = cfg.as_ref().map(|c| c.sched_scope).unwrap_or_default();
     // 档位取配置真值而不是运行快照：快照由主循环低频刷新，
     // 刚切档时读到的还是旧值，界面高亮会慢一拍
@@ -611,8 +648,13 @@ fn config_json() -> String {
     let (rt_max, rt_ts) = cfg
         .as_ref()
         .map(|c| (c.rt.max_per_app, c.rt.timeslice_ms))
-        .unwrap_or((crate::config::RT_DEFAULT_MAX, crate::config::RT_DEFAULT_TIMESLICE));
-    let snap = lock_ignore_poison(&SCHED_SNAPSHOT).clone().unwrap_or_default();
+        .unwrap_or((
+            crate::config::RT_DEFAULT_MAX,
+            crate::config::RT_DEFAULT_TIMESLICE,
+        ));
+    let snap = lock_ignore_poison(&SCHED_SNAPSHOT)
+        .clone()
+        .unwrap_or_default();
     let s_state = snap.state;
     let s_ticks = snap.ticks;
     let s_would = snap.would;
@@ -658,7 +700,9 @@ fn config_json() -> String {
 /// 因此这里的 `actual` 最多滞后 5 秒，够用来发现「一直没绑上」
 fn diag_json() -> String {
     let d = diag::snapshot();
-    let snap = lock_ignore_poison(&SCHED_SNAPSHOT).clone().unwrap_or_default();
+    let snap = lock_ignore_poison(&SCHED_SNAPSHOT)
+        .clone()
+        .unwrap_or_default();
     let threads: Vec<Value> = d
         .threads
         .iter()
@@ -682,7 +726,10 @@ fn diag_json() -> String {
                 "tid": j.tid,
                 "comm": j.comm,
                 "wait_ms": (j.wait_ms * 10.0).round() / 10.0,
+                "total_wait_ms": (j.total_wait_ms * 10.0).round() / 10.0,
                 "switches": j.switches,
+                "affinity": j.affinity,
+                "cpu": j.cpu,
             })
         })
         .collect();
@@ -698,6 +745,13 @@ fn diag_json() -> String {
             "enosys": d.aff.enosys,
             "other": d.aff.other,
             "cpuset_fail": d.aff.cpuset_fail,
+            "cpuset_paused": crate::apply_affinity::cpuset_paused(),
+            "clip": d.aff.clip,
+            "reset": d.aff.reset,
+            "shifted": d.aff.shifted,
+            "ineffective": d.aff.ineffective,
+            "stuck_skip": d.aff.stuck_skip,
+            "stuck": crate::apply_affinity::stuck_count(),
             "rule": d.aff.rule,
             "sync": d.aff.sync,
             "sched": d.aff.sched,
@@ -1046,9 +1100,10 @@ fn config_set_api(req: &Request) -> (u16, String) {
         // 目录全部换到新 base 下，旧的“已建”记录必须作废
         reset_cpuset_dir_cache();
         if let Some(cfg) = current_cfg()
-            && cfg.topo.cpuset_enabled {
-                create_cpuset_dir(&base_cpuset(), &cfg.topo.present_str, &cfg.topo.mems_str);
-            }
+            && cfg.topo.cpuset_enabled
+        {
+            create_cpuset_dir(&base_cpuset(), &cfg.topo.present_str, &cfg.topo.mems_str);
+        }
         FORCE_RELOAD.store(true, Ordering::Release);
     }
     if let Some(p) = path {
@@ -1269,7 +1324,11 @@ pub fn settings_save() {
         web_enable: WEB_ENABLED.load(Ordering::Relaxed),
         mode: MODE_FORCE.load(Ordering::Relaxed),
         check_interval: CHECK_INTERVAL.load(Ordering::Relaxed).max(1),
-        cpuset_name: base_cpuset().rsplit('/').next().unwrap_or_default().to_string(),
+        cpuset_name: base_cpuset()
+            .rsplit('/')
+            .next()
+            .unwrap_or_default()
+            .to_string(),
         config_file: lock_ignore_poison(&CONFIG_FILE).clone(),
     }
     .save(SETTINGS_FILE);
@@ -1381,7 +1440,11 @@ mod tests {
     #[test]
     fn parent_symlink_inside_whitelist_is_accepted() {
         let dir = format!("{}/appopt_dir_{}", exe_dir().display(), std::process::id());
-        let link = format!("{}/appopt_dir_link_{}", exe_dir().display(), std::process::id());
+        let link = format!(
+            "{}/appopt_dir_link_{}",
+            exe_dir().display(),
+            std::process::id()
+        );
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_file(&link);
         std::fs::create_dir_all(&dir).unwrap();

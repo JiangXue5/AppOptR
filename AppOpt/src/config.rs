@@ -855,42 +855,46 @@ pub fn load_config(
         );
     }
 
-    println!("配置文件解析完成，共加载 {} 条规则", num_rules);
+    crate::diag::emit(&format!("配置文件解析完成，共加载 {} 条规则", num_rules));
     if fail_cnt > 0 {
         eprintln!("警告: {} 条规则因格式无效被跳过", fail_cnt);
     }
     if unmatched_all {
-        println!("未匹配线程: all（沿用旧行为，设为全部核心）");
+        crate::diag::emit("未匹配线程: all（沿用旧行为，设为全部核心）");
     } else {
-        println!("未匹配线程: keep（保持原有亲和性）");
+        crate::diag::emit("未匹配线程: keep（保持原有亲和性）");
     }
     let (scope, sched_pkgs) = sched_scope(&rules, topo);
     if scope.levels < 2 {
-        println!("跨簇规则: 不适用（当前识别为 {} 个核心层）", scope.levels);
+        crate::diag::emit(&format!(
+            "跨簇规则: 不适用（当前识别为 {} 个核心层）",
+            scope.levels
+        ));
     } else {
-        println!(
+        crate::diag::emit(&format!(
             "跨簇规则: {} / {} 条，涉及 {} 个包（核心层级 {}）",
             scope.rules, num_rules, scope.pkgs, scope.levels
-        );
+        ));
     }
     match sched {
-        SchedMode::Off => println!("S7 动态分配: off（不采样，行为与静态规则一致）"),
-        SchedMode::Shadow => println!("S7 动态分配: shadow（采样与记录，不修改亲和性）"),
+        SchedMode::Off => crate::diag::emit("S7 动态分配: off（不采样，行为与静态规则一致）"),
+        SchedMode::Shadow => crate::diag::emit("S7 动态分配: shadow（采样与记录，不修改亲和性）"),
         // 拓扑不满足时照常记录意图，但明确不会生效，避免误以为已经在优化
-        SchedMode::On if scope.levels < 2 => {
-            println!("S7 动态分配: on（核心层仅 {} 个，不会生效）", scope.levels)
-        }
+        SchedMode::On if scope.levels < 2 => crate::diag::emit(&format!(
+            "S7 动态分配: on（核心层仅 {} 个，不会生效）",
+            scope.levels
+        )),
         SchedMode::On => {
-            println!("S7 动态分配: on（仅 Worker/Background 让位，每秒最多迁移 1 个线程）")
+            crate::diag::emit("S7 动态分配: on（仅 Worker/Background 让位，每秒最多迁移 1 个线程）")
         }
     }
     if !rt.is_off() {
-        println!(
+        crate::diag::emit(&format!(
             "RT 调度: {}，每应用上限 {}，RR 时间片 {} ms",
             rt.label(),
             rt.max_per_app,
             rt.timeslice_ms
-        );
+        ));
         // per_app 里配了但没有任何亲和性规则的包不会进入决策路径，提前说明比事后排查省事
         if rt.scope == RtScope::PerApp {
             let mut orphan: Vec<&str> = rt

@@ -7,10 +7,10 @@ use std::sync::mpsc;
 use std::thread;
 
 use aya::maps::{Array as AyaArray, HashMap as AyaHashMap, Map, PerCpuArray as AyaPerCpuArray};
-use aya::{programs::TracePoint as AyaTracePoint, Ebpf, EbpfLoader, Pod};
+use aya::{Ebpf, EbpfLoader, Pod, programs::TracePoint as AyaTracePoint};
 
 use crate::apply_affinity::{
-    affinity_apply, proc_walk, task_tids, tid_comm, AffinityOutcome, ApplyReason,
+    AffinityOutcome, ApplyReason, affinity_apply, proc_walk, task_tids, tid_comm,
 };
 use crate::cache::ProcCache;
 use crate::config::{AppConfig, CURRENT_CONFIG};
@@ -80,7 +80,9 @@ impl Drop for EbpfState {
             let _ = handle.join();
         }
         if self.wakeup_fd >= 0 {
-            unsafe { libc::close(self.wakeup_fd); }
+            unsafe {
+                libc::close(self.wakeup_fd);
+            }
         }
     }
 }
@@ -218,16 +220,23 @@ fn tracepoint_parse(root: &str, category: &str, name: &str) -> Option<HashMap<St
         if parts.len() < 2 {
             continue;
         }
-        let field_name = parts[0].split_whitespace().last().unwrap_or("").split('[').next().unwrap_or("");
+        let field_name = parts[0]
+            .split_whitespace()
+            .last()
+            .unwrap_or("")
+            .split('[')
+            .next()
+            .unwrap_or("");
         if field_name.is_empty() {
             continue;
         }
         for part in &parts[1..] {
             if let Some(off_str) = part.strip_prefix("offset:")
-                && let Ok(off) = off_str.trim().parse::<u32>() {
-                    offsets.insert(field_name.to_string(), off);
-                    break;
-                }
+                && let Ok(off) = off_str.trim().parse::<u32>()
+            {
+                offsets.insert(field_name.to_string(), off);
+                break;
+            }
         }
     }
     Some(offsets)
@@ -460,19 +469,28 @@ fn applied_get(bpf: &mut Ebpf) -> Option<AyaHashMap<&mut aya::maps::MapData, u32
 }
 
 fn applied_set(bpf: &mut Ebpf, tid: i32, cpus: &CpuSet) {
-    let Some(mut applied) = applied_get(bpf) else { return };
+    let Some(mut applied) = applied_get(bpf) else {
+        return;
+    };
     if let Err(e) = applied.insert(tid as u32, cpus.bits[0], 0) {
-        eprintln!("eBPF: APPLIED_MAP 插入失败 tid={} ({})，map 可能已满", tid, e);
+        eprintln!(
+            "eBPF: APPLIED_MAP 插入失败 tid={} ({})，map 可能已满",
+            tid, e
+        );
     }
 }
 
 fn applied_del(bpf: &mut Ebpf, tid: i32) {
-    let Some(mut applied) = applied_get(bpf) else { return };
+    let Some(mut applied) = applied_get(bpf) else {
+        return;
+    };
     let _ = applied.remove(&(tid as u32));
 }
 
 fn applied_clear(bpf: &mut Ebpf) {
-    let Some(mut m) = applied_get(bpf) else { return };
+    let Some(mut m) = applied_get(bpf) else {
+        return;
+    };
     let keys: Vec<u32> = m.keys().filter_map(|r| r.ok()).collect();
     for k in &keys {
         let _ = m.remove(k);
@@ -532,14 +550,19 @@ fn affinity_apply_task(
     cfg: &AppConfig,
     bpf: &mut Ebpf,
     comm: &str,
-) -> bool {
-    match affinity_apply(tid, cpus, Some(cpuset_dir), &cfg.topo, ApplyReason::Rule, comm).0 {
-        AffinityOutcome::Gone => true,
-        _ => {
-            applied_set(bpf, tid, cpus);
-            false
-        }
+    recheck: bool,
+) -> AffinityOutcome {
+    // 复核走 Sync 语义：只有它能区分「首次绑定」与「读回被改写」
+    let reason = if recheck {
+        ApplyReason::Sync
+    } else {
+        ApplyReason::Rule
+    };
+    let outcome = affinity_apply(tid, cpus, Some(cpuset_dir), &cfg.topo, reason, comm).0;
+    if outcome != AffinityOutcome::Gone {
+        applied_set(bpf, tid, cpus);
     }
+    outcome
 }
 
 /// 事件派发，按 event_type 增量处理 FORK/RENAME/EXEC/EXIT
@@ -555,11 +578,10 @@ pub fn event_dispatch(event: &EbpfProcEvent, cfg: &AppConfig, state: &mut EbpfSt
             rt::forget(tid);
         }
 
-        EBPF_EVENT_EXEC
-            if !event_apply(&mut state.cache, &mut state.bpf, tid, pid, comm, cfg) => {
-                state.cache.task_del(tid);
-                applied_del(&mut state.bpf, tid);
-            }
+        EBPF_EVENT_EXEC if !event_apply(&mut state.cache, &mut state.bpf, tid, pid, comm, cfg) => {
+            state.cache.task_del(tid);
+            applied_del(&mut state.bpf, tid);
+        }
 
         EBPF_EVENT_FORK => {
             // 内核已不再下发 FORK 事件：子线程创建即继承父线程 affinity 与 cpuset，
@@ -588,8 +610,8 @@ fn event_apply(
         return false;
     };
 
-    let ok = cache.task_apply(tid, pid, &pkg, comm, cfg, |t, c, d| {
-        affinity_apply_task(t, c, d, cfg, bpf, comm)
+    let ok = cache.task_apply(tid, pid, &pkg, comm, cfg, |t, c, d, recheck| {
+        affinity_apply_task(t, c, d, cfg, bpf, comm, recheck)
     });
     // 规则命中且亲和性写入成功后再考虑 RT，避免把没被管理的线程提升
     if ok && let Some(e) = cache.tasks.get(&tid) {
@@ -614,24 +636,43 @@ pub fn full_scan(cfg: &AppConfig, state: &mut EbpfState) {
     state.cache.clear();
     applied_clear(&mut state.bpf);
 
-    proc_walk(cfg, |_| true, |pid, pkg| {
-        let Some(tids) = task_tids(pid) else { return };
-        // 线程名按需读取：线程规则、S7 角色、RT 匹配任一需要才读
-        let need_comm = cfg.needs_comm(pkg);
-        for tid in tids {
-            let t_name = if need_comm {
-                tid_comm(tid).unwrap_or_default()
-            } else {
-                String::new()
-            };
-            let ok = state.cache.task_apply(tid, pid, pkg, &t_name, cfg, |tid, cpus, cpuset_dir| {
-                affinity_apply_task(tid, cpus, cpuset_dir, cfg, &mut state.bpf, &t_name)
-            });
-            if ok && let Some(e) = state.cache.tasks.get(&tid) {
-                rt::note(tid, pid, &e.pkg, &e.comm, &e.cpus, cfg);
+    proc_walk(
+        cfg,
+        |_| true,
+        |pid, pkg| {
+            let Some(tids) = task_tids(pid) else { return };
+            // 线程名按需读取：线程规则、S7 角色、RT 匹配任一需要才读
+            let need_comm = cfg.needs_comm(pkg);
+            for tid in tids {
+                let t_name = if need_comm {
+                    tid_comm(tid).unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                let ok = state.cache.task_apply(
+                    tid,
+                    pid,
+                    pkg,
+                    &t_name,
+                    cfg,
+                    |tid, cpus, cpuset_dir, recheck| {
+                        affinity_apply_task(
+                            tid,
+                            cpus,
+                            cpuset_dir,
+                            cfg,
+                            &mut state.bpf,
+                            &t_name,
+                            recheck,
+                        )
+                    },
+                );
+                if ok && let Some(e) = state.cache.tasks.get(&tid) {
+                    rt::note(tid, pid, &e.pkg, &e.comm, &e.cpus, cfg);
+                }
             }
-        }
-    });
+        },
+    );
     state.cfg_sig = cfg.pkg_sig.clone();
     state.cfg_policy_sig = cfg.policy_sig;
     // 缓存重建后再对账 RT：扫描期间退出的进程、被移出配置的包不能再留着 RT 记录
@@ -639,10 +680,7 @@ pub fn full_scan(cfg: &AppConfig, state: &mut EbpfState) {
 }
 
 /// 比对两轮逐包指纹，返回（新增或变更、已删除）的包名
-fn cfg_diff(
-    old: &HashMap<String, u64>,
-    new: &HashMap<String, u64>,
-) -> (Vec<String>, Vec<String>) {
+fn cfg_diff(old: &HashMap<String, u64>, new: &HashMap<String, u64>) -> (Vec<String>, Vec<String>) {
     let mut changed: Vec<String> = Vec::new();
     for (pkg, sig) in new {
         match old.get(pkg) {
@@ -685,26 +723,45 @@ pub fn config_rescan(new: &AppConfig, state: &mut EbpfState) {
 
     if !targets.is_empty() {
         let target_set: HashSet<&str> = targets.iter().map(|s| s.as_str()).collect();
-        proc_walk(new, |_| true, |pid, pkg| {
-            if !target_set.contains(pkg) {
-                return;
-            }
-            let Some(tids) = task_tids(pid) else { return };
-            let need_comm = new.needs_comm(pkg);
-            for tid in tids {
-                let t_name = if need_comm {
-                    tid_comm(tid).unwrap_or_default()
-                } else {
-                    String::new()
-                };
-                let ok = state.cache.task_apply(tid, pid, pkg, &t_name, new, |tid, cpus, dir| {
-                    affinity_apply_task(tid, cpus, dir, new, &mut state.bpf, &t_name)
-                });
-                if ok && let Some(e) = state.cache.tasks.get(&tid) {
-                    rt::note(tid, pid, &e.pkg, &e.comm, &e.cpus, new);
+        proc_walk(
+            new,
+            |_| true,
+            |pid, pkg| {
+                if !target_set.contains(pkg) {
+                    return;
                 }
-            }
-        });
+                let Some(tids) = task_tids(pid) else { return };
+                let need_comm = new.needs_comm(pkg);
+                for tid in tids {
+                    let t_name = if need_comm {
+                        tid_comm(tid).unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
+                    let ok = state.cache.task_apply(
+                        tid,
+                        pid,
+                        pkg,
+                        &t_name,
+                        new,
+                        |tid, cpus, dir, recheck| {
+                            affinity_apply_task(
+                                tid,
+                                cpus,
+                                dir,
+                                new,
+                                &mut state.bpf,
+                                &t_name,
+                                recheck,
+                            )
+                        },
+                    );
+                    if ok && let Some(e) = state.cache.tasks.get(&tid) {
+                        rt::note(tid, pid, &e.pkg, &e.comm, &e.cpus, new);
+                    }
+                }
+            },
+        );
     }
 
     state.cfg_sig = new.pkg_sig.clone();

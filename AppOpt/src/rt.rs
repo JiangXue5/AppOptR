@@ -284,10 +284,7 @@ impl RtState {
                 // 系统调用本身不可用（内核裁剪或 seccomp 拦截）。这不是单个线程的
                 // 参数问题，后面每个线程都会一样失败，继续重试只会刷屏
                 Some(libc::ENOSYS) => {
-                    self.fuse(&format!(
-                        "内核或安全策略不提供 sched_setscheduler（{}）",
-                        e
-                    ));
+                    self.fuse(&format!("内核或安全策略不提供 sched_setscheduler（{}）", e));
                 }
                 // 其余（EINVAL 等）多半是单个线程的参数或状态问题，
                 // 不能据此认定整个环境不可用：记录 errno，跳过该线程
@@ -715,6 +712,7 @@ mod tests {
             cpuset_dir: String::new(),
             is_thread_rule: false,
             comm: comm.to_string(),
+            applied: true,
         }
     }
 

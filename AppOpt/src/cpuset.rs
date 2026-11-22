@@ -76,6 +76,15 @@ impl CpuSet {
         }
     }
 
+    /// 是否为另一集合的子集。诊断用它区分「被 cpuset 裁小」与「被整体重置」：
+    /// 前者是写进去又被内核求交，后者是写进去之后被别的东西改回了全核
+    pub fn subset_of(&self, other: &CpuSet) -> bool {
+        self.bits
+            .iter()
+            .zip(other.bits.iter())
+            .all(|(a, b)| a & !b == 0)
+    }
+
     pub fn to_range_string(self) -> String {
         let mut result = String::new();
         let mut start: Option<usize> = None;
@@ -121,11 +130,7 @@ impl CpuSet {
                 &mut curr as *mut CpuSet as *mut libc::cpu_set_t,
             )
         };
-        if ret == -1 {
-            None
-        } else {
-            Some(curr)
-        }
+        if ret == -1 { None } else { Some(curr) }
     }
 
     pub fn set_affinity(&self, tid: i32) -> io::Result<()> {
@@ -174,11 +179,7 @@ pub fn parse_cpu_ranges(spec: &str, present: Option<&CpuSet>) -> CpuSet {
             if a == usize::MAX {
                 continue;
             }
-            if a > b {
-                (b, a)
-            } else {
-                (a, b)
-            }
+            if a > b { (b, a) } else { (a, b) }
         } else {
             let a: usize = part.parse().ok().unwrap_or(usize::MAX);
             if a == usize::MAX {
@@ -188,9 +189,10 @@ pub fn parse_cpu_ranges(spec: &str, present: Option<&CpuSet>) -> CpuSet {
         };
         for i in lo..=hi.min(CPU_SETSIZE - 1) {
             if let Some(present) = present
-                && !present.is_set(i) {
-                    continue;
-                }
+                && !present.is_set(i)
+            {
+                continue;
+            }
             set.set(i);
         }
     }
@@ -431,7 +433,11 @@ fn detect_core_types(online: &CpuSet) -> (CpuSet, CpuSet, CpuSet, &'static str, 
             let cpus: Vec<usize> = ["related_cpus", "cpus"]
                 .iter()
                 .find_map(|f| fs::read_to_string(path.join(f)).ok())
-                .map(|s| s.split_whitespace().filter_map(|c| c.parse().ok()).collect())
+                .map(|s| {
+                    s.split_whitespace()
+                        .filter_map(|c| c.parse().ok())
+                        .collect()
+                })
                 .unwrap_or_default();
             if cpus.is_empty() {
                 continue;
@@ -526,15 +532,19 @@ pub fn init_cpu_topo() -> CpuTopology {
         topo_degraded,
     };
 
-    println!(
+    crate::diag::emit(&format!(
         "CPU 拓扑: 在线[{}] e-core[{}] p-core[{}] hp-core[{}] 依据={}{}",
         topo.present_str,
         topo.e_core.to_range_string(),
         topo.p_core.to_range_string(),
         topo.hp_core.to_range_string(),
         topo.topo_source,
-        if topo.topo_degraded { "（簇数不足，语义核心已降级映射）" } else { "" }
-    );
+        if topo.topo_degraded {
+            "（簇数不足，语义核心已降级映射）"
+        } else {
+            ""
+        }
+    ));
 
     let cpuset_path = CString::new("/dev/cpuset").expect("常量字符串无 NUL");
     if unsafe { libc::access(cpuset_path.as_ptr(), libc::F_OK) } != 0 {

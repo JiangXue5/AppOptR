@@ -21,25 +21,25 @@ use std::fs;
 use std::os::unix::io::AsRawFd;
 use std::process;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::apply_affinity::{affinity_apply, AffinityOutcome, ApplyReason};
+use crate::apply_affinity::{AffinityOutcome, ApplyReason, affinity_apply};
 use crate::config::{
-    config_loader, init_inotify, load_config, AppConfig, SchedMode, CHECK_INTERVAL, CONFIG_FILE,
-    CURRENT_CONFIG,
+    AppConfig, CHECK_INTERVAL, CONFIG_FILE, CURRENT_CONFIG, SchedMode, config_loader, init_inotify,
+    load_config,
 };
 use crate::cpuset::{init_cpu_topo, set_base_cpuset};
 use crate::ebpf_mode::{
-    affinity_check, full_scan, event_dispatch, comm_map_init,
-    ebpf_init, config_rescan, reconcile, EbpfState, DROPPED_TOTAL,
+    DROPPED_TOTAL, EbpfState, affinity_check, comm_map_init, config_rescan, ebpf_init,
+    event_dispatch, full_scan, reconcile,
 };
-use crate::proc_mode::{cache_sync, ProcScanState};
+use crate::proc_mode::{ProcScanState, cache_sync};
 use crate::sched::SchedState;
 use crate::web::{
-    cache_stats, settings_load, settings_save, web_start, WebStats,
-    WEB_ENABLED, WEB_STATS, MODE_FORCE, SETTINGS_FILE,
+    MODE_FORCE, SETTINGS_FILE, WEB_ENABLED, WEB_STATS, WebStats, cache_stats, settings_load,
+    settings_save, web_start,
 };
 
 pub const MAX_PKG_LEN: usize = 128;
@@ -107,8 +107,14 @@ extern "C" fn on_exit_signal(_sig: libc::c_int) {
 /// RT 时间片就只能等下次启动恢复
 fn install_exit_handler() {
     unsafe {
-        libc::signal(libc::SIGTERM, on_exit_signal as *const () as libc::sighandler_t);
-        libc::signal(libc::SIGINT, on_exit_signal as *const () as libc::sighandler_t);
+        libc::signal(
+            libc::SIGTERM,
+            on_exit_signal as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGINT,
+            on_exit_signal as *const () as libc::sighandler_t,
+        );
     }
 }
 
@@ -126,7 +132,11 @@ fn instance_lock(cpuset_name: &str) -> Option<InstanceLock> {
     let file = match fs::OpenOptions::new().create(true).append(true).open(&path) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("警告: 无法创建锁文件 {} ({})，跳过单实例检查", path.display(), e);
+            eprintln!(
+                "警告: 无法创建锁文件 {} ({})，跳过单实例检查",
+                path.display(),
+                e
+            );
             return None;
         }
     };
@@ -136,14 +146,24 @@ fn instance_lock(cpuset_name: &str) -> Option<InstanceLock> {
             let holder = fs::read_to_string(&path).unwrap_or_default();
             let holder = holder.trim();
             if holder.is_empty() {
-                eprintln!("错误: 已有实例在管理 cpuset 目录 {}，本进程退出", cpuset_name);
+                eprintln!(
+                    "错误: 已有实例在管理 cpuset 目录 {}，本进程退出",
+                    cpuset_name
+                );
             } else {
-                eprintln!("错误: 已有实例(PID {})在管理 cpuset 目录 {}，本进程退出", holder, cpuset_name);
+                eprintln!(
+                    "错误: 已有实例(PID {})在管理 cpuset 目录 {}，本进程退出",
+                    holder, cpuset_name
+                );
             }
             eprintln!("提示: 如需并行请用 -b 指定不同的 cpuset 目录名");
             process::exit(0);
         }
-        eprintln!("警告: 锁文件 {} 加锁失败 ({})，跳过单实例检查", path.display(), err);
+        eprintln!(
+            "警告: 锁文件 {} 加锁失败 ({})，跳过单实例检查",
+            path.display(),
+            err
+        );
         return None;
     }
     // 仅作冲突提示用途，不参与运行判定
@@ -156,8 +176,7 @@ fn main() {
     let prog_name = &args[0];
 
     // 参数解析先行，-v/-h/错误用法在设置加载前退出，不产生文件副作用
-    let (mut cli_cfg, mut cli_interval, mut cli_cpuset, mut cli_web) =
-        (None, None, None, false);
+    let (mut cli_cfg, mut cli_interval, mut cli_cpuset, mut cli_web) = (None, None, None, false);
 
     let mut i = 1;
     while i < args.len() {
@@ -311,17 +330,21 @@ fn main() {
     // S7 状态。模式由配置驱动，off 时 tick 立即返回，不读 /proc/stat
     let mut sched_state = SchedState::new();
     let mut sched_deadline = Instant::now();
-    // 诊断：线程表与卡顿信号低频刷新，不新增线程也不改绑核行为
+    // 诊断：卡顿信号 1 秒采样（样本够多才可信），线程表 5 秒刷新一次
     let mut jank = diag::JankSampler::new();
+    let mut jank_deadline = Instant::now();
     let mut diag_deadline = Instant::now();
     let mut summary_deadline = Instant::now();
 
-    println!("启动AppOpt服务 v{}", env!("CARGO_PKG_VERSION"));
+    diag::emit(&format!("启动AppOpt服务 v{}", env!("CARGO_PKG_VERSION")));
     diag::announce();
 
     // 恢复的强制 proc 模式无需 eBPF 初始化
-    let mut ebpf_state: Option<EbpfState> =
-        if MODE_FORCE.load(Ordering::Relaxed) == 2 { None } else { ebpf_init() };
+    let mut ebpf_state: Option<EbpfState> = if MODE_FORCE.load(Ordering::Relaxed) == 2 {
+        None
+    } else {
+        ebpf_init()
+    };
     // 仅自动模式失败一次即放弃；强制 eBPF 需持续重试，强制 proc 无需 eBPF
     if ebpf_state.is_none() && MODE_FORCE.load(Ordering::Relaxed) == 0 {
         EBPF_GAVE_UP.store(true, Ordering::Relaxed);
@@ -341,6 +364,10 @@ fn main() {
         };
         let interval = CHECK_INTERVAL.load(Ordering::Relaxed).max(1);
         let mode = MODE_FORCE.load(Ordering::Relaxed);
+
+        // 热插拔会让 cpuset 重算 effective_cpus 并重置组内线程亲和性，
+        // 是「刚才绑住了、过一会儿又散了」最常见的成因，必须留下时间点
+        diag::watch_cpu_online();
 
         // 模式切换必须立即生效：`on -> off` 依赖 policy_sig 变化触发全量重扫，
         // 这里同时清空 S7 状态，让已迁移线程按规则重新落地
@@ -509,23 +536,29 @@ fn main() {
 
         // 诊断快照：线程表回答「谁没绑住」，卡顿采样回答「绑了之后渲染线程还等不等 CPU」。
         // 两件事都只在被管理线程上做，enumerate 上限由 diag 内部兜住
-        if diag_deadline.elapsed() >= Duration::from_secs(5) {
-            diag_deadline = Instant::now();
+        if jank_deadline.elapsed() >= Duration::from_secs(1) {
+            jank_deadline = Instant::now();
             match (&ebpf_state, &proc_state) {
                 (Some(es), _) => {
                     jank.sample(&es.cache);
-                    diag::publish_threads(&es.cache);
                 }
                 (None, Some(ps)) => {
                     jank.sample(&ps.cache);
-                    diag::publish_threads(&ps.cache);
                 }
+                _ => {}
+            }
+        }
+        if diag_deadline.elapsed() >= Duration::from_secs(5) {
+            diag_deadline = Instant::now();
+            match (&ebpf_state, &proc_state) {
+                (Some(es), _) => diag::publish_threads(&es.cache),
+                (None, Some(ps)) => diag::publish_threads(&ps.cache),
                 _ => {}
             }
         }
         if summary_deadline.elapsed() >= diag::SUMMARY_GAP {
             summary_deadline = Instant::now();
-            diag::periodic_summary();
+            diag::periodic_summary(&sched_state.snapshot());
         }
 
         // web 状态统计，低频更新避免高频事件循环下的额外开销

@@ -13,11 +13,7 @@ pub struct AffinityResult {
 }
 
 /// 线程规则 CPU 累加，无线程匹配走包级 fallback，仍无则按 keep/all 语义处理
-pub fn thread_affinity(
-    pkg: &str,
-    thread: &str,
-    cfg: &AppConfig,
-) -> Option<AffinityResult> {
+pub fn thread_affinity(pkg: &str, thread: &str, cfg: &AppConfig) -> Option<AffinityResult> {
     let pkg_rules = cfg.rule_index.get(pkg)?;
 
     let mut cpus = CpuSet::new();
@@ -81,7 +77,13 @@ fn fnmatch_c(pattern: &CString, string: &str) -> bool {
     }
     let mut buf = [0u8; MAX_THREAD_LEN];
     buf[..string.len()].copy_from_slice(string.as_bytes());
-    unsafe { libc::fnmatch(pattern.as_ptr(), buf.as_ptr() as *const _, libc::FNM_NOESCAPE) == 0 }
+    unsafe {
+        libc::fnmatch(
+            pattern.as_ptr(),
+            buf.as_ptr() as *const _,
+            libc::FNM_NOESCAPE,
+        ) == 0
+    }
 }
 
 /// 通过内核 comm 匹配配置包名
@@ -247,6 +249,11 @@ mod tests {
         }
         let miss = t1.elapsed().as_nanos() as f64 / N as f64;
 
-        println!("{} 条规则：命中线程 {:.0} ns/次，未命中线程 {:.0} ns/次", cfg.rules.len(), hit, miss);
+        println!(
+            "{} 条规则：命中线程 {:.0} ns/次，未命中线程 {:.0} ns/次",
+            cfg.rules.len(),
+            hit,
+            miss
+        );
     }
 }
