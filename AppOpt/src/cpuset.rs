@@ -17,9 +17,14 @@ static BASE_CPUSET_PATH: RwLock<Option<String>> = RwLock::new(None);
 
 pub const DEFAULT_CPUSET_NAME: &str = "AppOpt";
 
-/// 设置 BASE_CPUSET 目录名，name 为空或含 / 时忽略
+/// 设置 BASE_CPUSET 目录名。名字直接拼进 `/dev/cpuset/<name>`，`/` 之外
+/// `.` 与 `..` 同样危险：`.` 退化成根组（线程被迁进去就不再受系统分组约束），
+/// `..` 让 base 变成 `/dev`，随后会在 `/dev` 下建 cpus/mems 与集合目录
 pub fn set_base_cpuset(name: &str) {
-    if name.is_empty() || name.contains('/') {
+    if name.is_empty() || name.len() >= 64 || name.contains('/') || name.contains("..") {
+        return;
+    }
+    if name == "." || name == ".." || name.bytes().any(|b| b <= b' ') {
         return;
     }
     *BASE_CPUSET_PATH.write().unwrap() = Some(format!("/dev/cpuset/{}", name));

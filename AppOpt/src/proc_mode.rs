@@ -2,7 +2,9 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::time::{Duration, Instant};
 
-use crate::apply_affinity::{AffinityOutcome, proc_walk, read_cmdline, task_tids, tid_comm};
+use crate::apply_affinity::{
+    AffinityOutcome, pkg_owned, proc_walk, read_cmdline, task_tids, tid_comm,
+};
 use crate::cache::ProcCache;
 use crate::config::AppConfig;
 use crate::rt;
@@ -78,6 +80,10 @@ pub fn cache_sync(cfg: &AppConfig, state: &mut ProcScanState) {
             continue;
         };
         if !cfg.pkgs.contains(&pkg) {
+            continue;
+        }
+        // 新增进程才做一次属主校验，后续复用它缓存的 pid→pkg
+        if !pkg_owned(pid, &pkg) {
             continue;
         }
         state.tracked_pids.insert(pid, pkg.clone());

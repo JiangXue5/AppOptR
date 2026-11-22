@@ -36,16 +36,16 @@ if [ -f "${MODDIR}/keep_cores" ]; then
 		# 只记第一次看到的原值：重复启动时 min 可能已经是上次写入的 max
 		grep -q "^${MIN_CPUS} " "$CORE_CTL_BAK" 2>/dev/null || echo "${MIN_CPUS} ${MIN}" >> "$CORE_CTL_BAK"
 		[ "$MIN" = "$MAX" ] && continue
-		chmod a+w "$MIN_CPUS" 2>/dev/null
+		chmod u+w "$MIN_CPUS" 2>/dev/null
 		echo "$MAX" > "$MIN_CPUS" 2>/dev/null
-		chmod a-w "$MIN_CPUS" 2>/dev/null
+		chmod u-w "$MIN_CPUS" 2>/dev/null
 	done
 elif [ -f "$CORE_CTL_BAK" ]; then
 	while read -r MIN_CPUS MIN; do
 		[ -e "$MIN_CPUS" ] && [ -n "$MIN" ] || continue
-		chmod a+w "$MIN_CPUS" 2>/dev/null
+		chmod u+w "$MIN_CPUS" 2>/dev/null
 		echo "$MIN" > "$MIN_CPUS" 2>/dev/null
-		chmod a-w "$MIN_CPUS" 2>/dev/null
+		chmod u-w "$MIN_CPUS" 2>/dev/null
 	done < "$CORE_CTL_BAK"
 	rm -f "$CORE_CTL_BAK"
 fi

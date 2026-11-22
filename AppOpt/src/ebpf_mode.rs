@@ -302,6 +302,35 @@ pub fn ebpf_init() -> Option<EbpfState> {
         return None;
     }
 
+    // 这份字节码会以 root 身份加载进内核，被替换就是持久的 rootkit，
+    // 比改配置文件更隐蔽（下次重启自动生效）。只接受属主 root、
+    // 组/其他不可写的普通文件；符号链接一律不接，避免被换链
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let md = match fs::symlink_metadata(&ebpf_path) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!(
+                    "eBPF: 无法检查 {} ({})，回退到 /proc 轮询",
+                    ebpf_path.display(),
+                    e
+                );
+                return None;
+            }
+        };
+        let mode = md.mode() & 0o777;
+        if !md.file_type().is_file() || md.uid() != 0 || mode & 0o022 != 0 {
+            eprintln!(
+                "eBPF: {} 不安全（需 root 所有、组与其他不可写，当前 uid={} mode={:o}），拒绝加载",
+                ebpf_path.display(),
+                md.uid(),
+                mode
+            );
+            return None;
+        }
+    }
+
     let ebpf_data = match fs::read(&ebpf_path) {
         Ok(d) => d,
         Err(e) => {
@@ -316,6 +345,14 @@ pub fn ebpf_init() -> Option<EbpfState> {
 
     if ebpf_data.is_empty() {
         eprintln!("eBPF: {} 文件为空，回退到 /proc 轮询", ebpf_path.display());
+        return None;
+    }
+    // 加载器只认 ELF，这里先挡掉明显不是字节码的内容
+    if !ebpf_data.starts_with(b"\x7fELF") {
+        eprintln!(
+            "eBPF: {} 不是 ELF 文件，回退到 /proc 轮询",
+            ebpf_path.display()
+        );
         return None;
     }
 

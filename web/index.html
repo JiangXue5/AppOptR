@@ -165,6 +165,14 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 </style>
 </head>
 <body>
+<div id="tok-gate" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:99;align-items:center;justify-content:center;padding:24px">
+<div class="modal" style="max-width:340px">
+<h3>需要访问令牌</h3>
+<p class="hint">本机接口只对持有令牌的请求开放，避免其它应用借用 root 权限。令牌保存在模块目录的 <code>web.token</code>，模块日志的启动行里也有。</p>
+<input id="tok-input" placeholder="32 位十六进制令牌" autocomplete="off" spellcheck="false" style="width:100%;margin:12px 0;box-sizing:border-box">
+<div class="modal-actions"><button class="btn" id="tok-ok">确定</button></div>
+</div>
+</div>
 <div class="app">
 <main class="main">
 
@@ -398,10 +406,50 @@ const modeLabel=m=>m==='ebpf'?'eBPF 事件驱动':'Proc 轮询';
 // KernelSU 的 WebUI 由 https://mui.kernelsu.org 加载页面，相对路径会被解析到该域，
 // 而 API 在本机 8889 上，因此非 8889 端口时显式指向回环地址；浏览器直连保持同源。
 const API_BASE=location.port==='8889'?'':'http://127.0.0.1:8889';
+// 8889 只监听回环，但任何有 INTERNET 权限的应用都能连回环。服务端因此要求
+// 一个只写在模块目录（0700 root）里的令牌；浏览器拿不到文件，只能从模块日志
+// 或这里的输入框粘贴，KernelSU WebUI 则可以直接用 root shell 读
+const TOK_KEY='appopt_token';
+let TOKEN=localStorage.getItem(TOK_KEY)||'';
+function setToken(t){
+  TOKEN=(t||'').trim().toLowerCase();
+  if(/^[0-9a-f]{32}$/.test(TOKEN)){localStorage.setItem(TOK_KEY,TOKEN)}
+  else{localStorage.removeItem(TOK_KEY);TOKEN=''}
+}
+function showGate(){
+  const g=$('tok-gate');
+  if(!g)return;
+  g.style.display='flex';
+  setTimeout(()=>$('tok-input').focus(),50);
+}
+function hideGate(){const g=$('tok-gate');if(g)g.style.display='none'}
+async function ksuToken(){
+  // KernelSU WebUI 暴露 ksu.exec，返回值有 string 与 {errno,stdout} 两种形态
+  try{
+    if(!window.ksu||typeof window.ksu.exec!=='function')return '';
+    const r=await window.ksu.exec('cat /data/adb/modules/AppOpt/web.token');
+    const s=typeof r==='string'?r:(r&&(r.stdout||r.result))||'';
+    const m=String(s).match(/[0-9a-fA-F]{32}/);
+    return m?m[0]:'';
+  }catch(e){return ''}
+}
+async function initToken(){
+  const m=location.hash.match(/[#&]t=([0-9a-fA-F]{32})/);
+  if(m){
+    setToken(m[1]);
+    history.replaceState(null,'',location.pathname+location.search);
+    return;
+  }
+  if(TOKEN)return;
+  const t=await ksuToken();
+  if(t)setToken(t);
+}
 async function api(path,body){
-  const opts=body!==undefined?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}:{};
+  const h=TOKEN?{'X-AppOpt-Token':TOKEN}:{};
+  const opts=body!==undefined?{method:'POST',headers:{...h,'Content-Type':'application/json'},body:JSON.stringify(body)}:{headers:h};
   let r;
   try{r=await fetch(API_BASE+path,opts);}catch(e){throw new Error('无法连接本机服务，请用浏览器打开 http://127.0.0.1:8889/')}
+  if(r.status===401){showGate();throw new Error('需要访问令牌')}
   const d=await r.json().catch(()=>({}));
   if(!r.ok)throw new Error(d.err||('HTTP '+r.status));
   return d;
@@ -948,7 +996,21 @@ $('s-donate').onclick=()=>$('page-donate').classList.add('show');
 $('donate-back').onclick=()=>$('page-donate').classList.remove('show');
 $('donate-ali').onclick=()=>location.href='https://qr.alipay.com/tsx183072iwa3igjxm5fjb6';
 
-startStat();
+$('tok-ok').onclick=()=>{
+  const v=$('tok-input').value.trim();
+  if(!/^[0-9a-fA-F]{32}$/.test(v))return toast('令牌应为 32 位十六进制');
+  setToken(v);hideGate();
+  // 令牌刚设置好，把当前页签的数据重拉一遍
+  if(activeTab==='status')startStat();
+  else if(activeTab==='rules')loadRules();
+  else loadCfg();
+};
+$('tok-input').addEventListener('keydown',e=>{if(e.key==='Enter')$('tok-ok').click()});
+
+(async()=>{
+  await initToken();
+  startStat();
+})();
 </script>
 </body>
 </html>

@@ -1,7 +1,7 @@
 use std::ffi::CString;
 
 use crate::MAX_THREAD_LEN;
-use crate::apply_affinity::read_cmdline;
+use crate::apply_affinity::{pkg_owned, read_cmdline};
 use crate::config::AppConfig;
 use crate::cpuset::CpuSet;
 
@@ -99,8 +99,9 @@ pub fn comm_to_pkg(pid: i32, comm: &str, cfg: &AppConfig) -> Option<String> {
     if !cfg.trunc_keys.contains(&key) {
         return None;
     }
-    // 键只表示“某包名的前/后 15 字节与之相同”，仍需 cmdline 确认是本进程
-    read_cmdline(pid).filter(|name| cfg.pkgs.contains(name))
+    // 键只表示“某包名的前/后 15 字节与之相同”，仍需 cmdline 确认是本进程，
+    // 再用目录属主确认这个包名不是自己改出来的
+    read_cmdline(pid).filter(|name| cfg.pkgs.contains(name) && pkg_owned(pid, name))
 }
 
 #[cfg(test)]

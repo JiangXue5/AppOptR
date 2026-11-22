@@ -4,7 +4,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -33,6 +33,25 @@ use crate::{EBPF_GAVE_UP, MAX_PKG_LEN, MAX_THREAD_LEN, lock_ignore_poison};
 pub const WEB_PORT: u16 = 8889;
 const INDEX_HTML: &str = include_str!("../../web/index.html");
 
+/// 令牌文件名，与可执行文件同目录（service.sh 会把工作目录切到模块目录）
+pub const TOKEN_NAME: &str = "web.token";
+
+/// 单连接并发上限。每个连接一个线程，慢速连接不设上限时可以耗光线程。
+/// 浏览器对同一源最多 6 条长连接，留出余量即可
+const MAX_CONNS: usize = 32;
+/// 请求头单行上限。必须在读入过程中就截断，读完再查等于没查
+const MAX_HEAD_LINE: usize = 8192;
+/// 整个请求头上限
+const MAX_HEAD_TOTAL: usize = 16384;
+
+static ACTIVE_CONNS: AtomicUsize = AtomicUsize::new(0);
+
+/// Web API 的访问令牌。8889 只监听回环，但「能连回环」不等于「是用户本人」：
+/// 任何带 INTERNET 权限的本地应用都能直连，Host/Origin 校验对它们完全无效，
+/// 而守护进程是 root，替它办事就是提权。令牌由守护进程生成、以 0600 写入
+/// 模块目录，普通应用读不到；前端从 fragment 或 KernelSU WebUI 的 root shell 取得
+static WEB_TOKEN: Mutex<String> = Mutex::new(String::new());
+
 pub static MODE_FORCE: AtomicU8 = AtomicU8::new(0);
 pub static WEB_ENABLED: AtomicBool = AtomicBool::new(false);
 
@@ -56,6 +75,106 @@ pub fn cache_stats(cache: &ProcCache) -> (usize, usize) {
     (cache.tasks.len(), pkgs.len())
 }
 
+fn token_path() -> std::path::PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join(TOKEN_NAME)))
+        .unwrap_or_else(|| std::path::PathBuf::from(TOKEN_NAME))
+}
+
+fn random_token() -> String {
+    let mut buf = [0u8; 16];
+    match fs::File::open("/dev/urandom") {
+        Ok(mut f) => {
+            if f.read_exact(&mut buf).is_err() {
+                return String::new();
+            }
+        }
+        Err(_) => return String::new(),
+    }
+    buf.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+fn token_shape_ok(s: &str) -> bool {
+    s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// 读取或生成令牌。已存在且格式正确时沿用，重启后前端不必重输。
+/// 写不进去（只读挂载、权限损坏）返回空串，调用方必须据此拒绝启动 Web——
+/// 没有令牌就等于没有认证，宁可不开也不留一个 root 的后门
+fn token_load_or_create() -> String {
+    use std::io::Write as _;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::MetadataExt;
+
+    let path = token_path();
+    if let Ok(s) = fs::read_to_string(&path) {
+        let t = s.trim().to_ascii_lowercase();
+        // 属主不是 root 或同组/其他可读时，这份令牌可能早被别人看过，重新生成
+        let trusted = fs::metadata(&path)
+            .map(|m| m.uid() == 0 && m.mode() & 0o077 == 0)
+            .unwrap_or(false);
+        if token_shape_ok(&t) && trusted {
+            return t;
+        }
+    }
+    let tok = random_token();
+    if !token_shape_ok(&tok) {
+        eprintln!("Web: 无法生成随机令牌");
+        return String::new();
+    }
+    let name = match std::ffi::CString::new(path.as_os_str().to_string_lossy().as_bytes()) {
+        Ok(c) => c,
+        Err(_) => return String::new(),
+    };
+    // O_NOFOLLOW：预先放一个指向别处的同名链接不能把令牌写到白名单外
+    let fd = unsafe {
+        libc::open(
+            name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        eprintln!(
+            "Web: 创建令牌文件 {} 失败 ({})",
+            path.display(),
+            std::io::Error::last_os_error()
+        );
+        return String::new();
+    }
+    let mut f = unsafe { fs::File::from_raw_fd(fd) };
+    let ok = f.write_all(format!("{}\n", tok).as_bytes()).is_ok() && f.sync_all().is_ok();
+    // 已存在文件的权限位不受 open 的 mode 影响，这里显式收紧
+    unsafe {
+        libc::fchmod(f.as_raw_fd(), 0o600);
+    }
+    if !ok {
+        eprintln!("Web: 写入令牌文件失败");
+        return String::new();
+    }
+    println!("Web: 访问令牌已写入 {}", path.display());
+    tok
+}
+
+/// 常量时间比较，避免按字节提前返回泄露前缀
+fn token_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for i in 0..a.len() {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
+}
+
+fn token_match(got: &str) -> bool {
+    let want = lock_ignore_poison(&WEB_TOKEN);
+    !want.is_empty() && token_eq(got, &want)
+}
+
 /// 启动 web 前端，监听成功返回 true
 pub fn web_start() -> bool {
     let listener = match TcpListener::bind(("127.0.0.1", WEB_PORT)) {
@@ -65,11 +184,30 @@ pub fn web_start() -> bool {
             return false;
         }
     };
+    let tok = token_load_or_create();
+    if tok.is_empty() {
+        eprintln!("Web: 没有可用令牌，拒绝启动（避免无认证的 root 接口）");
+        return false;
+    }
+    *lock_ignore_poison(&WEB_TOKEN) = tok;
     WEB_ENABLED.store(true, Ordering::Release);
-    println!("Web: 前端已启用 http://127.0.0.1:{}/", WEB_PORT);
+    println!(
+        "Web: 前端已启用 http://127.0.0.1:{}/#t={}",
+        WEB_PORT,
+        lock_ignore_poison(&WEB_TOKEN).as_str()
+    );
     thread::spawn(move || {
         for stream in listener.incoming().flatten() {
-            thread::spawn(move || conn_handle(stream));
+            if ACTIVE_CONNS.fetch_add(1, Ordering::AcqRel) >= MAX_CONNS {
+                ACTIVE_CONNS.fetch_sub(1, Ordering::AcqRel);
+                // 不排队也不回响应，直接断：慢速连接宁可被拒也不吃线程
+                drop(stream);
+                continue;
+            }
+            thread::spawn(move || {
+                conn_handle(stream);
+                ACTIVE_CONNS.fetch_sub(1, Ordering::AcqRel);
+            });
         }
     });
     true
@@ -81,6 +219,7 @@ struct Request {
     host: String,
     origin: String,
     content_type: String,
+    token: String,
     body: Vec<u8>,
     keep_alive: bool,
 }
@@ -102,22 +241,53 @@ fn conn_handle(stream: TcpStream) {
     }
 }
 
+/// 有界读一行。`read_until` 会先把整行读进内存再返回，8192 的上限放在
+/// 读完之后等于没有——5 秒窗口内往连接里灌数据就能把 root 进程撑爆。
+/// 这里逐块取缓冲，超过上限立即失败，内存占用与对端行为无关
+fn read_head_line(
+    reader: &mut BufReader<TcpStream>,
+    out: &mut Vec<u8>,
+    max: usize,
+) -> std::io::Result<bool> {
+    loop {
+        let buf = reader.fill_buf()?;
+        if buf.is_empty() {
+            return Ok(false);
+        }
+        let (chunk, done) = match buf.iter().position(|&b| b == b'\n') {
+            Some(i) => (&buf[..=i], true),
+            None => (buf, false),
+        };
+        if out.len() + chunk.len() > max {
+            return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+        }
+        out.extend_from_slice(chunk);
+        let n = chunk.len();
+        reader.consume(n);
+        if done {
+            return Ok(true);
+        }
+    }
+}
+
 fn request_read(reader: &mut BufReader<TcpStream>) -> Option<Request> {
     let mut head = Vec::with_capacity(512);
     let mut line = Vec::with_capacity(128);
     loop {
         line.clear();
-        reader.read_until(b'\n', &mut line).ok()?;
+        if !read_head_line(reader, &mut line, MAX_HEAD_LINE).ok()? {
+            return None;
+        }
         if line.is_empty() {
             return None;
         }
         if line == b"\r\n" || line == b"\n" {
             break;
         }
-        head.extend_from_slice(&line);
-        if head.len() > 8192 {
+        if head.len() + line.len() > MAX_HEAD_TOTAL {
             return None;
         }
+        head.extend_from_slice(&line);
     }
 
     let head_str = String::from_utf8_lossy(&head);
@@ -127,8 +297,13 @@ fn request_read(reader: &mut BufReader<TcpStream>) -> Option<Request> {
     let path = parts.next()?.split('?').next().unwrap_or("").to_string();
     let version = parts.next().unwrap_or("HTTP/1.1").to_string();
 
-    let (mut host, mut origin, mut ctype, mut len) =
-        (String::new(), String::new(), String::new(), 0usize);
+    let (mut host, mut origin, mut ctype, mut token, mut len) = (
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        0usize,
+    );
     let mut conn = String::new();
     for h in lines {
         let Some((k, v)) = h.split_once(':') else {
@@ -139,6 +314,7 @@ fn request_read(reader: &mut BufReader<TcpStream>) -> Option<Request> {
             "host" => host = v.to_ascii_lowercase(),
             "origin" => origin = v.to_ascii_lowercase(),
             "content-type" => ctype = v.to_ascii_lowercase(),
+            "x-appopt-token" => token = v.to_ascii_lowercase(),
             "content-length" => len = v.parse().unwrap_or(usize::MAX),
             "connection" => conn = v.to_ascii_lowercase(),
             "transfer-encoding" => return None, // 拒绝 chunked
@@ -164,6 +340,7 @@ fn request_read(reader: &mut BufReader<TcpStream>) -> Option<Request> {
         host,
         origin,
         content_type: ctype,
+        token,
         body,
         keep_alive,
     })
@@ -201,6 +378,7 @@ fn resp_send(
         200 => "OK",
         204 => "No Content",
         400 => "Bad Request",
+        401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
         _ => "Error",
@@ -216,7 +394,7 @@ fn resp_send(
     if let Some(o) = cors {
         // 回显具体来源而非 *，保留将来加凭据的可能；PNA 头供 https 页面访问回环地址时通过预检
         head.push_str(&format!(
-            "Access-Control-Allow-Origin: {}\r\nVary: Origin\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nAccess-Control-Allow-Private-Network: true\r\n",
+            "Access-Control-Allow-Origin: {}\r\nVary: Origin\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, X-AppOpt-Token\r\nAccess-Control-Allow-Private-Network: true\r\n",
             o
         ));
     }
@@ -230,12 +408,16 @@ fn resp_send(
 ///
 /// 曾经用 `Sec-Fetch-Site` 作为同源依据：不带该头就算同源。这个头是客户端自己
 /// 填的，curl 只要不填、再带一个恶意 Origin 就能写配置，比浏览器更容易通过。
-/// 现在只认两件事——Origin 为空 / `null`（本机工具、file:// 页面），或命中白名单
-/// （回环与 KernelSU WebUI 容器）。其余一律 403
+/// 现在只认两件事——Origin 为空（本机工具），或命中白名单（回环与 KernelSU
+/// WebUI 容器）。`Origin: null` 来自沙箱 iframe 与 file:// 页面，任何网页都能
+/// 造出这个值，不再放行。其余一律 403。
+///
+/// 这一层只挡浏览器跨站与 DNS 重绑定；本地应用的直连由 API 令牌负责，
+/// 两者缺一不可
 fn origin_ok(host: &str, origin: &str, method: &str, ctype: &str) -> bool {
     let host_ok = matches!(host, "127.0.0.1" | "localhost");
     host_ok
-        && (origin.is_empty() || origin == "null" || origin_allowed(origin))
+        && (origin.is_empty() || origin_allowed(origin))
         && (method != "POST" || ctype.starts_with("application/json"))
 }
 
@@ -272,6 +454,21 @@ fn dispatch(out: &mut TcpStream, req: &Request) {
             b"{\"ok\":false,\"err\":\"forbidden\"}",
             true,
             None,
+        );
+        return;
+    }
+
+    // 页面本身放行：前端要靠它把令牌输入框和提示渲染出来。
+    // 所有 /api/* 一律要求令牌——读接口能枚举已装包名与线程名，
+    // 同样属于隐私泄露，不能只保护写接口
+    if req.path.starts_with("/api/") && !token_match(&req.token) {
+        resp_send(
+            out,
+            401,
+            "application/json",
+            b"{\"ok\":false,\"err\":\"\\u9700\\u8981\\u8bbf\\u95ee\\u4ee4\\u724c\",\"need_token\":true}",
+            true,
+            cors,
         );
         return;
     }
@@ -412,7 +609,12 @@ fn rules_json() -> String {
     json!({ "rules": groups, "rt_scope": rt_scope_str(cfg.rt.scope) }).to_string()
 }
 
-/// 名称校验
+/// 名称校验。这里写进的是配置文件，正常包名只有字母数字与点，线程名多几个
+/// `-_.:@+*`；shell 元字符一个都不需要，全部拒绝。
+///
+/// 之前只拦 `#`、`//` 与控制字符，`x;sh a.sh;y` 这种包名能原样落进配置。
+/// 配置文件本身不被 shell 执行，但曾经的 config_file 白名单允许把它指到
+/// `post-fs-data.sh`，注入串就成了 root 持久化路径。两道一起收紧才安全
 fn token_ok(s: &str, max: usize) -> bool {
     let t = s.trim();
     !t.is_empty()
@@ -420,6 +622,13 @@ fn token_ok(s: &str, max: usize) -> bool {
         && !t.bytes().any(|b| b < 0x20 || b == 0x7f)
         && !t.contains('#')
         && !t.contains("//")
+        && !t.contains("..")
+        && !t.bytes().any(|b| {
+            matches!(
+                b,
+                b';' | b'$' | b'`' | b'\\' | b'|' | b'&' | b'>' | b'<' | b'(' | b')' | b'"' | b'\''
+            )
+        })
 }
 
 fn pkg_shape_ok(pkg: &str) -> bool {
@@ -1156,8 +1365,18 @@ impl Default for Settings {
     }
 }
 
+/// cpuset 目录名。`.` 会让 base 变成 `/dev/cpuset/.`（等于根组，
+/// 线程被迁进去就退出了系统分组）；`..` 会让 base 变成 `/dev`，
+/// 守护进程随后在 `/dev` 下建 cpus/mems 与 `4-6` 目录。两者都必须拒绝，
+/// 而且值会落进 AppOpt.json，重启后依然有效
 fn valid_name(s: &str) -> bool {
-    !s.is_empty() && s.len() < 64 && !s.contains('/') && !s.bytes().any(|b| b <= b' ')
+    !s.is_empty()
+        && s.len() < 64
+        && s != "."
+        && s != ".."
+        && !s.contains('/')
+        && !s.contains("..")
+        && !s.bytes().any(|b| b <= b' ')
 }
 
 fn valid_path(s: &str) -> bool {
@@ -1167,10 +1386,16 @@ fn valid_path(s: &str) -> bool {
 /// 新建配置文件时写入的初始内容
 const CONFIG_HEADER: &str = "# 规则编写与使用说明请参考 http://AppOpt.suto.top\n\n";
 
-/// Web 端只能把配置文件指到固定白名单目录内，避免 root 权限下被诱导写入任意路径。
-/// 目录白名单：模块（可执行文件）目录、当前配置所在目录、/data/adb、/data/local/tmp、/sdcard。
-/// 路径先拒绝 `..` 组件，再规范化父目录后比较前缀；最终目标本身是符号链接时直接拒绝，
-/// 否则按路径打开会跟随链接落到白名单之外。真正的写入由 create_config_file 用 openat 兜底。
+/// Web 端只能把配置文件指到模块自身目录内（当前配置所在目录或可执行文件目录），
+/// 且必须是 `.conf` 结尾的普通文件。
+///
+/// 之前还放行 `/data/adb`、`/data/local/tmp`、`/sdcard`：`/data/adb` 覆盖了
+/// `modules/AppOpt/post-fs-data.sh` 与 `service.d/*.sh`，模块框架开机以 root 执行，
+/// 指向它等于把 root 持久化的写权限交给任何能连 8889 的应用。共享存储同理，
+/// 很多应用都能写 /sdcard。这两类目录整体移出白名单。
+///
+/// 路径先拒绝 `..` 组件，再规范化父目录后比较前缀；最终目标是符号链接时直接拒绝，
+/// 否则按路径打开会跟随链接落到白名单之外。真正的写入由 create_config_file 用 openat 兜底
 fn path_allowed(p: &str) -> bool {
     use std::path::{Component, Path, PathBuf};
 
@@ -1181,25 +1406,25 @@ fn path_allowed(p: &str) -> bool {
     {
         return false;
     }
+    // 只收 .conf：脚本、JSON、二进制都不是规则文件，没必要留后门
+    if path.extension().and_then(|e| e.to_str()) != Some("conf") {
+        return false;
+    }
     let Some(parent) = path.parent() else {
         return false;
     };
     let Ok(dir) = fs::canonicalize(parent) else {
         return false;
     };
-    // 已存在的路径：符号链接（含指向白名单内部的）一律不接，避免被换链绕过；
-    // 普通文件再规范化一次，确认它确实落在白名单目录下
+    // 已存在的路径：符号链接一律不接，避免被换链绕过；必须是普通文件，
+    // 否则 FIFO、设备节点会让读取阻塞或读不完
     if let Ok(md) = fs::symlink_metadata(path)
-        && (md.file_type().is_symlink() || fs::canonicalize(path).is_err())
+        && (md.file_type().is_symlink() || !md.file_type().is_file())
     {
         return false;
     }
 
-    let mut roots: Vec<PathBuf> = vec![
-        PathBuf::from("/data/adb"),
-        PathBuf::from("/data/local/tmp"),
-        PathBuf::from("/sdcard"),
-    ];
+    let mut roots: Vec<PathBuf> = Vec::new();
     if let Some(exe_dir) = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|p| p.to_path_buf()))
@@ -1292,10 +1517,18 @@ impl Settings {
     }
 
     fn save(&self, path: &str) {
+        use std::os::unix::fs::OpenOptionsExt;
+
         let _guard = lock_ignore_poison(&SAVE_LOCK);
         let json = serde_json::to_string_pretty(&self.to_value()).unwrap_or_default();
         let tmp = format!("{}.tmp", path);
-        let res = fs::File::create(&tmp)
+        // 显式 0644，别让 umask 决定设置文件是 0600 还是 0666
+        let res = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o644)
+            .open(&tmp)
             .and_then(|mut f| {
                 f.write_all(format!("{}\n", json).as_bytes())?;
                 f.sync_all()
@@ -1360,7 +1593,6 @@ mod tests {
     #[test]
     fn origin_requires_whitelist_even_without_fetch_site() {
         assert!(origin_ok("127.0.0.1", "", "GET", ""));
-        assert!(origin_ok("localhost", "null", "POST", "application/json"));
         assert!(origin_ok(
             "127.0.0.1",
             "https://mui.kernelsu.org",
@@ -1373,6 +1605,8 @@ mod tests {
             "POST",
             "application/json"
         ));
+        // `Origin: null` 任何网页都能构造，不再当作本机来源
+        assert!(!origin_ok("localhost", "null", "POST", "application/json"));
         // 恶意 Origin：不再因为没带 Sec-Fetch-Site 而放行
         assert!(!origin_ok("127.0.0.1", "https://evil.example", "GET", ""));
         assert!(!origin_ok(
@@ -1384,6 +1618,71 @@ mod tests {
         // Host 不是回环、POST 不是 JSON，仍然拒绝
         assert!(!origin_ok("10.0.0.2", "", "GET", ""));
         assert!(!origin_ok("127.0.0.1", "", "POST", "text/plain"));
+    }
+
+    /// 令牌必须是 32 位十六进制，比较走常量时间实现
+    #[test]
+    fn token_shape_and_compare() {
+        let a = "0123456789abcdef0123456789abcdef";
+        assert!(token_shape_ok(a));
+        assert!(token_eq(a, a));
+        assert!(!token_eq(a, "0123456789abcdef0123456789abcdee"));
+        assert!(!token_eq(a, &a[..31]));
+        for bad in ["", "0123", "zz23456789abcdef0123456789abcdef"] {
+            assert!(!token_shape_ok(bad), "{bad}");
+        }
+    }
+
+    /// 规则名会原样写进配置文件。虽然配置不被 shell 执行，但曾经的白名单能把
+    /// config_file 指到 post-fs-data.sh，`x;sh a.sh;y` 就是 root 持久化路径
+    #[test]
+    fn rule_name_rejects_shell_metachars() {
+        for bad in [
+            "x;sh /sdcard/a.sh;y",
+            "$(id)",
+            "a`id`b",
+            "a|b",
+            "a&&b",
+            "a>b",
+            "a$(b)",
+            "a'b",
+            "a\"b",
+        ] {
+            assert!(!token_ok(bad, MAX_PKG_LEN), "{bad}");
+        }
+        assert!(token_ok("com.example.game", MAX_PKG_LEN));
+        assert!(token_ok("RenderThread", MAX_THREAD_LEN));
+        assert!(token_ok("HwBinder:1234_1", MAX_THREAD_LEN));
+        assert!(token_ok("mali-rX", MAX_THREAD_LEN));
+    }
+
+    /// cpuset 目录名直接拼进 /dev/cpuset/<name>，`.` 会退回根组、`..` 会落到 /dev
+    #[test]
+    fn cpuset_name_rejects_dots() {
+        assert!(valid_name("AppOpt"));
+        assert!(valid_name("AppOpt-1"));
+        for bad in [".", "..", "a..b", "a/b", "", "a b"] {
+            assert!(!valid_name(bad), "{bad}");
+        }
+        assert!(valid_name(&"a".repeat(63)));
+        assert!(!valid_name(&"a".repeat(64)));
+    }
+
+    /// 配置文件只能是模块目录下的 .conf：脚本与共享存储都不再放行
+    #[test]
+    fn only_conf_inside_module_is_allowed() {
+        let exe = exe_dir();
+        assert!(path_allowed(exe.join("rules.conf").to_str().unwrap()));
+        for bad in [
+            exe.join("post-fs-data.sh"),
+            exe.join("service.d"),
+            exe.join("AppOpt.json"),
+            std::path::PathBuf::from("/sdcard/applist.conf"),
+            std::path::PathBuf::from("/data/adb/modules/AppOpt/post-fs-data.sh"),
+            std::path::PathBuf::from("/data/local/tmp/x.conf"),
+        ] {
+            assert!(!path_allowed(bad.to_str().unwrap()), "{}", bad.display());
+        }
     }
 
     /// `a{b` 会被写成包 a 的线程 b，`}` 会提前闭合块，`=` 会让集合错位

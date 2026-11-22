@@ -1,5 +1,83 @@
 # AppOptR 变更记录
 
+## 2.5.0（2026-11-22）
+
+一次纯安全加固，不改调度策略与规则语法。审计沿三条独立路径进到 root：
+
+1. 8889 无认证，任何带 `INTERNET` 权限的应用都能直连；
+2. `POST /api/config` 能把 `config_file` 指到 `/data/adb/modules/AppOpt/post-fs-data.sh`；
+3. `POST /api/rule` 的包名只拦 `#`、`//` 和控制字符，`x;sh /sdcard/a.sh;y` 原样落盘。
+
+三条串起来就是「无权限应用 → root 持久化」。下面按可利用性排序。
+
+### P0：Web 接口加访问令牌
+
+`Host` / `Origin` 校验只挡浏览器与 DNS 重绑定，对本地应用天然无效——它不发
+`Origin`，也不受同源策略约束。现在守护进程启动时生成 32 位十六进制令牌，
+以 `0600` 写进模块目录的 `web.token`；除 `GET /`（页面本身）外，所有 `/api/*`
+必须带 `X-AppOpt-Token`，否则 401。
+
+- 令牌写不进去时**拒绝启动 Web**，不留一个无认证的 root 端口；
+- 页面从 `#t=xxx`、`localStorage`、或 KernelSU WebUI 的 root shell 取令牌，
+  都拿不到时弹输入框；
+- 启动日志会打印带令牌的完整链接，浏览器粘贴一次即记住。
+
+读接口（`/api/suggest`、`/api/diag`）同样要求令牌。它们能枚举 `/data/data` 下的
+已装包名、运行中进程与线程名，等于绕过 Android 11+ 的包可见性限制，不是公开信息。
+
+### P0：config_file 只允许模块目录下的 `.conf`
+
+`/data/adb`、`/data/local/tmp`、`/sdcard` 三条白名单整体移除。`/data/adb` 覆盖
+`post-fs-data.sh` 与 `service.d/*.sh`，模块框架开机以 root 执行；共享存储则是
+几乎所有应用都能写。现在只剩可执行文件目录与当前配置目录，且必须 `.conf` 结尾、
+必须是普通文件（FIFO 会让读取阻塞）。
+
+### P0：规则名拒绝 shell 元字符
+
+`;` `$` `` ` `` `\` `|` `&` `>` `<` `(` `)` 引号一律拒绝，`..` 也拒绝。包名与线程名
+用不到这些字符。
+
+### P1：读失败不再当成空文件
+
+`fs::read_to_string(path).unwrap_or_default()` 把权限错误、IO 错误、非 UTF-8
+全当成空配置。配置文件里只要有一个 GBK 字节，下一次在 Web 上改一条规则，
+整个文件就被替换成那一条。现在只有 `NotFound` 走空值，其余返回 `IoErr`。
+
+### P1：请求读取有界，连接有上限
+
+`read_until` 先把整行读进内存再返回，8192 的上限放在读完之后等于没有：
+5 秒读超时内持续灌数据，单行缓冲会一直长，root 进程可能 OOM。改成逐块
+`fill_buf`，越界即断。线程数上限 32，超出的连接直接关闭。
+
+### P1：cpuset 目录名拒绝 `.` 与 `..`
+
+`..` 会让 base 变成 `/dev`，随后在 `/dev` 下建 `cpus`、`mems` 和 `4-6` 目录；
+`.` 会退回根组，线程一进去就脱离了系统分组。这个值还会写进 `AppOpt.json`，
+重启后依然有效，所以 `set_base_cpuset` 与 Web 侧各校验一次。
+
+### P1：进程身份加属主校验
+
+`/proc/<pid>/cmdline` 与 `comm` 都由进程自己写，改个名字就能蹭到游戏包的大核
+规则，也能按 `@rt` 拿到 `SCHED_RR`。新增 `pkg_owned()`：把 `/proc/<pid>` 的
+属主与 `/data/user/<userId>/<pkg>` 的属主对照，不一致就不认。目录由 installd
+建立，应用改不了。
+
+判定不了时（系统进程、包目录不存在、多用户布局不同）一律放行——这是加分项，
+不能因为某个 ROM 的目录布局把正常应用全拒掉。
+
+### P2：其它
+
+- `write_task` 的 EINVAL 路径先抬到 base 再写目标组，目标组仍失败时把线程
+  写回原组。不回滚的话线程会留在全核 base 上，反而绕过系统对后台线程的限制。
+- 熔断只统计 `NoDir` / `Base`。`Target(EINVAL)` 是单线程与目标组无交集，
+  几十个线程各撞一次就把整条 cpuset 通道停 2 分钟，属于误伤。
+- 配置与设置的 `.tmp` 显式 `0644`（原来随 umask），rename 前 `fchown` 并复制
+  `security.selinux` 标签，避免属主/标签被换掉。
+- `service.sh` 打开 sysfs 用 `chmod u+w`，不再有全局可写的窗口。
+- `Origin: null` 不再放行。任何网页都能构造这个值。
+- `AppOpt-ebpf` 加载前校验属主 root、组与其他不可写、非符号链接、ELF 魔数。
+  这份字节码以 root 加载进内核，被替换就是持久的 rootkit。
+
 ## 2.4.1（2026-11-22）
 
 2.4.0 的真机日志里有一句自相矛盾的话：

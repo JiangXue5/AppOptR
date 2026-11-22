@@ -290,21 +290,66 @@ fn line_remove(lines: &mut Vec<String>, pkg: &str, loc: &ThreadLoc) {
     }
 }
 
+/// 复制一个扩展属性（SELinux 标签）。rename 之后新文件的标签是当前进程的，
+/// 在强制模式下可能让原本能读配置的进程被拒
+fn copy_xattr(dst_fd: i32, src: &str, name: &str) {
+    use std::ffi::CString;
+    let (Ok(csrc), Ok(cname)) = (CString::new(src), CString::new(name)) else {
+        return;
+    };
+    let mut buf = [0u8; 256];
+    let n = unsafe {
+        libc::getxattr(
+            csrc.as_ptr(),
+            cname.as_ptr(),
+            buf.as_mut_ptr() as *mut _,
+            buf.len(),
+        )
+    };
+    if n > 0 {
+        unsafe {
+            libc::fsetxattr(
+                dst_fd,
+                cname.as_ptr(),
+                buf.as_ptr() as *const _,
+                n as usize,
+                0,
+            );
+        }
+    }
+}
+
 fn file_write(path: &str, lines: &[String]) -> RuleEdit {
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
     let mut out = lines.join("\n");
     out.push('\n');
     let tmp = format!("{}.tmp", path);
+    // 新文件默认受 umask 影响，可能是 0600 也可能是 0666；直接指定按原文件权限，
+    // 原文件不存在时用 0644，与 create_config_file 一致
+    let orig = fs::symlink_metadata(path).ok();
+    let mode = orig
+        .as_ref()
+        .map(|m| m.permissions().mode() & 0o777)
+        .unwrap_or(0o644);
     // 配置目录可能位于共享存储，临时文件用 O_NOFOLLOW 打开，
     // 防止预先放置的同名符号链接把这次写入引到白名单之外
     let res = fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
+        .mode(mode)
         .custom_flags(libc::O_NOFOLLOW)
         .open(&tmp)
         .and_then(|mut f| {
+            if let Some(m) = &orig {
+                // rename 会把属主换成当前进程，这里先对齐原文件
+                unsafe {
+                    libc::fchown(f.as_raw_fd(), m.uid(), m.gid());
+                }
+                copy_xattr(f.as_raw_fd(), path, "security.selinux");
+            }
             f.write_all(out.as_bytes())?;
             f.sync_all()
         })
@@ -318,11 +363,9 @@ fn file_write(path: &str, lines: &[String]) -> RuleEdit {
 
 pub fn rule_upsert(path: &str, pkg: &str, thread: &str, cpus: &str) -> RuleEdit {
     let _guard = crate::lock_ignore_poison(&WRITE_LOCK);
-    let mut lines: Vec<String> = fs::read_to_string(path)
-        .unwrap_or_default()
-        .lines()
-        .map(String::from)
-        .collect();
+    let Ok(mut lines) = read_conf(path) else {
+        return RuleEdit::IoErr;
+    };
     normalize_singles(&mut lines, pkg);
     let t = target_scan(&lines, pkg);
 
@@ -378,11 +421,9 @@ pub fn rule_upsert(path: &str, pkg: &str, thread: &str, cpus: &str) -> RuleEdit 
 
 pub fn rule_delete(path: &str, pkg: &str, thread: &str) -> RuleEdit {
     let _guard = crate::lock_ignore_poison(&WRITE_LOCK);
-    let mut lines: Vec<String> = fs::read_to_string(path)
-        .unwrap_or_default()
-        .lines()
-        .map(String::from)
-        .collect();
+    let Ok(mut lines) = read_conf(path) else {
+        return RuleEdit::IoErr;
+    };
     normalize_singles(&mut lines, pkg);
     let t = target_scan(&lines, pkg);
 
@@ -409,11 +450,9 @@ pub fn rule_delete(path: &str, pkg: &str, thread: &str) -> RuleEdit {
 
 pub fn rule_delete_pkg(path: &str, pkg: &str) -> RuleEdit {
     let _guard = crate::lock_ignore_poison(&WRITE_LOCK);
-    let mut lines: Vec<String> = fs::read_to_string(path)
-        .unwrap_or_default()
-        .lines()
-        .map(String::from)
-        .collect();
+    let Ok(mut lines) = read_conf(path) else {
+        return RuleEdit::IoErr;
+    };
     normalize_singles(&mut lines, pkg);
 
     let mut removed = false;
@@ -463,11 +502,9 @@ pub fn rule_delete_pkg(path: &str, pkg: &str) -> RuleEdit {
 
 pub fn rule_rename(path: &str, old: &str, new: &str) -> RuleEdit {
     let _guard = crate::lock_ignore_poison(&WRITE_LOCK);
-    let mut lines: Vec<String> = fs::read_to_string(path)
-        .unwrap_or_default()
-        .lines()
-        .map(String::from)
-        .collect();
+    let Ok(mut lines) = read_conf(path) else {
+        return RuleEdit::IoErr;
+    };
     normalize_singles(&mut lines, old);
     if !target_scan(&lines, old).any_line() {
         return RuleEdit::NotFound;
@@ -566,7 +603,9 @@ fn directive_put(lines: &mut Vec<String>, key: &str, value: Option<&str>) -> boo
 /// 配置线程可能读到只改了一半的文件
 pub fn rt_configure(path: &str, mode: &str, max: Option<u8>, timeslice: Option<u32>) -> RuleEdit {
     let _guard = crate::lock_ignore_poison(&WRITE_LOCK);
-    let mut lines = read_lines(path);
+    let Ok(mut lines) = read_conf(path) else {
+        return RuleEdit::IoErr;
+    };
     directive_put(&mut lines, "rt", Some(mode));
     if let Some(m) = max {
         directive_put(&mut lines, "rt.max", Some(&m.to_string()));
@@ -581,7 +620,9 @@ pub fn rt_configure(path: &str, mode: &str, max: Option<u8>, timeslice: Option<u
 /// 与 `@rt` 不同，这里没有分应用条目，切换即整机生效
 pub fn sched_set(path: &str, mode: &str) -> RuleEdit {
     let _guard = crate::lock_ignore_poison(&WRITE_LOCK);
-    let mut lines = read_lines(path);
+    let Ok(mut lines) = read_conf(path) else {
+        return RuleEdit::IoErr;
+    };
     directive_put(&mut lines, "sched", Some(mode));
     file_write(path, &lines)
 }
@@ -596,7 +637,9 @@ pub fn adv_configure(
     rt_timeslice: Option<u32>,
 ) -> RuleEdit {
     let _guard = crate::lock_ignore_poison(&WRITE_LOCK);
-    let mut lines = read_lines(path);
+    let Ok(mut lines) = read_conf(path) else {
+        return RuleEdit::IoErr;
+    };
     if let Some(u) = unmatched {
         directive_put(&mut lines, "unmatched", Some(u));
     }
@@ -609,18 +652,26 @@ pub fn adv_configure(
     file_write(path, &lines)
 }
 
-fn read_lines(path: &str) -> Vec<String> {
-    fs::read_to_string(path)
-        .unwrap_or_default()
-        .lines()
-        .map(String::from)
-        .collect()
+/// 读配置并切成行。只有 `NotFound` 才当成空文件——
+/// 其余错误（权限、IO、编解码）必须原样报出去。
+///
+/// 旧实现把所有 `Err` 都当空串：配置文件里只要有一个非 UTF-8 字节（GBK 注释很常见），
+/// `read_to_string` 就失败，随后写入会把整个文件替换成只含本次修改的那一条，
+/// 用户攒的几十条规则一次全丢
+fn read_conf(path: &str) -> Result<Vec<String>, RuleEdit> {
+    match fs::read_to_string(path) {
+        Ok(s) => Ok(s.lines().map(String::from).collect()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(_) => Err(RuleEdit::IoErr),
+    }
 }
 
 /// 写或删除 `@rt.app=<包名> ...`。`spec` 为空表示删除该条目
 pub fn rt_app_set(path: &str, pkg: &str, spec: &str) -> RuleEdit {
     let _guard = crate::lock_ignore_poison(&WRITE_LOCK);
-    let mut lines = read_lines(path);
+    let Ok(mut lines) = read_conf(path) else {
+        return RuleEdit::IoErr;
+    };
     let new_line = if spec.is_empty() {
         None
     } else {
@@ -689,7 +740,9 @@ fn rt_app_state(line: &str) -> Option<bool> {
 /// 否则 `rt_active()` 仍为真，内核时间片会一直被改写。
 pub fn rt_toggle(path: &str, pkg: &str, enabled: bool) -> RuleEdit {
     let _guard = crate::lock_ignore_poison(&WRITE_LOCK);
-    let mut lines = read_lines(path);
+    let Ok(mut lines) = read_conf(path) else {
+        return RuleEdit::IoErr;
+    };
 
     // 保留手工调过的模式与上限：`off` 只是状态位，重新打开时恢复原参数
     let keep = lines.iter().find_map(|l| {
@@ -741,6 +794,41 @@ pub fn rt_toggle(path: &str, pkg: &str, enabled: bool) -> RuleEdit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 非 UTF-8 文件必须报错而不是当成空文件：旧实现会把整个配置替换成一条规则
+    #[test]
+    fn undecodable_config_is_not_truncated() {
+        let dir = format!("/tmp/appopt_edit_gbk_{}", std::process::id());
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let conf = format!("{}/applist.conf", dir);
+        // GBK 编码的「# 你好」注释，第二个字节起不是合法 UTF-8
+        let raw = [0x23, 0x20, 0xc4, 0xe3, 0xba, 0xc3, 0x0a];
+        fs::write(&conf, raw).unwrap();
+
+        assert!(matches!(
+            rule_upsert(&conf, "com.test.app", "", "0-1"),
+            RuleEdit::IoErr
+        ));
+        assert!(matches!(
+            rule_delete(&conf, "com.test.app", ""),
+            RuleEdit::IoErr
+        ));
+        assert_eq!(fs::read(&conf).unwrap(), raw, "读失败时不得改写原文件");
+
+        // 不存在的文件仍然按空配置新建，保持首次使用的行为
+        let fresh = format!("{}/fresh.conf", dir);
+        assert!(matches!(
+            rule_upsert(&fresh, "com.test.app", "", "0-1"),
+            RuleEdit::Ok
+        ));
+        assert!(
+            fs::read_to_string(&fresh)
+                .unwrap()
+                .contains("com.test.app=0-1")
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn tmp_symlink_does_not_redirect_write() {

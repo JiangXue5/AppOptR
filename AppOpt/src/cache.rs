@@ -603,6 +603,6 @@ mod tests {
         assert_eq!(cache.sched.get(&4321).copied(), Some(set_of("4-7")));
         // 线程退出后不再保留
         cache.task_del(4321);
-        assert!(cache.sched.get(&4321).is_none());
+        assert!(!cache.sched.contains_key(&4321));
     }
 }

@@ -583,6 +583,11 @@ pub fn note(tid: i32, pid: i32, pkg: &str, comm: &str, allowed: &CpuSet, cfg: &A
     if cfg.rt.is_off() {
         return;
     }
+    // RT 提升的代价比绑核更大：改名冒充就能拿到 SCHED_RR，这里必须复核身份。
+    // 上游已按 uid 过滤过，这道是兜底——rt 也可能被 eBPF 路径直接调用
+    if !crate::apply_affinity::pkg_owned(pid, pkg) {
+        return;
+    }
     if let Some(s) = crate::lock_ignore_poison(&RT).as_mut() {
         s.note(tid, pid, pkg, comm, allowed, cfg);
     }

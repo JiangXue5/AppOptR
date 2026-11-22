@@ -34,6 +34,37 @@ pub(crate) fn read_cmdline(pid: i32) -> Option<String> {
     Some(trimmed.to_string())
 }
 
+/// 进程的 real uid。`/proc/<pid>` 目录属主就是它，一次 stat 即可；
+/// dumpable=0 的进程属主会变成 root，此时按「非应用进程」放行，方向是保守的
+pub(crate) fn proc_uid(pid: i32) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata(format!("/proc/{}", pid)).ok().map(|m| m.uid())
+}
+
+/// 包名是否真属于这个进程。`cmdline` 与 `comm` 都是进程自己写的，改个名字就能
+/// 蹭到目标游戏的大核规则，甚至按 `@rt` 拿到 SCHED_RR。包目录的属主由 installd
+/// 建立、应用本身改不了，用它做交叉校验。
+///
+/// 判定不了时（读不到 uid、包目录不存在、系统进程）返回 true：这是一道加分项，
+/// 不能因为某个 ROM 目录布局不同就把正常应用全部拒掉
+pub(crate) fn pkg_owned(pid: i32, pkg: &str) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let Some(uid) = proc_uid(pid) else {
+        return true;
+    };
+    // 10000 以下是非应用 uid（root/system/shell），不参与包名匹配
+    if uid < 10_000 {
+        return true;
+    }
+    // 多用户：uid = userId * 100000 + appId，包目录在 /data/user/<userId>/ 下
+    let path = format!("/data/user/{}/{}", uid / 100_000, pkg);
+    match fs::metadata(&path) {
+        Ok(md) => md.uid() == uid,
+        Err(_) => true,
+    }
+}
+
 pub(crate) fn tid_comm(tid: i32) -> Option<String> {
     let mut buf = [0u8; MAX_THREAD_LEN];
     let bytes = read_proc_file(tid, "comm", &mut buf)?;
@@ -237,6 +268,33 @@ pub fn reset_cpuset_dir_cache() {
     }
 }
 
+/// 线程当前所在的 cpuset 目录（绝对路径）。cgroup 里记录的是相对层级根的路径，
+/// Android 把 cpuset 层级挂在 `/dev/cpuset`，所以 `/background` 要补前缀
+fn cgroup_dir(tid: i32) -> Option<String> {
+    // 线程同时属于多个子系统，每行一个；512 字节在层数多时会截断
+    let mut buf = [0u8; 1024];
+    let bytes = read_proc_file(tid, "cgroup", &mut buf)?;
+    let s = std::str::from_utf8(bytes).ok()?;
+    for line in s.lines() {
+        let mut it = line.splitn(3, ':');
+        let _ = it.next()?;
+        let ctrl = it.next()?;
+        let path = it.next()?.trim();
+        if !ctrl.split(',').any(|c| c == "cpuset") {
+            continue;
+        }
+        if path == "/" || path.is_empty() {
+            return Some("/dev/cpuset".to_string());
+        }
+        return Some(if path.starts_with("/dev/cpuset/") {
+            path.to_string()
+        } else {
+            format!("/dev/cpuset{}", path)
+        });
+    }
+    None
+}
+
 /// 把 tid 挂到 cpuset 子目录，目录缺失时重建一次（外部删除兜底）。
 /// 失败原因必须带出去：cpuset 写不进去时只剩 sched_setaffinity 兜底，
 /// 这往往就是「有时绑得住、有时绑不住」的那一半
@@ -281,10 +339,23 @@ fn write_task(dir: &str, tid: i32, topo: &CpuTopology) -> Result<(), CpusetFail>
     if first == libc::EINVAL {
         // 连 base 都失败，说明问题在挂载或权限，与目标集合无关；
         // 这一区分决定了用户该改规则还是改模块安装方式
+        // 先记下原组，目标组仍失败时要能原路退回
+        let orig = cgroup_dir(tid);
         if append(&format!("{}/tasks", base)).is_err() {
             return Err(CpusetFail::Base(first));
         }
-        return append(&path).map_err(|e| CpusetFail::Target(errno(e)));
+        return match append(&path) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // 抬到 base 之后目标组还是写不进去：必须把线程写回原组。
+                // 否则它就一直留在全核 base 上，等于绕过系统对后台线程的限制，
+                // 比「没绑上」更糟
+                if let Some(o) = orig.filter(|o| *o != base) {
+                    let _ = append(&format!("{}/tasks", o));
+                }
+                Err(CpusetFail::Target(errno(e)))
+            }
+        };
     }
     Err(CpusetFail::Target(first))
 }
@@ -379,7 +450,12 @@ pub fn affinity_apply(
             Ok(()) => cpuset_ok(),
             Err(f) => {
                 diag::note_cpuset_failure(tid, if dir.is_empty() { "<base>" } else { dir }, f);
-                cpuset_failed(f.errno());
+                // 只有全局性失败才计入熔断。`Target(EINVAL)` 是单个线程与目标组
+                // 无交集（规则要 4-6、线程被压在 0-3），几十个线程各撞一次就把
+                // 整条 cpuset 通道停 2 分钟，是明显的误伤
+                if !matches!(f, CpusetFail::Target(_)) {
+                    cpuset_failed(f.errno());
+                }
             }
         }
     }
@@ -437,6 +513,11 @@ pub(crate) fn proc_walk(
         if !cfg.pkgs.contains(&pkg) {
             continue;
         }
+        // 名字可以自己改，属主不能。放在 here 而不是匹配函数里，
+        // 是因为这条路径要拿 pid 才能校验
+        if !pkg_owned(pid, &pkg) {
+            continue;
+        }
         f(pid, &pkg);
         count += 1;
     }
@@ -452,6 +533,18 @@ mod tests {
 
     fn self_tid() -> i32 {
         unsafe { libc::syscall(libc::SYS_gettid) as i32 }
+    }
+
+    /// 身份校验是加分项：判不了的情况必须放行，不能因为某个 ROM 目录布局不同
+    /// 就把正常应用全部拒掉
+    #[test]
+    fn pkg_owned_fails_open_when_unknown() {
+        let pid = std::process::id() as i32;
+        // 测试进程是 root（uid < 10000），不参与包名校验
+        assert!(proc_uid(pid).is_some());
+        assert!(pkg_owned(pid, "com.example.anything"));
+        // 不存在的 pid 读不到 uid，同样放行
+        assert!(pkg_owned(GHOST, "com.example.anything"));
     }
 
     /// 已经符合目标集合时短路返回，不产生任何系统调用
