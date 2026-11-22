@@ -397,6 +397,14 @@ impl SchedState {
             self.state = "不适用";
             return Vec::new();
         }
+        // 规则全是单簇时，没有任何线程的允许集合横跨簇，S7 的采样结论
+        // 永远是「无可让位」——真机上 576 次探测/分钟换 0 次迁移就是这么来的。
+        // 这跟「降频」不是一回事：降频还在烧 1/8 的开销，这里一分都不该烧。
+        // 状态直接说清楚，用户才知道该改规则，而不是等它「醒过来」
+        if cfg.sched_scope.rules == 0 {
+            self.state = "规则无跨簇";
+            return Vec::new();
+        }
         if cache.tasks.is_empty() {
             self.state = "等待被管理进程";
             self.prev = None;
@@ -964,6 +972,27 @@ mod tests {
         assert!(!st.should_idle(t0 + Duration::from_secs(1)));
         assert_eq!(st.idle_rounds, 0);
         assert!(st.last_decide.is_none());
+    }
+
+    /// 一条跨簇规则都没有时，S7 不该再去 /proc 采样：结论注定是「无可让位」。
+    /// 修复前真机是 576 次探测/分钟、0 次迁移，还占着「判定已降频」的挡位
+    #[test]
+    fn no_cross_cluster_rule_skips_sampling_entirely() {
+        let mut cfg = cfg_with("nocross", "com.test.game=p-core\n");
+        cfg.sched_scope = SchedScope {
+            levels: 3,
+            rules: 0,
+            pkgs: 0,
+        };
+        let mut cpus = CpuSet::new();
+        cpus.set(4);
+        cpus.set(5);
+        let cache = cache_with("com.test.game", "UnityMain", cpus);
+        let mut st = SchedState::new();
+        st.set_mode(SchedMode::On);
+        assert!(st.tick(&cfg, &cache).is_empty());
+        assert_eq!(st.state, "规则无跨簇");
+        assert_eq!(st.probed, 0, "不得读任何线程");
     }
 
     #[test]

@@ -19,6 +19,12 @@ pub static INOTIFY_WD: AtomicI32 = AtomicI32::new(-1);
 pub static CHECK_INTERVAL: AtomicU64 = AtomicU64::new(2);
 pub static FORCE_RELOAD: AtomicBool = AtomicBool::new(false);
 pub static CONFIG_FILE: Mutex<String> = Mutex::new(String::new());
+/// 上一次真正生效的「内容 + 拓扑」指纹。一次保存往往触发两三个 CLOSE_WRITE
+/// （编辑器先写临时文件再改名、WebUI 分两次落盘），mtime 每次都变，
+/// 只靠 mtime 去重挡不住——真机上出现过 396 次写触发 99 次重解析、
+/// 以及一次保存 2 秒内解析两遍的情况
+static RELOAD_SIG: AtomicU64 = AtomicU64::new(0);
+static RELOAD_SIG_SET: AtomicBool = AtomicBool::new(false);
 
 pub struct AffinityRule {
     pub pkg: String,
@@ -913,6 +919,10 @@ pub fn load_config(
             "S7 动态分配: on（核心层仅 {} 个，不会生效）",
             scope.levels
         )),
+        // 规则全在单簇内：S7 没有可让位的目标，运行期直接不采样
+        SchedMode::On if scope.rules == 0 => {
+            crate::diag::emit("S7 动态分配: on（规则无跨簇，没有可让位的目标，不会采样）")
+        }
         SchedMode::On => {
             crate::diag::emit("S7 动态分配: on（仅 Worker/Background 让位，每秒最多迁移 1 个线程）")
         }
@@ -1040,11 +1050,51 @@ fn disable_inotify(inotify_fd: i32) {
     INOTIFY_WD.store(-1, Ordering::Release);
 }
 
+/// 文件内容 + 拓扑的指纹。拓扑变了必须重解析（热插拔会改变核心层映射），
+/// 内容没变则不解析：重解析除了刷出十几行日志、让 S7 与 RT 各重建一遍状态，
+/// 不会带来任何变化
+fn content_sig(file: &str, topo: &CpuTopology) -> Option<u64> {
+    let content = fs::read_to_string(file).ok()?;
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in content
+        .as_bytes()
+        .iter()
+        .copied()
+        .chain(topo.present_str.bytes())
+        .chain(topo.mems_str.bytes())
+    {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    Some(h)
+}
+
 fn config_reload(last_mtime: &mut i64) {
     let Some(cfg) = lock_ignore_poison(&CURRENT_CONFIG).clone() else {
         return;
     };
     let file = lock_ignore_poison(&CONFIG_FILE).clone();
+    if let Some(sig) = content_sig(&file, &cfg.topo) {
+        // 内容与拓扑都没变：这次事件只是同一次保存的余波，重解析毫无收益
+        if RELOAD_SIG_SET.load(Ordering::Acquire) && RELOAD_SIG.load(Ordering::Relaxed) == sig {
+            return;
+        }
+        // 内容确实变了：绕过 mtime 门。两次写入落在同一时间戳精度内时，
+        // mtime 会相等，光靠它会把真实修改挡在门外
+        *last_mtime = -1;
+        let Some(new_cfg) = load_config(&file, &cfg.topo, last_mtime) else {
+            return;
+        };
+        RELOAD_SIG.store(sig, Ordering::Relaxed);
+        RELOAD_SIG_SET.store(true, Ordering::Release);
+        {
+            let mut guard = lock_ignore_poison(&CURRENT_CONFIG);
+            *guard = Some(Arc::new(new_cfg));
+        }
+        CONFIG_UPDATED.store(true, Ordering::Release);
+        return;
+    }
+    // 读不到内容（正在被写、被删）：按老路走一次，失败就等下一次事件
     let Some(new_cfg) = load_config(&file, &cfg.topo, last_mtime) else {
         return;
     };
@@ -1116,8 +1166,12 @@ fn inotify_handle(interval: u64, last_mtime: &mut i64) {
             if event.mask & (libc::IN_CLOSE_WRITE | libc::IN_DELETE_SELF | libc::IN_MOVE_SELF) != 0
             {
                 reload_needed = true;
-                *last_mtime = -1;
+                // 只对「换了 inode」的事件作废 mtime：改名/删除后路径指向的已不是
+                // 原文件，mtime 不可比。普通 CLOSE_WRITE 交给 config_reload 的
+                // 内容指纹判断——这里无脑置 -1，等于每次保存都强制重解析，
+                // 而一次保存往往触发两三个事件
                 if event.mask & (libc::IN_DELETE_SELF | libc::IN_MOVE_SELF) != 0 {
+                    *last_mtime = -1;
                     needs_rewatch = true;
                 }
             }
@@ -1203,6 +1257,28 @@ mod tests {
         let cfg = load_config(&path, topo, &mut mtime).expect("配置应能加载");
         let _ = fs::remove_file(&path);
         cfg.sched_scope
+    }
+
+    /// 内容指纹：同一次保存的多个事件必须同值（否则每次都重解析），
+    /// 内容或拓扑一变必须不同值（否则真实修改被挡在门外）
+    #[test]
+    fn content_sig_dedupes_only_identical_reloads() {
+        let t = topo_of(&[0, 1, 2, 3], &[4, 5, 6], &[7]);
+        let p = "/tmp/appopt_sig_a.conf";
+        fs::write(p, "com.a=4-6\n").unwrap();
+        let a = content_sig(p, &t).unwrap();
+        // 同样的内容 + 同样的拓扑：命中，跳过重解析
+        assert_eq!(a, content_sig(p, &t).unwrap());
+
+        // 只改一个字符也必须重新解析
+        fs::write(p, "com.a=4-6\ncom.b=7\n").unwrap();
+        assert_ne!(a, content_sig(p, &t).unwrap());
+
+        // 内容没变但拓扑变了（热插拔换掉了一个簇）：必须重新解析
+        fs::write(p, "com.a=4-6\n").unwrap();
+        let t2 = topo_of(&[0, 1, 2, 3], &[4, 5], &[6]);
+        assert_ne!(a, content_sig(p, &t2).unwrap());
+        let _ = fs::remove_file(p);
     }
 
     #[test]

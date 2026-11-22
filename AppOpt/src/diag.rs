@@ -638,8 +638,14 @@ pub fn note_group_clip(group: SysGroup, want: &CpuSet, got: &CpuSet, eff: &str) 
     if !s.clip_announced.insert(group) {
         return;
     }
+    // 这句曾经收在「要拿到完整集合写 @sysgroup=takeover」上，可 takeover 也要
+    // cgroup 写权限——自检没通过时那条路根本不存在，等于把人指去撞墙。
+    // 现在只说清约束与两条真实出路：让接管恢复，或把规则改成组内集合
     let line = format!(
-        "系统分组: {} 的生效集合是 {}，规则要的 {} 超出该组，按 {} 绑定（此刻迁不进自己的组，只能取交集）；要拿到完整集合写 @sysgroup=takeover",
+        "系统分组: {} 的生效集合是 {}，规则要的 {} 超出该组，按 {} 绑定；\
+         此刻只能靠 sched_setaffinity，内核会把集合收敛到组生效集合——\
+         要拿完整集合需 cgroup 接管可用（启动时应打印 cpuset 自检通过），\
+         或把规则改成该组内的集合",
         group.label(),
         eff,
         want.to_range_string(),

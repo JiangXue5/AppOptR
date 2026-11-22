@@ -459,6 +459,23 @@ pub fn attach_task(path: &str, tid: i32) -> io::Result<()> {
     f.write_all(&buf[..n])
 }
 
+/// 把挂载路径换成 cgroup 内的相对路径。
+///
+/// `/proc/<tid>/cgroup` 里的路径永远相对层级根（`/AppOpt`），而 base 是挂载点
+/// 下的完整路径（`/dev/cpuset/AppOpt`）。两者直接比较**在任何设备上都不相等**——
+/// 2.3.9 的自检就因此把「已经迁进去了」读成「线程仍在原组」，判成
+/// 「本机不接受 cgroup 接管」，把整条 cgroup 路永久关掉。日志里那句
+/// 「写入返回成功但线程仍在 /AppOpt」正是这个断言失败的产物：
+/// `/AppOpt` 就是 base 目录，它其实成功了
+fn cgroup_rel(path: &str) -> String {
+    let p = path.trim_end_matches('/');
+    match p.strip_prefix("/dev/cpuset") {
+        Some("") => "/".to_string(),
+        Some(rest) if rest.starts_with('/') => rest.to_string(),
+        _ => p.to_string(),
+    }
+}
+
 /// 建组自检：把自己写进 base 的 tasks 一次，写进去之后**回读组归属**，
 /// 两件事都对才算真的能用。写返回 0 不代表迁进去了（只读挂载、内核裁剪都可能），
 /// 不看回读就下结论，等于用「没报错」冒充「成功了」。
@@ -471,12 +488,14 @@ pub fn attach_task(path: &str, tid: i32) -> io::Result<()> {
 /// 而它会被系统改组配置时重置，这个结论必须一次说清，而不是反复重试。
 fn probe_cpuset(base: &str) -> Result<(), String> {
     let tid = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
-    let base_norm = base.trim_end_matches('/').to_string();
+    // 写文件用挂载路径，比较用 cgroup 相对路径，两者不能混
+    let base_dir = base.trim_end_matches('/');
+    let base_norm = cgroup_rel(base);
     // 自检会短暂改变自己的组与亲和性，先备份再恢复，不能留下副作用
     let orig = thread_cgroup(tid);
     let backup = CpuSet::get_affinity(tid);
     let res = (|| {
-        attach_task(&format!("{}/tasks", base_norm), tid)
+        attach_task(&format!("{}/tasks", base_dir), tid)
             .map_err(|e| format!("写入失败（{}）", e))?;
         match thread_cgroup(tid) {
             Some(p) if p.trim_end_matches('/') == base_norm => Ok(()),
@@ -813,7 +832,15 @@ pub fn init_cpu_topo() -> CpuTopology {
         return topo;
     }
     match probe_cpuset(&base_cpuset()) {
-        Ok(()) => topo.cpuset_enabled = true,
+        Ok(()) => {
+            topo.cpuset_enabled = true;
+            // 成功也要留一行：真机上「有没有接管成功」直接决定后面所有
+            // 绑核行为的解释，不打印就只能靠猜
+            crate::diag::emit(&format!(
+                "cpuset: 自检通过，受管线程可迁入 {}，规则集合不再被系统组裁剪",
+                base_cpuset()
+            ));
+        }
         Err(e) => {
             // 目录建得出、文件写得进，但内核不接受任务：这台设备上
             // cgroup 接管这条路是死的，早说清楚好过每分钟失败一次
@@ -1045,6 +1072,21 @@ mod tests {
         attach_task(p.to_str().unwrap(), 13552).unwrap();
         assert_eq!(fs::read(&p).unwrap(), b"13552", "不得带换行符");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 自检回读的路径口径：/proc/<tid>/cgroup 给的是 `/AppOpt`，
+    /// base 给的是 `/dev/cpuset/AppOpt`。修复前两者直接比较，永远不等，
+    /// 于是「迁移成功」被读成「线程仍在原组」，cgroup 路被永久关掉
+    #[test]
+    fn probe_compares_paths_in_same_units() {
+        assert_eq!(cgroup_rel("/dev/cpuset/AppOpt"), "/AppOpt");
+        assert_eq!(cgroup_rel("/dev/cpuset/AppOpt/"), "/AppOpt");
+        assert_eq!(cgroup_rel("/AppOpt"), "/AppOpt");
+        assert_eq!(cgroup_rel("/dev/cpuset"), "/");
+        assert_eq!(cgroup_rel("/dev/cpuset/"), "/");
+        // 真正的失败必须仍然判得出来：线程在别的组
+        assert_ne!(cgroup_rel("/dev/cpuset/AppOpt"), "/top-app");
+        assert_ne!(cgroup_rel("/dev/cpuset/AppOpt"), "/AppOpt2");
     }
 
     /// Android 的 cpuset 组名决定线程能不能上大核，分类错一个，
