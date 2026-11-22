@@ -247,12 +247,9 @@ fn write_task(dir: &str, tid: i32, topo: &CpuTopology) -> Result<(), CpusetFail>
     } else {
         format!("{}/{}/tasks", base, dir)
     };
-    let append = |p: &str| {
-        fs::OpenOptions::new()
-            .append(true)
-            .open(p)
-            .and_then(|mut f| writeln!(f, "{}", tid))
-    };
+    // 必须一次性写完整数字：带换行会被内核当成两段，第二段（只有 `\n`）
+    // 直接被判 EINVAL，于是「已经迁进去了」被读成「EINVAL 失败」
+    let append = |p: &str| crate::cpuset::attach_task(p, tid);
     let errno = |e: std::io::Error| e.raw_os_error().unwrap_or(0);
 
     // base 目录由 init_cpu_topo 负责，这里只追加 tasks

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::fmt::Write as _;
 use std::fs;
@@ -5,6 +6,7 @@ use std::io;
 use std::io::Write as _;
 
 use std::sync::RwLock;
+use std::time::{Duration, Instant};
 
 pub const CPU_SETSIZE: usize = 1024;
 pub const CPU_WORD_BITS: usize = 64;
@@ -57,10 +59,6 @@ pub enum SysGroup {
 }
 
 impl SysGroup {
-    pub fn is_background(self) -> bool {
-        self == SysGroup::Background
-    }
-
     pub fn label(self) -> &'static str {
         match self {
             SysGroup::Own => "AppOpt",
@@ -104,12 +102,6 @@ pub fn classify_group(path: &str) -> SysGroup {
         "" => SysGroup::Unknown,
         _ => SysGroup::Other,
     }
-}
-
-pub fn thread_group(tid: i32) -> SysGroup {
-    thread_cgroup(tid)
-        .map(|p| classify_group(&p))
-        .unwrap_or(SysGroup::Unknown)
 }
 
 /// 生效集合的文件名：v1 是 `cpuset.effective_cpus`，v2 是 `cpuset.cpus.effective`。
@@ -197,6 +189,35 @@ pub fn group_effective(path: &str) -> Option<String> {
         return Some(eff);
     }
     effective_by_walk("/dev/cpuset", path)
+}
+
+/// 生效集合的短时缓存。校验一轮要遍历几百个线程，同一组会被反复求交
+/// （`/foreground` 上 172 个线程就是 344 次 open + 按父链求交）。
+/// 组配置以秒级稳定，5 秒缓存既跟得上真实变更，也不会把这份开销摊到每个线程
+const EFF_TTL: Duration = Duration::from_secs(5);
+/// 组路径 → (读取时刻, 生效集合)。`None` 表示读不到，同样缓存：
+/// 读不到时按父链求交会连撞几次失败，没必要每个线程重来一遍
+type EffCache = HashMap<String, (Instant, Option<String>)>;
+static EFF_CACHE: RwLock<Option<EffCache>> = RwLock::new(None);
+
+pub fn group_effective_cached(path: &str) -> Option<String> {
+    let now = Instant::now();
+    if let Ok(g) = EFF_CACHE.read()
+        && let Some(m) = g.as_ref()
+        && let Some((at, v)) = m.get(path)
+        && now.duration_since(*at) < EFF_TTL
+    {
+        return v.clone();
+    }
+    let v = group_effective(path);
+    if let Ok(mut g) = EFF_CACHE.write() {
+        let m = g.get_or_insert_with(HashMap::new);
+        if m.len() > 64 {
+            m.retain(|_, (at, _)| now.duration_since(*at) < EFF_TTL);
+        }
+        m.insert(path.to_string(), (now, v.clone()));
+    }
+    v
 }
 
 const _: () = assert!(std::mem::size_of::<CpuSet>() == std::mem::size_of::<libc::cpu_set_t>());
@@ -419,7 +440,28 @@ pub(crate) fn create_cpuset_dir(path: &str, cpus: &str, mems: &str) -> bool {
     fs::write(&mems_path, mems).is_ok()
 }
 
-/// 建组自检：把自己写进 base 的 tasks 一次，成功才算真的能用。
+/// 把一个线程号写进 cgroup 的 `tasks`。
+///
+/// **必须一次 write 写完，且不带换行。** `writeln!` 会被展开成两次 write
+/// （先写数字，再写 `"\n"`）；内核 `__cgroup_procs_write` 收到的第二段是空内容，
+/// `kstrtoint(strstrip(buf))` 失败，直接返回 `EINVAL`。于是「线程其实已经迁进
+/// 目标组」被读成「EINVAL 迁移失败」：2.3.8 的自检就是被这一行判成
+/// 「本机不接受 cgroup 接管」，把整条 cgroup 路关掉了；两步迁组里的 base
+/// 回退也一并被误判成「连 base 都写不进去」。
+pub fn attach_task(path: &str, tid: i32) -> io::Result<()> {
+    let mut buf = [0u8; 12];
+    let n = {
+        let mut cur = std::io::Cursor::new(&mut buf[..]);
+        write!(cur, "{}", tid)?;
+        cur.position() as usize
+    };
+    let mut f = fs::OpenOptions::new().append(true).open(path)?;
+    f.write_all(&buf[..n])
+}
+
+/// 建组自检：把自己写进 base 的 tasks 一次，写进去之后**回读组归属**，
+/// 两件事都对才算真的能用。写返回 0 不代表迁进去了（只读挂载、内核裁剪都可能），
+/// 不看回读就下结论，等于用「没报错」冒充「成功了」。
 ///
 /// 真机上出现过「mkdir、写 cpus/mems 全部成功，但写 tasks 一直 EINVAL、
 /// `cpuset.effective_cpus` 也读不到」的情况——文件都在，cgroup 却不接受
@@ -429,16 +471,28 @@ pub(crate) fn create_cpuset_dir(path: &str, cpus: &str, mems: &str) -> bool {
 /// 而它会被系统改组配置时重置，这个结论必须一次说清，而不是反复重试。
 fn probe_cpuset(base: &str) -> Result<(), String> {
     let tid = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
-    // 自检会短暂改变自己的亲和性，先备份再恢复，不能留下副作用
+    let base_norm = base.trim_end_matches('/').to_string();
+    // 自检会短暂改变自己的组与亲和性，先备份再恢复，不能留下副作用
+    let orig = thread_cgroup(tid);
     let backup = CpuSet::get_affinity(tid);
-    let path = format!("{}/tasks", base);
     let res = (|| {
-        let mut f = fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .map_err(|e| format!("打开失败（{}）", e))?;
-        writeln!(f, "{}", tid).map_err(|e| format!("写入失败（{}）", e))
+        attach_task(&format!("{}/tasks", base_norm), tid)
+            .map_err(|e| format!("写入失败（{}）", e))?;
+        match thread_cgroup(tid) {
+            Some(p) if p.trim_end_matches('/') == base_norm => Ok(()),
+            Some(p) => Err(format!("写入返回成功但线程仍在 {}（组被禁用或只读）", p)),
+            None => Err("写入后读不到线程组归属".to_string()),
+        }
     })();
+    // 恢复现场：先写回原组，再恢复亲和性。顺序反了会被迁组再裁一次
+    if let Some(p) = orig.as_deref()
+        && p.trim_end_matches('/') != base_norm
+    {
+        let _ = attach_task(
+            &format!("/dev/cpuset{}/tasks", p.trim_end_matches('/')),
+            tid,
+        );
+    }
     if let Some(b) = backup {
         let _ = b.set_affinity(tid);
     }
@@ -975,6 +1029,22 @@ mod tests {
         assert_eq!(h, set(&[2, 3]));
         assert_eq!(src, "capacity");
         assert!(degraded);
+    }
+
+    /// 写入必须一次完成且不带换行。`writeln!` 会被拆成「数字」+「\n」两次
+    /// write，内核收到只有换行的第二段直接返回 EINVAL——线程其实已经迁进去了，
+    /// 却被记成失败。2.3.8 的自检就是被这一行判成「本机不接受 cgroup 接管」
+    #[test]
+    fn attach_task_writes_digits_only_in_one_shot() {
+        let dir = std::env::temp_dir().join(format!("ao_attach_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("tasks");
+        fs::write(&p, "").unwrap();
+
+        attach_task(p.to_str().unwrap(), 13552).unwrap();
+        assert_eq!(fs::read(&p).unwrap(), b"13552", "不得带换行符");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Android 的 cpuset 组名决定线程能不能上大核，分类错一个，

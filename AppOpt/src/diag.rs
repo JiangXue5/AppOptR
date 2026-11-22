@@ -135,11 +135,16 @@ struct Sink {
     drift_kind: [u64; 3],
     /// 本周期因系统后台组跳过的次数
     sysgroup_since_summary: u64,
+    /// 最近一轮被系统组拦下的线程数。累计次数会被轮次放大（172 个线程 × 5 轮
+    /// = 860 次），只有「当前多少个线程」才是能对照的实数
+    sysgroup_last: u64,
     /// 本周期「目标与所在组无交集」的次数与首个样例
     unreachable_since_summary: u64,
     unreachable_sample: Option<(String, i32, String, String)>,
     /// 已经说明过的组，同类只播报一次
     sysgroup_announced: HashSet<SysGroup>,
+    /// 已经说明过「目标被组集合裁小」的组
+    clip_announced: HashSet<SysGroup>,
     /// 本周期「写后回读仍不一致」的样本与计数
     ineffective: Vec<Drift>,
     ineffective_n: u64,
@@ -187,9 +192,11 @@ fn sink() -> std::sync::MutexGuard<'static, Option<Sink>> {
         drift: Vec::new(),
         drift_kind: [0; 3],
         sysgroup_since_summary: 0,
+        sysgroup_last: 0,
         unreachable_since_summary: 0,
         unreachable_sample: None,
         sysgroup_announced: HashSet::new(),
+        clip_announced: HashSet::new(),
         ineffective: Vec::new(),
         ineffective_n: 0,
         stuck_skip: 0,
@@ -610,12 +617,33 @@ pub fn note_sysgroup_batch(n: u64) {
     let Some(s) = guard.as_mut() else { return };
     s.stats.sysgroup_skip += n;
     s.sysgroup_since_summary += n;
+    s.sysgroup_last = n;
     if !s.sysgroup_announced.insert(SysGroup::Background) {
         return;
     }
     let line = format!(
         "系统分组: {} 个线程被系统限定在后台组，规则要求的大核不在该组生效集合内，内核会拒绝绑定；已跳过（不计失败）。切回前台会自动恢复，要强制接管写 @sysgroup=takeover",
         n
+    );
+    emit(&line);
+    push_event(s, line);
+}
+
+/// 目标集合被所在组的生效集合裁小。写全集时内核会求交，返回成功但回读永远是
+/// 子集，接着被判成「写了也白写」白停 300 秒。改成按交集绑之后不会再有回读
+/// 不一致，所以这条说明就是唯一的现场记录，同一组只给一次
+pub fn note_group_clip(group: SysGroup, want: &CpuSet, got: &CpuSet, eff: &str) {
+    let mut guard = sink();
+    let Some(s) = guard.as_mut() else { return };
+    if !s.clip_announced.insert(group) {
+        return;
+    }
+    let line = format!(
+        "系统分组: {} 的生效集合是 {}，规则要的 {} 超出该组，按 {} 绑定（此刻迁不进自己的组，只能取交集）；要拿到完整集合写 @sysgroup=takeover",
+        group.label(),
+        eff,
+        want.to_range_string(),
+        got.to_range_string()
     );
     emit(&line);
     push_event(s, line);
@@ -772,7 +800,8 @@ pub fn periodic_summary(current: &SchedSnapshot) {
     }
     if sysgroup > 0 {
         emit(&format!(
-            "系统分组: 近 {} 秒 {} 次因后台组跳过（累计 {}）；这些线程被系统限定在小核，不改规则就绑不上",
+            "系统分组: 当前 {} 个线程被系统限定在小核（近 {} 秒跳过 {} 次，累计 {}）；不改规则就绑不上，切回前台会自动恢复",
+            s.sysgroup_last,
             SUMMARY_GAP.as_secs(),
             sysgroup,
             st.sysgroup_skip
@@ -1242,6 +1271,7 @@ mod tests {
             crate::cache::TaskEntry {
                 pid: 1,
                 pkg: "com.x".into(),
+                want: CpuSet::new(),
                 cpus: CpuSet::new(),
                 cpuset_dir: String::new(),
                 is_thread_rule: false,

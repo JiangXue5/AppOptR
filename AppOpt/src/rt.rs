@@ -708,6 +708,7 @@ mod tests {
         TaskEntry {
             pid,
             pkg: pkg.to_string(),
+            want: cpus(cores),
             cpus: cpus(cores),
             cpuset_dir: String::new(),
             is_thread_rule: false,

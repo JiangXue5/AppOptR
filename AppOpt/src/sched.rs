@@ -46,6 +46,12 @@ const IDLE_ROUNDS: u32 = 5;
 /// 降频后的判定间隔。规则只覆盖单簇时，每秒 64 次 /proc 读取换来的
 /// 结论永远是「无事可做」，这份开销本身就是掉帧来源之一
 const IDLE_GAP: Duration = Duration::from_secs(8);
+/// 持续空转到这个轮数就不再是「可能马上有活」，而是「规则根本不支持换簇」。
+/// 8 秒一次、每次 64 个线程，挂在游戏里一局下来仍是几万次 /proc 读取，
+/// 换来的只是一行重复的「允许集合不足」
+const DEAD_ROUNDS: u32 = 30;
+/// 空转档的判定间隔
+const DEAD_GAP: Duration = Duration::from_secs(30);
 /// 活跃判定最多读取的进程数，避免一次 tick 打爆 /proc
 const MAX_ACTIVE_PIDS: usize = 8;
 /// 决策环形缓冲保留条数
@@ -386,7 +392,11 @@ impl SchedState {
         // 连续几轮如此就降频，情况一变（规则改成跨簇、或出现可让位线程）
         // idle_rounds 会清零并立刻恢复每秒判定
         if self.should_idle(Instant::now()) {
-            self.state = "规则单簇，判定已降频";
+            self.state = if self.idle_rounds >= DEAD_ROUNDS {
+                "规则单簇，判定已休眠"
+            } else {
+                "规则单簇，判定已降频"
+            };
             return Vec::new();
         }
 
@@ -432,10 +442,15 @@ impl SchedState {
 
     /// 是否该跳过本轮采样。降频只影响采样频率，不影响判定结果
     fn should_idle(&self, now: Instant) -> bool {
+        let gap = if self.idle_rounds >= DEAD_ROUNDS {
+            DEAD_GAP
+        } else {
+            IDLE_GAP
+        };
         self.idle_rounds >= IDLE_ROUNDS
             && self
                 .last_decide
-                .is_some_and(|t| now.duration_since(t) < IDLE_GAP)
+                .is_some_and(|t| now.duration_since(t) < gap)
     }
 
     /// 用给定负载推进一轮判定。测试直接调用，生产由 `tick` 采样后转发。
@@ -992,6 +1007,7 @@ mod tests {
         crate::cache::TaskEntry {
             pid: 100,
             pkg: pkg.to_string(),
+            want: cpus,
             cpus,
             cpuset_dir: String::new(),
             is_thread_rule: false,
@@ -1316,6 +1332,7 @@ mod tests {
             crate::cache::TaskEntry {
                 pid: 100,
                 pkg: "com.test.game".to_string(),
+                want: allowed,
                 cpus: allowed,
                 cpuset_dir: String::new(),
                 is_thread_rule: false,
@@ -1460,6 +1477,7 @@ mod tests {
             crate::cache::TaskEntry {
                 pid: 100,
                 pkg: "com.test.game".into(),
+                want: cpus,
                 cpus,
                 cpuset_dir: String::new(),
                 is_thread_rule: false,
