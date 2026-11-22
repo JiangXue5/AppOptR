@@ -752,6 +752,7 @@ fn diag_json() -> String {
             "ineffective": d.aff.ineffective,
             "stuck_skip": d.aff.stuck_skip,
             "sysgroup_skip": d.aff.sysgroup_skip,
+            "unreachable": d.aff.unreachable,
             "stuck": crate::apply_affinity::stuck_count(),
             "rule": d.aff.rule,
             "sync": d.aff.sync,

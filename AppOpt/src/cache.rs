@@ -189,23 +189,30 @@ impl ProcCache {
 
     /// 遍历 tasks 应用亲和性，返回 dead_tids 供 eBPF 调用方清理 APPLIED_MAP。
     /// 只有 ESRCH 才算退出，设置失败（EPERM/EINVAL）的线程保留在缓存里等下一轮
-    pub fn affinity_sync(&mut self, topo: &CpuTopology) -> Vec<i32> {
+    pub fn affinity_sync(&mut self, topo: &CpuTopology, respect: bool) -> Vec<i32> {
         let mut dead_tids: Vec<i32> = Vec::new();
+        let mut blocked_now = 0u64;
         for (tid, e) in self.tasks.iter_mut() {
-            // 系统分组硬限制：目标与所在组生效集合无交集，写多少次都不会生效。
-            // 但应用切前台时系统会把它移出 background，必须重新评估，
-            // 否则这个线程会被永久放弃
-            if e.blocked {
+            // 组归属每轮都重看，不只在「已被拦住」时看。应用切后台时系统会把
+            // 线程从 top-app 搬进 background(0-3)，规则却仍要 4-6，交集为空。
+            // 只在首次评估的话，线程一旦被判成「可绑」就再也不会重看，
+            // 于是切后台后每轮都硬写一次——真机日志里 `+2599s` 之后
+            // 每分钟 495 次 EINVAL、`挪簇 495` 就是这么来的。
+            // 代价是每 60 秒每个受管线程读一次 /proc/<tid>/cgroup，
+            // 相比几百次注定失败的 sched_setaffinity 便宜得多
+            if respect {
                 let group = crate::cpuset::thread_group(*tid);
-                if group == e.group {
-                    continue;
+                if group != e.group || !e.blocked {
+                    e.group = group;
+                    e.blocked = background_blocked(*tid, &e.cpus, group);
                 }
-                e.group = group;
-                e.blocked = background_blocked(*tid, &e.cpus, group);
-                if e.blocked {
-                    continue;
-                }
-                e.applied = false;
+            } else if e.blocked {
+                // 配置改成 takeover 后要能立刻恢复绑定，不必重启
+                e.blocked = false;
+            }
+            if e.blocked {
+                blocked_now += 1;
+                continue;
             }
             // 还没绑上过的线程走首次绑定语义，只有绑定过的才做「被改写」判定
             let reason = if e.applied {
@@ -227,6 +234,9 @@ impl ProcCache {
         }
         for tid in &dead_tids {
             self.task_del(*tid);
+        }
+        if blocked_now > 0 {
+            crate::diag::note_sysgroup_batch(blocked_now);
         }
         dead_tids
     }

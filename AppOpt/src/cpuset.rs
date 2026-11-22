@@ -2,6 +2,7 @@ use std::ffi::CString;
 use std::fmt::Write as _;
 use std::fs;
 use std::io;
+use std::io::Write as _;
 
 use std::sync::RwLock;
 
@@ -125,9 +126,77 @@ pub fn read_effective(dir: &str) -> Option<String> {
     None
 }
 
-/// 组路径（`/top-app` 这类）对应的生效集合
+/// 读一层的 CPU 集合，返回（内容，是否 v2 布局）。
+/// 内容为空是有意义的：v2 的空 `cpuset.cpus` 表示「继承父级」，
+/// v1 的空 `cpus` 表示「本组没有 CPU」，两者语义相反，不能混
+fn read_cpus_file(dir: &str) -> Option<(String, bool)> {
+    for (name, v2) in [("cpus", false), ("cpuset.cpus", true)] {
+        if let Ok(s) = fs::read_to_string(format!("{}/{}", dir, name)) {
+            return Some((s.trim().to_string(), v2));
+        }
+    }
+    None
+}
+
+/// 按内核定义自己算生效集合：自身 `cpus` 与所有祖先 `cpus` 的交集。
+///
+/// 真机 2.3.7 的日志里 `effective` 恒为 `-`——部分 Android 内核不导出
+/// `cpuset.effective_cpus`。于是「可达性」永远未知，「尊重系统分组」这条
+/// 逻辑一次都没生效，`/background`(0-3) 的线程照样被硬写 4-6，
+/// `+2599s` 之后每分钟 495 次 EINVAL 就是这么来的。
+///
+/// 交集是内核的定义本身，读不到导出值时按定义算，结果一致，也不依赖
+/// 内核导出了哪些文件。
+pub fn effective_by_walk(root: &str, path: &str) -> Option<String> {
+    let mut levels: Vec<String> = vec![root.to_string()];
+    let mut cur = root.to_string();
+    for seg in path.trim_matches('/').split('/') {
+        if seg.is_empty() {
+            continue;
+        }
+        cur.push('/');
+        cur.push_str(seg);
+        levels.push(cur.clone());
+    }
+    let mut acc: Option<CpuSet> = None;
+    let mut saw_any = false;
+    for lv in &levels {
+        // 这一层没有 cpus 文件（尚未建的组）就跳过，不当作空集
+        let Some((raw, is_v2)) = read_cpus_file(lv) else {
+            continue;
+        };
+        saw_any = true;
+        if raw.is_empty() {
+            if is_v2 {
+                // v2 空值 = 继承父级
+                continue;
+            }
+            // v1 空值 = 本组不可运行任何任务
+            return Some(String::new());
+        }
+        let set = parse_cpu_ranges(&raw, None);
+        acc = Some(match acc {
+            Some(mut a) => {
+                a.and(&set);
+                a
+            }
+            None => set,
+        });
+    }
+    if !saw_any {
+        return None;
+    }
+    acc.map(|s| s.to_range_string())
+}
+
+/// 组路径（`/top-app` 这类）对应的生效集合。优先用内核导出值，
+/// 读不到再按父链交集自己算
 pub fn group_effective(path: &str) -> Option<String> {
-    read_effective(&format!("/dev/cpuset{}", path.trim_end_matches('/')))
+    let dir = format!("/dev/cpuset{}", path.trim_end_matches('/'));
+    if let Some(eff) = read_effective(&dir) {
+        return Some(eff);
+    }
+    effective_by_walk("/dev/cpuset", path)
 }
 
 const _: () = assert!(std::mem::size_of::<CpuSet>() == std::mem::size_of::<libc::cpu_set_t>());
@@ -348,6 +417,32 @@ pub(crate) fn create_cpuset_dir(path: &str, cpus: &str, mems: &str) -> bool {
     }
     let mems_path = format!("{}/mems", path);
     fs::write(&mems_path, mems).is_ok()
+}
+
+/// 建组自检：把自己写进 base 的 tasks 一次，成功才算真的能用。
+///
+/// 真机上出现过「mkdir、写 cpus/mems 全部成功，但写 tasks 一直 EINVAL、
+/// `cpuset.effective_cpus` 也读不到」的情况——文件都在，cgroup 却不接受
+/// 任何任务。不试一次就无从判断，只能每分钟撞一次失败。
+///
+/// 失败时立刻把 cpuset 关掉：剩下唯一的绑核手段是 sched_setaffinity，
+/// 而它会被系统改组配置时重置，这个结论必须一次说清，而不是反复重试。
+fn probe_cpuset(base: &str) -> Result<(), String> {
+    let tid = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
+    // 自检会短暂改变自己的亲和性，先备份再恢复，不能留下副作用
+    let backup = CpuSet::get_affinity(tid);
+    let path = format!("{}/tasks", base);
+    let res = (|| {
+        let mut f = fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .map_err(|e| format!("打开失败（{}）", e))?;
+        writeln!(f, "{}", tid).map_err(|e| format!("写入失败（{}）", e))
+    })();
+    if let Some(b) = backup {
+        let _ = b.set_affinity(tid);
+    }
+    res
 }
 
 #[derive(Clone)]
@@ -660,8 +755,19 @@ pub fn init_cpu_topo() -> CpuTopology {
         .unwrap_or_else(|| "0".to_string());
     topo.mems_str = mems;
 
-    if create_cpuset_dir(&base_cpuset(), &topo.present_str, &topo.mems_str) {
-        topo.cpuset_enabled = true;
+    if !create_cpuset_dir(&base_cpuset(), &topo.present_str, &topo.mems_str) {
+        return topo;
+    }
+    match probe_cpuset(&base_cpuset()) {
+        Ok(()) => topo.cpuset_enabled = true,
+        Err(e) => {
+            // 目录建得出、文件写得进，但内核不接受任务：这台设备上
+            // cgroup 接管这条路是死的，早说清楚好过每分钟失败一次
+            crate::diag::emit(&format!(
+                "cpuset: 自检失败，{}，本机不接受 cgroup 接管线程；绑核只靠 sched_setaffinity，系统改动组配置时会被重置",
+                e
+            ));
+        }
     }
 
     topo
@@ -885,6 +991,68 @@ mod tests {
         assert_eq!(classify_group("/AppOpt/4-6"), SysGroup::Own);
         assert_eq!(classify_group("/"), SysGroup::Unknown);
         assert_eq!(classify_group("/camera-daemon"), SysGroup::Other);
+    }
+
+    /// 生效集合必须自己按父链求交集：真机 2.3.7 的日志里
+    /// `cpuset.effective_cpus` 读不到，导致「可达性」永远未知，
+    /// background(0-3) 的线程被硬写 4-6，每分钟几百次 EINVAL
+    #[test]
+    fn effective_walks_ancestors_and_intersects() {
+        let root = std::env::temp_dir().join(format!("ao_walk_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let r = root.to_str().unwrap();
+        fs::create_dir_all(root.join("AppOpt/4-6")).unwrap();
+        fs::create_dir_all(root.join("background")).unwrap();
+        fs::write(root.join("cpus"), "0-7\n").unwrap();
+        fs::write(root.join("AppOpt/cpus"), "0-7\n").unwrap();
+        fs::write(root.join("AppOpt/4-6/cpus"), "4-6\n").unwrap();
+        fs::write(root.join("background/cpus"), "0-3\n").unwrap();
+
+        assert_eq!(
+            effective_by_walk(r, "/AppOpt/4-6").as_deref(),
+            Some("4-6"),
+            "三层交集应等于最内层"
+        );
+        assert_eq!(effective_by_walk(r, "/background").as_deref(), Some("0-3"));
+        assert_eq!(effective_by_walk(r, "/").as_deref(), Some("0-7"));
+
+        // 子组超出父组时必须被裁掉，这正是「内核为什么拒绝」的依据
+        fs::write(root.join("AppOpt/4-6/cpus"), "4-9\n").unwrap();
+        assert_eq!(effective_by_walk(r, "/AppOpt/4-6").as_deref(), Some("4-7"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// v2 的空 `cpuset.cpus` 表示继承父级，v1 的空 `cpus` 表示本组
+    /// 没有 CPU。两种语义相反，判错会把「继承全核」当成「无核可用」
+    #[test]
+    fn effective_handles_v2_inheritance_and_v1_empty() {
+        let root = std::env::temp_dir().join(format!("ao_walk2_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let r = root.to_str().unwrap();
+        fs::create_dir_all(root.join("top-app")).unwrap();
+        fs::create_dir_all(root.join("empty_v1")).unwrap();
+        fs::write(root.join("cpuset.cpus"), "0-7\n").unwrap();
+        fs::write(root.join("cpuset.mems"), "0\n").unwrap();
+        fs::write(root.join("top-app/cpuset.cpus"), "\n").unwrap();
+        fs::write(root.join("empty_v1/cpus"), "\n").unwrap();
+
+        assert_eq!(
+            effective_by_walk(r, "/top-app").as_deref(),
+            Some("0-7"),
+            "v2 空值继承父级"
+        );
+        assert_eq!(
+            effective_by_walk(r, "/empty_v1").as_deref(),
+            Some(""),
+            "v1 空值表示该组不能运行任务"
+        );
+
+        // 显式值时 v2 同样要参与交集
+        fs::write(root.join("top-app/cpuset.cpus"), "4-7\n").unwrap();
+        assert_eq!(effective_by_walk(r, "/top-app").as_deref(), Some("4-7"));
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// 生效集合的文件名 v1/v2 不同，只认一种就会把所有组都判成「未知」

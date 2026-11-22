@@ -481,7 +481,7 @@ fn main() {
                 || cache.force_affinity
             {
                 // ESRCH 的线程同时收回 RT 记录，避免事件漏报时配额一直被占
-                for tid in cache.cache.affinity_sync(&cfg.topo) {
+                for tid in cache.cache.affinity_sync(&cfg.topo, cfg.sysgroup_respect) {
                     rt::forget(tid);
                 }
                 affinity_deadline = Instant::now();

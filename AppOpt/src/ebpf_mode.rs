@@ -622,7 +622,7 @@ fn event_apply(
 
 /// 定期纠正 affinity_sync 清死亡 tid
 pub fn affinity_check(state: &mut EbpfState, cfg: &AppConfig) {
-    let dead_tids = state.cache.affinity_sync(&cfg.topo);
+    let dead_tids = state.cache.affinity_sync(&cfg.topo, cfg.sysgroup_respect);
     for tid in dead_tids {
         applied_del(&mut state.bpf, tid);
         // 这里的 tid 已经 ESRCH。EXIT 事件丢失时这是唯一能收回 RT 记录与配额的路径，

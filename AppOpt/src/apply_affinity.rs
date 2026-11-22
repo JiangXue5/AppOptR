@@ -66,13 +66,18 @@ static READY_DIRS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 
 /// 连续失败多少次后暂停尝试
 const CPUSET_TRIP_FAILS: u32 = 3;
-/// 暂停时长。半开放行一次试探，避免设备只是短暂异常就永久放弃 cpuset
+/// 首次暂停时长。半开放行一次试探，避免设备只是短暂异常就永久放弃 cpuset
 const CPUSET_PAUSE: Duration = Duration::from_secs(120);
+/// 暂停上限：真机上「组不可用」是静态事实，每分钟试探一次纯属噪音，
+/// 退到 10 分钟一次，既保留自愈能力又不占日志
+const CPUSET_PAUSE_MAX: Duration = Duration::from_secs(600);
 
 struct Breaker {
     fails: u32,
     until: Option<Instant>,
     tripped: bool,
+    /// 已经熔断过几次。每多一次，暂停时长翻倍
+    trips: u32,
 }
 
 impl Breaker {
@@ -81,7 +86,15 @@ impl Breaker {
             fails: 0,
             until: None,
             tripped: false,
+            trips: 0,
         }
+    }
+
+    /// 本轮应暂停多久：120 s → 240 → 480 → 600 封顶。
+    /// 半开再失败说明不是瞬时抖动，缩短间隔只会持续撞同一个失败路径
+    fn pause(&self) -> Duration {
+        let secs = CPUSET_PAUSE.as_secs() << self.trips.min(3);
+        Duration::from_secs(secs.min(CPUSET_PAUSE_MAX.as_secs()))
     }
 
     /// 是否允许再尝试写 cpuset。暂停到期后放行一次（半开），成功则彻底恢复
@@ -105,7 +118,9 @@ impl Breaker {
         // 半开试探再失败只延长暂停，不重复刷同一条熔断日志
         let announce = !self.tripped;
         self.tripped = true;
-        self.until = Some(now + CPUSET_PAUSE);
+        let pause = self.pause();
+        self.trips = self.trips.saturating_add(1);
+        self.until = Some(now + pause);
         announce
     }
 
@@ -129,9 +144,12 @@ fn cpuset_ok() {
 }
 
 fn cpuset_failed(err: Option<i32>) {
-    let announce = lock_ignore_poison(&BREAKER).failed(Instant::now());
+    let mut b = lock_ignore_poison(&BREAKER);
+    let announce = b.failed(Instant::now());
+    let pause = b.pause();
+    drop(b);
     if announce {
-        diag::note_cpuset_tripped(err, CPUSET_TRIP_FAILS, CPUSET_PAUSE);
+        diag::note_cpuset_tripped(err, CPUSET_TRIP_FAILS, pause);
     }
 }
 
@@ -222,7 +240,7 @@ pub fn reset_cpuset_dir_cache() {
 /// 把 tid 挂到 cpuset 子目录，目录缺失时重建一次（外部删除兜底）。
 /// 失败原因必须带出去：cpuset 写不进去时只剩 sched_setaffinity 兜底，
 /// 这往往就是「有时绑得住、有时绑不住」的那一半
-fn write_task(dir: &str, tid: i32, topo: &CpuTopology) -> Result<(), i32> {
+fn write_task(dir: &str, tid: i32, topo: &CpuTopology) -> Result<(), CpusetFail> {
     let base = base_cpuset();
     let path = if dir.is_empty() {
         format!("{}/tasks", base)
@@ -239,11 +257,11 @@ fn write_task(dir: &str, tid: i32, topo: &CpuTopology) -> Result<(), i32> {
 
     // base 目录由 init_cpu_topo 负责，这里只追加 tasks
     if dir.is_empty() {
-        return append(&path).map_err(errno);
+        return append(&path).map_err(|e| CpusetFail::Base(errno(e)));
     }
     if !dir_ready(dir, topo) {
         // 建不出目录（只读/权限），按原行为仅靠 sched_setaffinity
-        return Err(0);
+        return Err(CpusetFail::NoDir);
     }
     let first = match append(&path) {
         Ok(()) => return Ok(()),
@@ -253,9 +271,9 @@ fn write_task(dir: &str, tid: i32, topo: &CpuTopology) -> Result<(), i32> {
     if first == libc::ENOENT {
         dir_invalidate(dir);
         return if dir_ready(dir, topo) {
-            append(&path).map_err(errno)
+            append(&path).map_err(|e| CpusetFail::Target(errno(e)))
         } else {
-            Err(0)
+            Err(CpusetFail::NoDir)
         };
     }
     // EINVAL 不是权限问题：内核 cpuset_can_attach 要求线程「当前允许的 CPU」
@@ -263,10 +281,45 @@ fn write_task(dir: &str, tid: i32, topo: &CpuTopology) -> Result<(), i32> {
     // 规则却要 4-6 时交集为空，写一万次都是 EINVAL。
     // 先写 base（全核，与任何线程都有交集，必然成功）把线程抬出来，
     // 第二次写目标组就有交集了。中间是毫秒级窗口，好过一直绑不上
-    if first == libc::EINVAL && append(&format!("{}/tasks", base)).is_ok() {
-        return append(&path).map_err(errno);
+    if first == libc::EINVAL {
+        // 连 base 都失败，说明问题在挂载或权限，与目标集合无关；
+        // 这一区分决定了用户该改规则还是改模块安装方式
+        if append(&format!("{}/tasks", base)).is_err() {
+            return Err(CpusetFail::Base(first));
+        }
+        return append(&path).map_err(|e| CpusetFail::Target(errno(e)));
     }
-    Err(first)
+    Err(CpusetFail::Target(first))
+}
+
+/// cpuset 写入失败的三种形态。它们的处理方式完全不同，混成一句
+/// 「写入失败」等于什么都没说：
+/// - `NoDir`：模块没权限建组，重试无用，只能改安装或 SELinux
+/// - `Base`：连全核 base 都写不进去，是挂载/权限问题
+/// - `Target`：base 成功而目标组仍拒绝，说明该组的生效集合为空，
+///   或与线程原组无交集——改规则或迁出原组才有出路
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum CpusetFail {
+    NoDir,
+    Base(i32),
+    Target(i32),
+}
+
+impl CpusetFail {
+    pub(crate) fn errno(self) -> Option<i32> {
+        match self {
+            CpusetFail::NoDir => None,
+            CpusetFail::Base(e) | CpusetFail::Target(e) => Some(e),
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            CpusetFail::NoDir => "目录未建成（权限或只读挂载）",
+            CpusetFail::Base(_) => "连 base 全核都写不进去（挂载或权限）",
+            CpusetFail::Target(_) => "已抬到 base 组，目标组仍拒绝（生效集合为空或与原组无交集）",
+        }
+    }
 }
 
 /// 亲和性写入结果。必须把「线程已退出」和「设置失败」分开：
@@ -327,13 +380,9 @@ pub fn affinity_apply(
     {
         match write_task(dir, tid, topo) {
             Ok(()) => cpuset_ok(),
-            Err(e) => {
-                diag::note_cpuset_failure(
-                    tid,
-                    if dir.is_empty() { "<base>" } else { dir },
-                    (e != 0).then_some(e),
-                );
-                cpuset_failed((e != 0).then_some(e));
+            Err(f) => {
+                diag::note_cpuset_failure(tid, if dir.is_empty() { "<base>" } else { dir }, f);
+                cpuset_failed(f.errno());
             }
         }
     }

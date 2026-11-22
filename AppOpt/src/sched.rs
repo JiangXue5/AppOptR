@@ -41,6 +41,11 @@ const LOAD_GAP: i32 = 150;
 const MAX_MOVES: usize = 1;
 /// 单轮最多检查的线程数，超出部分由游标轮转覆盖
 const MAX_PROBE: usize = 64;
+/// 连续多少轮「全部因允许集合不足而跳过」后开始降频
+const IDLE_ROUNDS: u32 = 5;
+/// 降频后的判定间隔。规则只覆盖单簇时，每秒 64 次 /proc 读取换来的
+/// 结论永远是「无事可做」，这份开销本身就是掉帧来源之一
+const IDLE_GAP: Duration = Duration::from_secs(8);
 /// 活跃判定最多读取的进程数，避免一次 tick 打爆 /proc
 const MAX_ACTIVE_PIDS: usize = 8;
 /// 决策环形缓冲保留条数
@@ -299,6 +304,10 @@ pub struct SchedState {
     /// pid -> utime+stime，用于活跃判定
     active: HashMap<i32, u64>,
     ring: VecDeque<String>,
+    /// 连续「全部跳过、零迁移」的轮数，用于判断判定是否在白跑
+    idle_rounds: u32,
+    /// 上一次真正做判定的时刻，降频时用
+    last_decide: Option<Instant>,
     /// 轮转游标，保证线程数超过 MAX_PROBE 时仍能全覆盖
     cursor: usize,
     /// 活跃判定的轮转游标：被管理 pid 超过 MAX_ACTIVE_PIDS 时
@@ -319,6 +328,8 @@ impl SchedState {
             mode: SchedMode::Off,
             ticks: 0,
             probed: 0,
+            idle_rounds: 0,
+            last_decide: None,
             would: 0,
             moved: 0,
             failed: 0,
@@ -368,6 +379,14 @@ impl SchedState {
         if cache.tasks.is_empty() {
             self.state = "等待被管理进程";
             self.prev = None;
+            self.idle_rounds = 0;
+            return Vec::new();
+        }
+        // 规则只覆盖单簇时，每轮 64 次 /proc 读取的结论都是「无事可做」。
+        // 连续几轮如此就降频，情况一变（规则改成跨簇、或出现可让位线程）
+        // idle_rounds 会清零并立刻恢复每秒判定
+        if self.should_idle(Instant::now()) {
+            self.state = "规则单簇，判定已降频";
             return Vec::new();
         }
 
@@ -387,7 +406,36 @@ impl SchedState {
             return Vec::new();
         }
         self.state = "运行中";
-        self.tick_at(cfg, cache, load, Instant::now())
+        let before_allow = self.skip[SKIP_ALLOW];
+        let probed_now = cache.tasks.len().min(MAX_PROBE) as u64;
+        let moves = self.tick_at(cfg, cache, load, Instant::now());
+        self.last_decide = Some(Instant::now());
+        // 本轮的跳过如果全部来自「允许集合不足两层」，说明规则本身就是单簇，
+        // 不是负载不达标——这种白跑会持续到规则改变为止
+        self.note_round(
+            probed_now,
+            self.skip[SKIP_ALLOW].saturating_sub(before_allow),
+            !moves.is_empty(),
+        );
+        moves
+    }
+
+    /// 一轮判定后更新「白跑」计数。只有「探到了线程、一个都没迁、
+    /// 且跳过原因全是允许集合不足」才算白跑；负载不达标属于正常判定
+    fn note_round(&mut self, probed_now: u64, skipped_allow: u64, moved: bool) {
+        if probed_now > 0 && !moved && skipped_allow >= probed_now {
+            self.idle_rounds = self.idle_rounds.saturating_add(1);
+        } else {
+            self.idle_rounds = 0;
+        }
+    }
+
+    /// 是否该跳过本轮采样。降频只影响采样频率，不影响判定结果
+    fn should_idle(&self, now: Instant) -> bool {
+        self.idle_rounds >= IDLE_ROUNDS
+            && self
+                .last_decide
+                .is_some_and(|t| now.duration_since(t) < IDLE_GAP)
     }
 
     /// 用给定负载推进一轮判定。测试直接调用，生产由 `tick` 采样后转发。
@@ -870,6 +918,31 @@ pub const fn sample_period() -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 规则只覆盖单簇时，S7 每秒仍在扫 64 个线程。连续几轮全跳过必须降频，
+    /// 否则「开了 S7 就掉帧」里有一部分就是 S7 自己在读 /proc
+    #[test]
+    fn idle_rounds_throttle_single_cluster_rules() {
+        let mut st = SchedState::new();
+        let t0 = Instant::now();
+        // 5 轮：探到 64 个、全部因允许集合跳过、零迁移
+        for _ in 0..IDLE_ROUNDS {
+            st.note_round(64, 64, false);
+        }
+        st.last_decide = Some(t0);
+        assert!(st.should_idle(t0 + Duration::from_secs(1)), "应进入降频");
+        // 降频间隔过后要放行一轮，保留自愈能力
+        assert!(!st.should_idle(t0 + IDLE_GAP + Duration::from_secs(1)));
+
+        // 只要出现一次真实迁移，立刻恢复每秒判定
+        st.note_round(64, 0, true);
+        assert_eq!(st.idle_rounds, 0);
+        assert!(!st.should_idle(t0 + Duration::from_secs(1)));
+
+        // 负载不达标不是「白跑」：那是策略在正常工作，不该降频
+        st.note_round(64, 0, false);
+        assert_eq!(st.idle_rounds, 0);
+    }
     use crate::config::SchedScope;
 
     fn topo() -> CpuTopology {

@@ -87,6 +87,9 @@ pub struct AffinityStats {
     pub stuck_skip: u64,
     /// 线程被系统放在后台组、规则目标不在该组内而主动跳过的次数
     pub sysgroup_skip: u64,
+    /// 目标集合与线程所在组的生效集合没有交集：内核必然拒绝，
+    /// 计成「挪簇」会让人以为线程被搬了几百次，实际是几百次失败
+    pub unreachable: u64,
     /// 按原因拆分
     pub rule: u64,
     pub sync: u64,
@@ -132,6 +135,9 @@ struct Sink {
     drift_kind: [u64; 3],
     /// 本周期因系统后台组跳过的次数
     sysgroup_since_summary: u64,
+    /// 本周期「目标与所在组无交集」的次数与首个样例
+    unreachable_since_summary: u64,
+    unreachable_sample: Option<(String, i32, String, String)>,
     /// 已经说明过的组，同类只播报一次
     sysgroup_announced: HashSet<SysGroup>,
     /// 本周期「写后回读仍不一致」的样本与计数
@@ -146,6 +152,9 @@ struct Sink {
     last_snap: Option<SchedSnapshot>,
     /// 上一次即时打印漂移样例的时刻
     last_drift_log: Instant,
+    /// 「规则只覆盖一个簇」这条说明已经给过：它是静态结论，
+    /// 每 60 秒重复一遍只会把真正变化的行挤掉
+    allow_hint_shown: bool,
 }
 
 /// 一次「读回与期望不一致」的现场。期望/实际的组合能直接区分根因：
@@ -178,6 +187,8 @@ fn sink() -> std::sync::MutexGuard<'static, Option<Sink>> {
         drift: Vec::new(),
         drift_kind: [0; 3],
         sysgroup_since_summary: 0,
+        unreachable_since_summary: 0,
+        unreachable_sample: None,
         sysgroup_announced: HashSet::new(),
         ineffective: Vec::new(),
         ineffective_n: 0,
@@ -187,6 +198,7 @@ fn sink() -> std::sync::MutexGuard<'static, Option<Sink>> {
         last_snap: None,
         // 首条漂移立即打印，不因初始化时刻被 30 秒节流挡住
         last_drift_log: now.checked_sub(DRIFT_LOG_GAP).unwrap_or(now),
+        allow_hint_shown: false,
     });
     guard
 }
@@ -324,20 +336,22 @@ fn unreachable_note(tid: i32, want: &CpuSet) -> Option<String> {
 /// 但如果设备上 cpuset 只读又叠加应用自己改亲和性，就会表现为绑不住。
 /// 首次失败（以及每 5 分钟）打一次完整现场：只报 errno 说不清是目录没建成、
 /// 父级 cpus 为空，还是线程原本就在别的 cpuset 里
-pub fn note_cpuset_failure(tid: i32, dir: &str, err: Option<i32>) {
+pub fn note_cpuset_failure(tid: i32, dir: &str, fail: crate::apply_affinity::CpusetFail) {
     let mut guard = sink();
     let Some(s) = guard.as_mut() else { return };
     s.stats.cpuset_fail += 1;
     s.cpuset_since_summary += 1;
-    let line = match err {
+    let line = match fail.errno() {
         Some(e) => format!(
-            "cpuset: 写入 {}/tasks 失败（{}），本次只靠绑核",
+            "cpuset: 写入 {}/tasks 失败（{}；{}），本次只靠绑核",
             dir,
-            errno_hint(e)
+            errno_hint(e),
+            fail.label()
         ),
         None => format!(
-            "cpuset: 写入 {}/tasks 失败（目录未建成），本次只靠绑核",
-            dir
+            "cpuset: 写入 {}/tasks 失败（{}），本次只靠绑核",
+            dir,
+            fail.label()
         ),
     };
     push_event(s, line.clone());
@@ -436,6 +450,25 @@ pub fn note_cpuset_tripped(err: Option<i32>, fails: u32, pause: Duration) {
     }
 }
 
+/// 目标集合与线程所在 cgroup 的生效集合是否完全无交集。
+/// 无交集时内核在 `cpuset_can_attach` 与 `sched_setaffinity` 两处都返回
+/// EINVAL，写多少次都不会生效，唯一的出路是改规则或把线程迁出该组
+fn unreachable_group(tid: i32, want: &CpuSet) -> bool {
+    let Some(path) = crate::cpuset::thread_cgroup(tid) else {
+        return false;
+    };
+    let Some(eff) = crate::cpuset::group_effective(&path) else {
+        return false;
+    };
+    let eff_set = crate::cpuset::parse_cpu_ranges(&eff, None);
+    if eff_set.count() == 0 {
+        return false;
+    }
+    let mut inter = *want;
+    inter.and(&eff_set);
+    inter.count() == 0
+}
+
 /// 校验时读回与期望不一致：记录分类与现场样本。
 /// 分类比数字有用——「实际是期望的子集」和「实际变回全核」是两种完全不同的故障
 pub fn note_drift(tid: i32, comm: &str, expect: &CpuSet, actual: &CpuSet) {
@@ -446,8 +479,24 @@ pub fn note_drift(tid: i32, comm: &str, expect: &CpuSet, actual: &CpuSet) {
     } else {
         DriftKind::Shifted
     };
+    // 判定要读 /proc 与 cgroup，放在持锁之前。只有「互不包含」才可能
+    // 是「目标与所在组无交集」，另外两类本身就在同一个组里，不可能不可达
+    let unreachable = kind == DriftKind::Shifted && unreachable_group(tid, expect);
     let mut guard = sink();
     let Some(s) = guard.as_mut() else { return };
+    if unreachable {
+        s.stats.unreachable += 1;
+        s.unreachable_since_summary += 1;
+        if s.unreachable_sample.is_none() {
+            s.unreachable_sample = Some((
+                comm.to_string(),
+                tid,
+                expect.to_range_string(),
+                read_thread_cpuset(tid),
+            ));
+        }
+        return;
+    }
     match kind {
         DriftKind::Clip => {
             s.stats.clip += 1;
@@ -554,6 +603,24 @@ pub fn note_sysgroup_skip(tid: i32, comm: &str, group: SysGroup, want: &CpuSet) 
     push_event(s, line);
 }
 
+/// 校验轮里整批因系统分组被跳过。逐线程播报会把日志刷满，
+/// 这里只累加计数，并在首次给出一次结论
+pub fn note_sysgroup_batch(n: u64) {
+    let mut guard = sink();
+    let Some(s) = guard.as_mut() else { return };
+    s.stats.sysgroup_skip += n;
+    s.sysgroup_since_summary += n;
+    if !s.sysgroup_announced.insert(SysGroup::Background) {
+        return;
+    }
+    let line = format!(
+        "系统分组: {} 个线程被系统限定在后台组，规则要求的大核不在该组生效集合内，内核会拒绝绑定；已跳过（不计失败）。切回前台会自动恢复，要强制接管写 @sysgroup=takeover",
+        n
+    );
+    emit(&line);
+    push_event(s, line);
+}
+
 /// 比较一次在线 CPU 集合，变化说明发生了热插拔。
 /// cpuset 会在这个时机重算 effective_cpus 并重置组内线程的亲和性，
 /// 这是「刚才绑住了、过一会儿又散了」最常见的成因
@@ -627,6 +694,8 @@ pub fn periodic_summary(current: &SchedSnapshot) {
     let rewrites = std::mem::take(&mut s.rewrite_since_summary);
     let cpuset = std::mem::take(&mut s.cpuset_since_summary);
     let sysgroup = std::mem::take(&mut s.sysgroup_since_summary);
+    let unreach = std::mem::take(&mut s.unreachable_since_summary);
+    let unreach_sample = s.unreachable_sample.take();
     let kinds = std::mem::take(&mut s.drift_kind);
     let drift = std::mem::take(&mut s.drift);
     let ineff_n = std::mem::take(&mut s.ineffective_n);
@@ -680,6 +749,27 @@ pub fn periodic_summary(current: &SchedSnapshot) {
             ));
         }
     }
+    if unreach > 0 {
+        // 持续状态：只在首次给样例，之后只报计数，否则每 60 秒重复同一句
+        match unreach_sample {
+            Some((comm, tid, expect, cpuset)) => emit(&format!(
+                "不可达: 近 {} 秒 {} 个线程的目标集合与所在组无交集（累计 {}），如 {}({}) 期望 {} cpuset={}；内核会同时拒绝迁组与绑核，已跳过",
+                SUMMARY_GAP.as_secs(),
+                unreach,
+                st.unreachable,
+                comm,
+                tid,
+                expect,
+                cpuset
+            )),
+            None => emit(&format!(
+                "不可达: 近 {} 秒另有 {} 个线程的目标集合与所在组无交集（累计 {}）",
+                SUMMARY_GAP.as_secs(),
+                unreach,
+                st.unreachable
+            )),
+        }
+    }
     if sysgroup > 0 {
         emit(&format!(
             "系统分组: 近 {} 秒 {} 次因后台组跳过（累计 {}）；这些线程被系统限定在小核，不改规则就绑不上",
@@ -702,14 +792,23 @@ pub fn periodic_summary(current: &SchedSnapshot) {
             tail
         ));
     }
-    if let Some(line) = sched_period_line(prev.as_ref(), current) {
+    let mut hint = std::mem::take(&mut s.allow_hint_shown);
+    if let Some(line) = sched_period_line(prev.as_ref(), current, &mut hint) {
+        // 先释放锁再打日志，避免写 stdout 阻塞时把诊断入口一起卡住
+        s.allow_hint_shown = hint;
         emit(&line);
+    } else {
+        s.allow_hint_shown = hint;
     }
 }
 
 /// S7 周期说明。开着的策略必须能自证「在看、在判、为什么不动」，
 /// 否则用户只能看到「开了 S7 就掉帧」，却没有任何可查的因果
-fn sched_period_line(prev: Option<&SchedSnapshot>, cur: &SchedSnapshot) -> Option<String> {
+fn sched_period_line(
+    prev: Option<&SchedSnapshot>,
+    cur: &SchedSnapshot,
+    allow_hint: &mut bool,
+) -> Option<String> {
     if cur.mode == 0 {
         return None;
     }
@@ -778,7 +877,8 @@ fn sched_period_line(prev: Option<&SchedSnapshot>, cur: &SchedSnapshot) -> Optio
         Some(p) => d(cur.skip[SKIP_ALLOW], p.skip[SKIP_ALLOW]),
         None => cur.skip[SKIP_ALLOW],
     };
-    if moved == 0 && would == 0 && probed > 0 && allow_skip * 10 >= probed * 9 {
+    if moved == 0 && would == 0 && probed > 0 && allow_skip * 10 >= probed * 9 && !*allow_hint {
+        *allow_hint = true;
         line.push_str(
             "；说明：规则的允许集合都只覆盖一个簇，S7 没有可让位的目标，\
              规则写成跨簇（如 all-core）才会生效",
@@ -1101,7 +1201,8 @@ mod tests {
         cur.skip[0] = 40;
         cur.skip[1] = 7;
         cur.load = [100, 500, 200];
-        let line = sched_period_line(Some(&prev), &cur).expect("开着 S7 必须有摘要");
+        let mut hint = false;
+        let line = sched_period_line(Some(&prev), &cur, &mut hint).expect("开着 S7 必须有摘要");
         assert!(line.contains("迁移 0 次"), "{}", line);
         assert!(line.contains("跳过"), "{}", line);
         assert!(line.contains("100/500/200"), "{}", line);
@@ -1109,7 +1210,8 @@ mod tests {
         // 关闭时不产出 S7 日志，保持安静
         let mut off = cur.clone();
         off.mode = 0;
-        assert!(sched_period_line(Some(&prev), &off).is_none());
+        let mut hint2 = false;
+        assert!(sched_period_line(Some(&prev), &off, &mut hint2).is_none());
     }
 
     /// cpuset 失败时给出的现场必须包含目标/父/根三层与线程所在 cpuset，
