@@ -270,8 +270,7 @@ impl RtState {
         // 结构体字面量在部分 target 上无法编译
         let mut param: libc::sched_param = unsafe { std::mem::zeroed() };
         param.sched_priority = 1;
-        let ret =
-            unsafe { libc::sched_setscheduler(tid, libc::SCHED_RR | SCHED_RESET_ON_FORK, &param) };
+        let ret = sys_setsched(tid, libc::SCHED_RR | SCHED_RESET_ON_FORK, &param);
         if ret != 0 {
             let e = io::Error::last_os_error();
             match e.raw_os_error() {
@@ -281,6 +280,14 @@ impl RtState {
                 // 权限 / 安全策略拒绝：本进程后面每一次都会失败，熔断并清理
                 Some(libc::EPERM) | Some(libc::EACCES) => {
                     self.fuse(&format!("sched_setscheduler({}) 被拒绝（{}）", tid, e));
+                }
+                // 系统调用本身不可用（内核裁剪或 seccomp 拦截）。这不是单个线程的
+                // 参数问题，后面每个线程都会一样失败，继续重试只会刷屏
+                Some(libc::ENOSYS) => {
+                    self.fuse(&format!(
+                        "内核或安全策略不提供 sched_setscheduler（{}）",
+                        e
+                    ));
                 }
                 // 其余（EINVAL 等）多半是单个线程的参数或状态问题，
                 // 不能据此认定整个环境不可用：记录 errno，跳过该线程
@@ -467,8 +474,36 @@ fn fnmatch(pattern: &str, name: &str) -> bool {
     unsafe { libc::fnmatch(p.as_ptr(), n.as_ptr(), libc::FNM_NOESCAPE) == 0 }
 }
 
+/// 直接走 syscall 设置调度策略。
+///
+/// 不能调 `libc::sched_setscheduler`：Rust 自带的 musl 静态库
+/// （`rustlib/<target>/lib/self-contained/libc.a`）把 `sched_setscheduler`、
+/// `sched_setparam`、`sched_getscheduler` 编成了「直接返回 -ENOSYS」的桩，
+/// 反汇编里就是 `mov x0, #-0x26; ret`。静态链接后这些桩会顶替真正的实现，
+/// 于是设备上每次提升都失败，而且桩不设 errno，只能看到一堆 `os error 38`
+/// （"Function not implemented"），看起来像内核不支持实时调度。
+fn sys_setsched(tid: i32, policy: libc::c_int, param: &libc::sched_param) -> libc::c_int {
+    unsafe {
+        libc::syscall(
+            libc::SYS_sched_setscheduler as libc::c_long,
+            tid as libc::c_long,
+            policy as libc::c_long,
+            param as *const libc::sched_param,
+        ) as libc::c_int
+    }
+}
+
+fn sys_getsched(tid: i32) -> libc::c_int {
+    unsafe {
+        libc::syscall(
+            libc::SYS_sched_getscheduler as libc::c_long,
+            tid as libc::c_long,
+        ) as libc::c_int
+    }
+}
+
 fn is_realtime(tid: i32) -> bool {
-    let policy = unsafe { libc::sched_getscheduler(tid) };
+    let policy = sys_getsched(tid);
     policy == libc::SCHED_FIFO || policy == libc::SCHED_RR
 }
 
@@ -493,7 +528,7 @@ fn owned_value(current: Option<u32>, applied: Option<u32>) -> bool {
 fn demote(tid: i32) -> bool {
     let mut param: libc::sched_param = unsafe { std::mem::zeroed() };
     param.sched_priority = 0;
-    unsafe { libc::sched_setscheduler(tid, libc::SCHED_OTHER, &param) == 0 }
+    sys_setsched(tid, libc::SCHED_OTHER, &param) == 0
 }
 
 fn backup_path() -> Option<PathBuf> {
@@ -1069,11 +1104,21 @@ mod tests {
         (handle, tid)
     }
 
+    /// syscall 包装的号必须与 libc 一致。号写错时内核返回 -ENOSYS，
+    /// 而 libc 在宿主机上是真实实现，正好用来对拍
+    #[test]
+    fn raw_sched_syscall_matches_libc() {
+        let me = unsafe { libc::syscall(libc::SYS_gettid) as i32 };
+        let raw = sys_getsched(me);
+        assert!(raw >= 0, "sys_getsched 未返回调度策略: {}", raw);
+        assert_eq!(raw, unsafe { libc::sched_getscheduler(me) });
+    }
+
     /// 真实线程走一遍：成功则进表并可回滚，失败则不留记录、不改策略
     #[test]
     fn promotion_outcome_matches_kernel_state() {
         let (handle, tid) = spawn_named("RenderThread");
-        let before = unsafe { libc::sched_getscheduler(tid) };
+        let before = sys_getsched(tid);
         let cfg = cfg_of(
             RtConfig {
                 scope: RtScope::Global,
@@ -1088,14 +1133,14 @@ mod tests {
         if ok {
             // 有 CAP_SYS_NICE：必须进表，且能被单独回滚
             assert!(s.own.contains_key(&tid));
-            assert_eq!(unsafe { libc::sched_getscheduler(tid) }, libc::SCHED_RR);
+            assert_eq!(sys_getsched(tid), libc::SCHED_RR);
             s.demote_all();
             assert!(!s.own.contains_key(&tid));
-            assert_eq!(unsafe { libc::sched_getscheduler(tid) }, libc::SCHED_OTHER);
+            assert_eq!(sys_getsched(tid), libc::SCHED_OTHER);
         } else {
             // EPERM：不能留记录，线程策略保持原样
             assert!(s.own.is_empty(), "失败的提升不能留下所有权记录");
-            assert_eq!(unsafe { libc::sched_getscheduler(tid) }, before);
+            assert_eq!(sys_getsched(tid), before);
         }
 
         handle.thread().unpark();
@@ -1148,7 +1193,7 @@ mod tests {
         );
         assert_eq!(s.demoted, 0, "pid 不符的旧记录不能触发降级");
         // 新线程没有策略，不能被提升，也不该被改成别的调度策略
-        assert_eq!(unsafe { libc::sched_getscheduler(tid) }, libc::SCHED_OTHER);
+        assert_eq!(sys_getsched(tid), libc::SCHED_OTHER);
 
         handle.thread().unpark();
         handle.join().unwrap();

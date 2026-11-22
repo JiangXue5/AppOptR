@@ -1,3 +1,9 @@
+### v2.3.4更新日志
+- 修复 RT 在真机上完全没生效：静态链接的 musl 把 `sched_setscheduler` /
+  `sched_getscheduler` 编成了直接返回 -ENOSYS 的桩，日志里因此一直报
+  `Function not implemented (os error 38)`。改为直接走系统调用，两个架构都验证到真实 svc
+- `ENOSYS` 不再当普通错误处理：熔断一次并写明原因，不会每个线程每轮重复刷日志
+
 ### v2.3.3更新日志
 - 修正内置的 AsoulOpt 游戏表：包名由 324 补到 333，补上 PUBG、Albion Online、
   Heaven Burns Red、Mini World、Dumb Nation 以及 Supercell 的荒野乱斗 / 部落冲突 / squad 等 9 个

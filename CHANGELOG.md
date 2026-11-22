@@ -1,5 +1,34 @@
 # AppOptR 变更记录
 
+## 2.3.4（2026-11-22）
+
+修复 RT 在真机上完全无法生效。
+
+### 根因
+
+Rust 自带的 musl 静态库（`rustlib/<target>/lib/self-contained/libc.a`）把
+`sched_setscheduler`、`sched_setparam`、`sched_getscheduler` 编成了「直接返回
+`-ENOSYS`」的桩，反汇编即 `mov x0, #-0x26; ret`。静态链接后桩顶替了真正的实现，
+每次提升都失败；桩又不设置 `errno`，日志里只能看到
+`Function not implemented (os error 38)`，看起来像内核或 ROM 不支持实时调度。
+aarch64 与 x86_64 的 `libc.a` 都有这个问题，因此 2.3.0 以来 RT 在所有设备上都没生效过。
+
+### 修复
+
+- 三个调用点改为直接 `syscall(SYS_sched_setscheduler / SYS_sched_getscheduler)`，
+  绕开这两个符号。产物反汇编已确认走真实 `svc`：aarch64 用 119 / 120，
+  x86_64 用 144 / 145
+- `ENOSYS` 归入环境级失败：熔断一次并写明原因，不再每个线程、每轮扫描重复刷日志
+- 新增 `raw_sched_syscall_matches_libc`：syscall 包装与 libc 的 `sched_getscheduler`
+  对拍，调用号写错会直接测试失败，不会静默退回桩
+
+### 验证
+
+- `cargo test`：128 passed / 0 failed / 1 ignored
+- 两个架构的 release 产物反汇编确认无 ENOSYS 桩调用；亲和性仍走 `svc` 122 / 123，未受影响
+- 真机 RT 是否实际提升仍需装上后看日志里是否出现 `RT: 已提升`，并用
+  `cat /proc/<tid>/stat` 第 41 个字段或 `chrt -p <tid>` 复核
+
 ## 2.3.3（2026-11-21）
 
 修正 AsoulOpt 内置表的迁移结果。
