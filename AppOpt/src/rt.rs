@@ -713,6 +713,8 @@ mod tests {
             is_thread_rule: false,
             comm: comm.to_string(),
             applied: true,
+            group: crate::cpuset::SysGroup::Unknown,
+            blocked: false,
         }
     }
 

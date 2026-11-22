@@ -30,6 +30,106 @@ pub fn base_cpuset() -> String {
         .unwrap_or_else(|| "/dev/cpuset/AppOpt".to_string())
 }
 
+/// base 目录的最后一段，用来把「自己的组」和系统组分开
+fn base_name() -> String {
+    base_cpuset()
+        .rsplit('/')
+        .next()
+        .unwrap_or("AppOpt")
+        .to_string()
+}
+
+/// 线程所在的 cpuset 组。Android 在组配置变化时会把组内线程的亲和性
+/// 强制收敛到组生效集合，这是「刚绑上又变回去」最主要的来源：
+/// 不接管组，任何 sched_setaffinity 都会被下一次收敛覆盖
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub enum SysGroup {
+    #[default]
+    Unknown,
+    /// AppOpt 自己建的组，系统不会碰
+    Own,
+    TopApp,
+    Foreground,
+    /// background / system-background / restricted：系统有意压在小核
+    Background,
+    Other,
+}
+
+impl SysGroup {
+    pub fn is_background(self) -> bool {
+        self == SysGroup::Background
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SysGroup::Own => "AppOpt",
+            SysGroup::TopApp => "top-app",
+            SysGroup::Foreground => "foreground",
+            SysGroup::Background => "后台组",
+            SysGroup::Other => "其他组",
+            SysGroup::Unknown => "未知",
+        }
+    }
+}
+
+/// 读线程所在 cpuset 组路径。cgroup v1 形如 `3:cpuset:/top-app`，
+/// v2 形如 `0::/top-app`，两种都要认
+pub fn thread_cgroup(tid: i32) -> Option<String> {
+    let raw = fs::read_to_string(format!("/proc/{}/cgroup", tid)).ok()?;
+    for line in raw.lines() {
+        let mut it = line.splitn(3, ':');
+        let _id = it.next()?;
+        let ctrl = it.next()?;
+        let path = it.next()?;
+        // v2 的控制器列为空；v1 只有 cpuset 那一行才是我们要的
+        if ctrl.is_empty() || ctrl.split(',').any(|c| c == "cpuset") {
+            return Some(path.trim().to_string());
+        }
+    }
+    None
+}
+
+/// 按组路径归类。只看第一段，子组（如 /foreground/bg）跟随父组语义
+pub fn classify_group(path: &str) -> SysGroup {
+    let p = path.trim_matches('/');
+    let base = base_name();
+    if !base.is_empty() && (p == base || p.starts_with(&format!("{}/", base))) {
+        return SysGroup::Own;
+    }
+    match p.split('/').next().unwrap_or("") {
+        "top-app" => SysGroup::TopApp,
+        "foreground" => SysGroup::Foreground,
+        "background" | "system-background" | "restricted" => SysGroup::Background,
+        "" => SysGroup::Unknown,
+        _ => SysGroup::Other,
+    }
+}
+
+pub fn thread_group(tid: i32) -> SysGroup {
+    thread_cgroup(tid)
+        .map(|p| classify_group(&p))
+        .unwrap_or(SysGroup::Unknown)
+}
+
+/// 生效集合的文件名：v1 是 `cpuset.effective_cpus`，v2 是 `cpuset.cpus.effective`。
+/// 只读其中一个会让现场信息永远是 `-`，而这一格恰好是判断「不可达」的关键
+pub fn read_effective(dir: &str) -> Option<String> {
+    for name in ["cpuset.effective_cpus", "cpuset.cpus.effective"] {
+        if let Ok(s) = fs::read_to_string(format!("{}/{}", dir, name)) {
+            let t = s.trim();
+            if !t.is_empty() {
+                return Some(t.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// 组路径（`/top-app` 这类）对应的生效集合
+pub fn group_effective(path: &str) -> Option<String> {
+    read_effective(&format!("/dev/cpuset{}", path.trim_end_matches('/')))
+}
+
 const _: () = assert!(std::mem::size_of::<CpuSet>() == std::mem::size_of::<libc::cpu_set_t>());
 
 #[repr(C)]
@@ -769,5 +869,46 @@ mod tests {
         assert_eq!(h, set(&[2, 3]));
         assert_eq!(src, "capacity");
         assert!(degraded);
+    }
+
+    /// Android 的 cpuset 组名决定线程能不能上大核，分类错一个，
+    /// 「尊重系统分组」就会误伤前台线程或白放过后台线程
+    #[test]
+    fn group_classification_covers_android_sets() {
+        assert_eq!(classify_group("/top-app"), SysGroup::TopApp);
+        assert_eq!(classify_group("/foreground"), SysGroup::Foreground);
+        assert_eq!(classify_group("/foreground/bg"), SysGroup::Foreground);
+        assert_eq!(classify_group("/background"), SysGroup::Background);
+        assert_eq!(classify_group("/system-background"), SysGroup::Background);
+        assert_eq!(classify_group("/restricted"), SysGroup::Background);
+        assert_eq!(classify_group("/AppOpt"), SysGroup::Own);
+        assert_eq!(classify_group("/AppOpt/4-6"), SysGroup::Own);
+        assert_eq!(classify_group("/"), SysGroup::Unknown);
+        assert_eq!(classify_group("/camera-daemon"), SysGroup::Other);
+    }
+
+    /// 生效集合的文件名 v1/v2 不同，只认一种就会把所有组都判成「未知」
+    #[test]
+    fn effective_reads_both_cgroup_layouts() {
+        let dir = std::env::temp_dir().join(format!("ao_eff_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        fs::write(dir.join("cpuset.effective_cpus"), "0-3\n").unwrap();
+        assert_eq!(
+            read_effective(dir.to_str().unwrap()).as_deref(),
+            Some("0-3")
+        );
+
+        fs::remove_file(dir.join("cpuset.effective_cpus")).unwrap();
+        fs::write(dir.join("cpuset.cpus.effective"), "4-7\n").unwrap();
+        assert_eq!(
+            read_effective(dir.to_str().unwrap()).as_deref(),
+            Some("4-7")
+        );
+
+        fs::remove_file(dir.join("cpuset.cpus.effective")).unwrap();
+        assert_eq!(read_effective(dir.to_str().unwrap()), None);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

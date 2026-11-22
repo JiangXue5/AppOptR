@@ -9,7 +9,7 @@
 //!
 //! 设计上不做采样线程、不写文件：诊断依附主循环，关掉 S7 后除计数外零开销。
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -17,15 +17,18 @@ use std::time::{Duration, Instant};
 
 use crate::apply_affinity::ApplyReason;
 use crate::cache::ProcCache;
-use crate::cpuset::CpuSet;
+use crate::cpuset::{CpuSet, SysGroup};
 use crate::lock_ignore_poison;
 use crate::roles::{Role, role_of};
-use crate::sched::{SKIP_LABELS, SchedSnapshot};
+use crate::sched::{SKIP_ALLOW, SKIP_LABELS, SchedSnapshot};
 
 /// 事件环上限。比 S7 的 8 条更宽一点，够看清一次抖动的前后因果
 const EVENT_CAP: usize = 12;
 /// 失败日志最小间隔，避免一个必然失败的线程每秒刷屏
 const FAIL_LOG_GAP: Duration = Duration::from_secs(5);
+/// 同一线程的同一 errno 单独节流。「线程在后台组、目标在大核」是持续状态，
+/// 每 5 秒重复一遍只会把真正有用的行挤掉
+const FAIL_LOG_GAP_TID: Duration = Duration::from_secs(60);
 /// 周期摘要间隔
 pub const SUMMARY_GAP: Duration = Duration::from_secs(60);
 /// 卡顿信号阈值：Critical 线程单次就绪等待均值超过它才上报
@@ -82,6 +85,8 @@ pub struct AffinityStats {
     pub ineffective: u64,
     /// 因上述原因被跳过重绑的次数
     pub stuck_skip: u64,
+    /// 线程被系统放在后台组、规则目标不在该组内而主动跳过的次数
+    pub sysgroup_skip: u64,
     /// 按原因拆分
     pub rule: u64,
     pub sync: u64,
@@ -113,6 +118,8 @@ struct Sink {
     stats: AffinityStats,
     events: VecDeque<String>,
     last_fail_log: Option<(i32, Instant)>,
+    /// 每条线程各自的最近一次失败播报，避免持续失败刷屏
+    fail_tid: HashMap<(i32, i32), Instant>,
     last_summary: Instant,
     last_jank_log: Instant,
     /// 本轮摘要周期内新增的失败数，用于决定要不要打摘要
@@ -123,6 +130,10 @@ struct Sink {
     drift: Vec<Drift>,
     /// 本周期漂移的分类计数：裁剪 / 重置 / 挪簇
     drift_kind: [u64; 3],
+    /// 本周期因系统后台组跳过的次数
+    sysgroup_since_summary: u64,
+    /// 已经说明过的组，同类只播报一次
+    sysgroup_announced: HashSet<SysGroup>,
     /// 本周期「写后回读仍不一致」的样本与计数
     ineffective: Vec<Drift>,
     ineffective_n: u64,
@@ -158,6 +169,7 @@ fn sink() -> std::sync::MutexGuard<'static, Option<Sink>> {
         stats: AffinityStats::default(),
         events: VecDeque::new(),
         last_fail_log: None,
+        fail_tid: HashMap::new(),
         last_summary: now,
         last_jank_log: now,
         fail_since_summary: 0,
@@ -165,6 +177,8 @@ fn sink() -> std::sync::MutexGuard<'static, Option<Sink>> {
         cpuset_since_summary: 0,
         drift: Vec::new(),
         drift_kind: [0; 3],
+        sysgroup_since_summary: 0,
+        sysgroup_announced: HashSet::new(),
         ineffective: Vec::new(),
         ineffective_n: 0,
         stuck_skip: 0,
@@ -252,15 +266,58 @@ pub fn note_failure(tid: i32, comm: &str, want: &CpuSet, errno: i32) {
     }
     push_event(s, line.clone());
 
-    // 同一 errno 每 5 秒最多一条；换了 errno 立即打，方便一次看清不同原因
-    let should_log = match s.last_fail_log {
-        Some((last_errno, at)) => last_errno != errno || at.elapsed() >= FAIL_LOG_GAP,
-        None => true,
-    };
-    if should_log {
-        emit(&line);
-        s.last_fail_log = Some((errno, Instant::now()));
+    // 两层节流：全局 5 秒一条防大面积刷屏；同一线程同一 errno 60 秒一条，
+    // 因为「线程被系统固定在后台组」不会因为多写一次日志就改变
+    let now = Instant::now();
+    let global_due = s
+        .last_fail_log
+        .is_none_or(|(_, at)| now.duration_since(at) >= FAIL_LOG_GAP);
+    let tid_due = s
+        .fail_tid
+        .get(&(tid, errno))
+        .is_none_or(|at| now.duration_since(*at) >= FAIL_LOG_GAP_TID);
+    if !(global_due && tid_due) {
+        return;
     }
+    emit(&line);
+    s.last_fail_log = Some((errno, now));
+    s.fail_tid.insert((tid, errno), now);
+    if s.fail_tid.len() > 256 {
+        s.fail_tid
+            .retain(|_, at| now.duration_since(*at) < FAIL_LOG_GAP_TID);
+    }
+    // EINVAL 里最常见的一类不是权限，而是线程所在组的生效集合与目标无交集。
+    // 只报「目标集合非法」等于没说，必须把线程被固定在哪一组写出来
+    if errno == libc::EINVAL
+        && let Some(why) = unreachable_note(tid, want)
+    {
+        push_event(s, why.clone());
+        emit(&why);
+    }
+}
+
+/// 线程「绑不上」的系统侧原因：所在 cgroup 的生效集合与目标没有交集时，
+/// 内核会同时拒绝 cgroup 迁移与 sched_setaffinity，改规则之外没有别的出路
+fn unreachable_note(tid: i32, want: &CpuSet) -> Option<String> {
+    let path = crate::cpuset::thread_cgroup(tid)?;
+    let eff = crate::cpuset::group_effective(&path)?;
+    let eff_set = crate::cpuset::parse_cpu_ranges(&eff, None);
+    if eff_set.count() == 0 {
+        return None;
+    }
+    let mut inter = *want;
+    inter.and(&eff_set);
+    if inter.count() > 0 {
+        return None;
+    }
+    let group = crate::cpuset::classify_group(&path);
+    Some(format!(
+        "原因: 线程在 {}({})，与目标 {} 无交集，属系统分组限制；要绑到大核必须先把线程迁出该组",
+        path,
+        eff,
+        want.to_range_string()
+    ))
+    .map(|s| format!("{}（{}）", s, group.label()))
 }
 
 /// cpuset 目录写入失败。真相是「绑核还有 sched_setaffinity 兜底」，
@@ -316,27 +373,48 @@ fn cpuset_detail(dir: &str, tid: i32) -> Vec<String> {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "-".to_string())
     };
+    // v1 与 v2 的生效集合文件名不同，只读一种会让这一格永远是 `-`，
+    // 而它恰好是判断「内核为什么不接受」的唯一依据
+    let eff = |p: &str| crate::cpuset::read_effective(p).unwrap_or_else(|| "-".to_string());
+    let group_path = crate::cpuset::thread_cgroup(tid).unwrap_or_else(|| "-".to_string());
+    let group_eff = crate::cpuset::group_effective(&group_path).unwrap_or_else(|| "-".to_string());
+    let group = crate::cpuset::classify_group(&group_path);
+    let target_cpus = read(&format!("{}/cpus", target));
+    let reachable = if group_eff == "-" || target_cpus == "-" {
+        "可达性未知（读不到生效集合）"
+    } else {
+        let mut inter = crate::cpuset::parse_cpu_ranges(&target_cpus, None);
+        inter.and(&crate::cpuset::parse_cpu_ranges(&group_eff, None));
+        if inter.count() == 0 {
+            "与目标无交集，内核必然拒绝"
+        } else {
+            "与目标有交集"
+        }
+    };
     vec![
         format!(
-            "cpuset 现场: 目标[{}] cpus={} mems={} effective_cpus={}",
+            "cpuset 现场: 目标[{}] cpus={} mems={} effective={}",
             target,
-            read(&format!("{}/cpus", target)),
+            target_cpus,
             read(&format!("{}/mems", target)),
-            read(&format!("{}/cpuset.effective_cpus", target)),
+            eff(&target),
         ),
         format!(
-            "cpuset 现场: 父[{}] cpus={} mems={} effective_cpus={}",
+            "cpuset 现场: 父[{}] cpus={} mems={} effective={}",
             base,
             read(&format!("{}/cpus", base)),
             read(&format!("{}/mems", base)),
-            read(&format!("{}/cpuset.effective_cpus", base)),
+            eff(&base),
         ),
         format!(
-            "cpuset 现场: 根[/dev/cpuset] cpus={} mems={}；线程 {} 当前 cpuset={}",
+            "cpuset 现场: 线程 {} 所在组 {}({}，{}组) {}；根[/dev/cpuset] cpus={} mems={}",
+            tid,
+            group_path,
+            group_eff,
+            group.label(),
+            reachable,
             read("/dev/cpuset/cpus"),
             read("/dev/cpuset/mems"),
-            tid,
-            read(&format!("/proc/{}/cpuset", tid)),
         ),
     ]
 }
@@ -450,6 +528,32 @@ pub fn note_stuck() {
     s.stuck_skip += 1;
 }
 
+/// 线程被系统放在后台组、规则目标又不在该组生效集合内。
+/// 这不是失败：内核对 cgroup 迁移和 sched_setaffinity 都会返回 EINVAL，
+/// 硬试只会把线程在簇之间来回踢。同类组只说明一次，其余进 60 秒摘要
+pub fn note_sysgroup_skip(tid: i32, comm: &str, group: SysGroup, want: &CpuSet) {
+    let mut guard = sink();
+    let Some(s) = guard.as_mut() else { return };
+    s.stats.sysgroup_skip += 1;
+    s.sysgroup_since_summary += 1;
+    if !s.sysgroup_announced.insert(group) {
+        return;
+    }
+    let name = if comm.is_empty() {
+        format!("tid {}", tid)
+    } else {
+        format!("{}({})", comm, tid)
+    };
+    let line = format!(
+        "系统分组: {} 在 {} 组，规则要求 {} 不在该组内，内核会拒绝绑定；已跳过（不计失败）。要强制接管写 @sysgroup=takeover",
+        name,
+        group.label(),
+        want.to_range_string()
+    );
+    emit(&line);
+    push_event(s, line);
+}
+
 /// 比较一次在线 CPU 集合，变化说明发生了热插拔。
 /// cpuset 会在这个时机重算 effective_cpus 并重置组内线程的亲和性，
 /// 这是「刚才绑住了、过一会儿又散了」最常见的成因
@@ -522,6 +626,7 @@ pub fn periodic_summary(current: &SchedSnapshot) {
     let fails = std::mem::take(&mut s.fail_since_summary);
     let rewrites = std::mem::take(&mut s.rewrite_since_summary);
     let cpuset = std::mem::take(&mut s.cpuset_since_summary);
+    let sysgroup = std::mem::take(&mut s.sysgroup_since_summary);
     let kinds = std::mem::take(&mut s.drift_kind);
     let drift = std::mem::take(&mut s.drift);
     let ineff_n = std::mem::take(&mut s.ineffective_n);
@@ -574,6 +679,14 @@ pub fn periodic_summary(current: &SchedSnapshot) {
                 d.comm, d.tid, d.expect, d.actual, d.cpuset
             ));
         }
+    }
+    if sysgroup > 0 {
+        emit(&format!(
+            "系统分组: 近 {} 秒 {} 次因后台组跳过（累计 {}）；这些线程被系统限定在小核，不改规则就绑不上",
+            SUMMARY_GAP.as_secs(),
+            sysgroup,
+            st.sysgroup_skip
+        ));
     }
     if cpuset > 0 {
         let tail = if crate::apply_affinity::cpuset_paused() {
@@ -658,6 +771,18 @@ fn sched_period_line(prev: Option<&SchedSnapshot>, cur: &SchedSnapshot) -> Optio
     };
     if !skip.is_empty() {
         line.push_str(&format!("；跳过：{}", skip));
+    }
+    // 一次都没动、且跳过几乎全是「允许集合不足两层」时，问题不在负载也不在策略，
+    // 而是规则本身没跨簇。不明说这一句，用户只能看到「开着 S7 却完全没动」
+    let allow_skip = match prev {
+        Some(p) => d(cur.skip[SKIP_ALLOW], p.skip[SKIP_ALLOW]),
+        None => cur.skip[SKIP_ALLOW],
+    };
+    if moved == 0 && would == 0 && probed > 0 && allow_skip * 10 >= probed * 9 {
+        line.push_str(
+            "；说明：规则的允许集合都只覆盖一个簇，S7 没有可让位的目标，\
+             规则写成跨簇（如 all-core）才会生效",
+        );
     }
     Some(line)
 }
@@ -1020,6 +1145,8 @@ mod tests {
                 is_thread_rule: false,
                 comm: "RenderThread".into(),
                 applied: true,
+                group: crate::cpuset::SysGroup::Unknown,
+                blocked: false,
             },
         );
         let mut s = JankSampler::new();

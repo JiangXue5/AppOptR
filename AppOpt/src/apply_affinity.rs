@@ -245,16 +245,28 @@ fn write_task(dir: &str, tid: i32, topo: &CpuTopology) -> Result<(), i32> {
         // 建不出目录（只读/权限），按原行为仅靠 sched_setaffinity
         return Err(0);
     }
-    if append(&path).is_ok() {
-        return Ok(());
-    }
+    let first = match append(&path) {
+        Ok(()) => return Ok(()),
+        Err(e) => errno(e),
+    };
     // 目录被外部删除：先失效再重建一次，重建后补写
-    dir_invalidate(dir);
-    if dir_ready(dir, topo) {
-        append(&path).map_err(errno)
-    } else {
-        Err(0)
+    if first == libc::ENOENT {
+        dir_invalidate(dir);
+        return if dir_ready(dir, topo) {
+            append(&path).map_err(errno)
+        } else {
+            Err(0)
+        };
     }
+    // EINVAL 不是权限问题：内核 cpuset_can_attach 要求线程「当前允许的 CPU」
+    // 与目标组的生效集合有交集，否则直接拒绝。线程被系统放在 background(0-3)、
+    // 规则却要 4-6 时交集为空，写一万次都是 EINVAL。
+    // 先写 base（全核，与任何线程都有交集，必然成功）把线程抬出来，
+    // 第二次写目标组就有交集了。中间是毫秒级窗口，好过一直绑不上
+    if first == libc::EINVAL && append(&format!("{}/tasks", base)).is_ok() {
+        return append(&path).map_err(errno);
+    }
+    Err(first)
 }
 
 /// 亲和性写入结果。必须把「线程已退出」和「设置失败」分开：

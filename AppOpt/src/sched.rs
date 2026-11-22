@@ -924,6 +924,8 @@ mod tests {
             is_thread_rule: false,
             comm: comm.to_string(),
             applied: true,
+            group: crate::cpuset::SysGroup::Unknown,
+            blocked: false,
         }
     }
 
@@ -1246,6 +1248,8 @@ mod tests {
                 is_thread_rule: false,
                 comm: "Thread-7".to_string(),
                 applied: true,
+                group: crate::cpuset::SysGroup::Unknown,
+                blocked: false,
             },
         );
         let mut st = state_for(&cache, SchedMode::Shadow);
@@ -1388,6 +1392,8 @@ mod tests {
                 is_thread_rule: false,
                 comm: "Thread-8".into(),
                 applied: true,
+                group: crate::cpuset::SysGroup::Unknown,
+                blocked: false,
             },
         );
         let mut st = state_for(&cache, SchedMode::On);

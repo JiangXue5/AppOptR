@@ -751,6 +751,7 @@ fn diag_json() -> String {
             "shifted": d.aff.shifted,
             "ineffective": d.aff.ineffective,
             "stuck_skip": d.aff.stuck_skip,
+            "sysgroup_skip": d.aff.sysgroup_skip,
             "stuck": crate::apply_affinity::stuck_count(),
             "rule": d.aff.rule,
             "sync": d.aff.sync,

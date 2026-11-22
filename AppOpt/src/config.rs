@@ -166,6 +166,11 @@ pub struct AppConfig {
     /// 线程未命中任何线程规则、且包无包级规则时的行为：
     /// false（默认 keep）保持原亲和性，true（all）沿用旧行为设为全部核心
     pub unmatched_all: bool,
+    /// 是否尊重系统 cpuset 分组。为 true 时，线程被 Android 放在
+    /// background / system-background / restricted 组且目标核不在该组
+    /// 生效集合内，就不去硬绑——内核本来就会拒绝，硬试只会造成无效迁移。
+    /// `@sysgroup=takeover` 关闭该行为，把线程从系统组里强行拉出来
+    pub sysgroup_respect: bool,
     /// 跨簇规则统计，仅用于展示 S7 的潜在作用面
     pub sched_scope: SchedScope,
     /// 允许集合横跨多个核心层的包。S7 靠线程名判角色，这些包即使没有线程规则
@@ -217,6 +222,7 @@ impl AppConfig {
             pkg_sig: HashMap::new(),
             policy_sig: 0,
             unmatched_all: false,
+            sysgroup_respect: true,
             sched_scope: SchedScope::default(),
             sched_pkgs: HashSet::new(),
             sched: SchedMode::Off,
@@ -269,9 +275,15 @@ fn build_pkg_sig(rules: &[AffinityRule]) -> HashMap<String, u64> {
 /// 影响所有包的开关变化不会体现在 pkg_sig 里，必须单独比对，
 /// 否则已缓存线程不会重新应用，`on → off` 也回滚不了。
 /// RT 的每一项都要进来：分应用开关、匹配方式、上限、时间片变化都要触发全量重扫
-fn build_policy_sig(unmatched_all: bool, sched: SchedMode, rt: &RtConfig) -> u64 {
+fn build_policy_sig(
+    unmatched_all: bool,
+    sysgroup_respect: bool,
+    sched: SchedMode,
+    rt: &RtConfig,
+) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     unmatched_all.hash(&mut h);
+    sysgroup_respect.hash(&mut h);
     (sched as u8).hash(&mut h);
     (rt.scope as u8).hash(&mut h);
     match &rt.global {
@@ -659,6 +671,8 @@ pub fn load_config(
     let mut in_block = false;
     // 保守默认：未匹配线程保持原有亲和性，不再主动设为全部核心
     let mut unmatched_all = false;
+    // 默认尊重系统分组：后面的应用在后台组时本来就不许上大核
+    let mut sysgroup_respect = true;
     // 动态调度默认全关，配置里不写就与 2.3.0 行为一致
     let mut sched = SchedMode::Off;
     let mut rt = RtConfig::default();
@@ -687,6 +701,8 @@ pub fn load_config(
             match (key, val) {
                 ("unmatched", "keep") => unmatched_all = false,
                 ("unmatched", "all") => unmatched_all = true,
+                ("sysgroup", "respect" | "keep") => sysgroup_respect = true,
+                ("sysgroup", "takeover" | "ignore" | "force") => sysgroup_respect = false,
                 ("sched", "off") => sched = SchedMode::Off,
                 ("sched", "shadow") => sched = SchedMode::Shadow,
                 ("sched", "on") => sched = SchedMode::On,
@@ -836,7 +852,7 @@ pub fn load_config(
     let trunc_keys = build_trunc_keys(&pkgs);
     let rule_index = build_rule_index(&rules);
     let pkg_sig = build_pkg_sig(&rules);
-    let policy_sig = build_policy_sig(unmatched_all, sched, &rt);
+    let policy_sig = build_policy_sig(unmatched_all, sysgroup_respect, sched, &rt);
 
     // 同一包多条包级规则按并集生效，顺序无关；只提示不改变语义
     let mut multi: Vec<&str> = rule_index
@@ -864,6 +880,19 @@ pub fn load_config(
     } else {
         crate::diag::emit("未匹配线程: keep（保持原有亲和性）");
     }
+    crate::diag::emit(&format!(
+        "系统分组: {}（线程在系统后台组时{}）",
+        if sysgroup_respect {
+            "尊重"
+        } else {
+            "强行接管"
+        },
+        if sysgroup_respect {
+            "留在小核，不硬绑大核"
+        } else {
+            "会被拉进 AppOpt 组，可能增加耗电"
+        }
+    ));
     let (scope, sched_pkgs) = sched_scope(&rules, topo);
     if scope.levels < 2 {
         crate::diag::emit(&format!(
@@ -930,6 +959,7 @@ pub fn load_config(
         pkg_sig,
         policy_sig,
         unmatched_all,
+        sysgroup_respect,
         sched_scope: scope,
         sched_pkgs,
         sched,
