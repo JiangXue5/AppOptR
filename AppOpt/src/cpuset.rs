@@ -205,6 +205,22 @@ pub fn effective_at(dir: &str) -> Option<String> {
     effective_by_walk("/dev/cpuset", &cgroup_rel(d)).filter(|s| !s.is_empty())
 }
 
+/// 当前在线的 CPU 集合（`/sys/devices/system/cpu/online`）。
+///
+/// 真机上「规则写 4-6、回读 4-5」不能只归因于 cpuset：这批设备连
+/// `cpuset.effective_cpus` 都没导出，父链交集又是 0-7。真正的减法发生在
+/// 内核把 `sched_setaffinity` 的掩码与 `cpu_active_mask` 求交——核被
+/// hotplug 或 core_ctl 下电时，写进去的 bit 会静默消失。打印裁剪现场时
+/// 必须带上这个值，否则读者只能把它当成配置错误
+pub fn online_cpus() -> Option<CpuSet> {
+    let s = fs::read_to_string("/sys/devices/system/cpu/online").ok()?;
+    let t = s.trim();
+    if t.is_empty() {
+        return None;
+    }
+    Some(parse_cpu_ranges(t, None))
+}
+
 /// 生效集合的短时缓存。校验一轮要遍历几百个线程，同一组会被反复求交
 /// （`/foreground` 上 172 个线程就是 344 次 open + 按父链求交）。
 /// 组配置以秒级稳定，5 秒缓存既跟得上真实变更，也不会把这份开销摊到每个线程
@@ -277,6 +293,14 @@ impl CpuSet {
     pub fn and(&mut self, other: &CpuSet) {
         for (d, &s) in self.bits.iter_mut().zip(other.bits.iter()) {
             *d &= s;
+        }
+    }
+
+    /// 差集：留在自己里、但不在 `other` 里的核。
+    /// 诊断用它回答「规则要的核里有几个此刻不在线」
+    pub fn and_not(&mut self, other: &CpuSet) {
+        for (d, &s) in self.bits.iter_mut().zip(other.bits.iter()) {
+            *d &= !s;
         }
     }
 
@@ -566,7 +590,7 @@ impl CpuTopology {
 }
 
 /// 读取 cpuN/online，节点缺失（如 CPU0）视为在线
-fn cpu_online(cpu: usize) -> bool {
+pub(crate) fn cpu_is_online(cpu: usize) -> bool {
     match fs::read_to_string(format!("/sys/devices/system/cpu/cpu{}/online", cpu)) {
         Ok(s) => s.trim() != "0",
         Err(_) => true,
@@ -792,7 +816,7 @@ pub fn init_cpu_topo() -> CpuTopology {
     // 离线 CPU 不进入规则集合与 cpuset 写入集合
     let mut online = CpuSet::new();
     for cpu in 0..CPU_SETSIZE {
-        if present.is_set(cpu) && cpu_online(cpu) {
+        if present.is_set(cpu) && cpu_is_online(cpu) {
             online.set(cpu);
         }
     }
@@ -878,6 +902,19 @@ mod tests {
             s.set(c);
         }
         s
+    }
+
+    /// 差集只留「自己要了、对方没有」的核：裁剪归因靠它区分
+    /// 「核下线」与「组集合限制」，多算或少算一个核就会给出相反的结论
+    #[test]
+    fn and_not_leaves_only_missing_cpus() {
+        let mut s = set(&[4, 5, 6]);
+        s.and_not(&set(&[0, 1, 2, 3, 5, 7]));
+        assert_eq!(s.to_range_string(), "4,6");
+        // 完全包含时结果为空
+        let mut t = set(&[4, 5]);
+        t.and_not(&set(&[0, 1, 2, 3, 4, 5, 6, 7]));
+        assert_eq!(t.count(), 0);
     }
 
     #[test]

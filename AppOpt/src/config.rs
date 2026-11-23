@@ -650,6 +650,36 @@ fn parse_rt_app(arg: &str, default_max: u8) -> Option<(String, AppRt)> {
     Some((pkg.to_string(), app))
 }
 
+/// 启动（或热重载）时检查规则里的核是否都在线。
+///
+/// 真机上「规则写 4-6、日志一直记裁剪 4-5」最常见的成因是中核簇被 core_ctl
+/// 或 hotplug 下电：`sched_setaffinity` 的掩码会与在线集合求交，写进去的 bit
+/// 静默消失，随后被校验判成「被裁剪」。启动行先说清楚，省得用户以为规则错了
+fn report_offline_rules(rules: &[AffinityRule], topo: &CpuTopology) {
+    // 优先现读：热重载时 topo 是启动快照，中间可能发生过热插拔
+    let online = crate::cpuset::online_cpus().unwrap_or(topo.present_cpus);
+    let mut reported: Vec<String> = Vec::new();
+    for r in rules {
+        let mut off = r.cpus;
+        off.and_not(&online);
+        if off.count() == 0 {
+            continue;
+        }
+        let want = r.cpus.to_range_string();
+        if reported.contains(&want) {
+            continue;
+        }
+        reported.push(want.clone());
+        crate::diag::emit(&format!(
+            "规则集合: 规则要的 {} 里 CPU {} 当前不在线（在线 [{}]）；这些核会被内核静默扣掉、回读变小，\
+             日志随后记成「裁剪」。核上线后下一轮自动恢复，不是规则写错",
+            want,
+            off.to_range_string(),
+            online.to_range_string()
+        ));
+    }
+}
+
 /// 加载配置文件，返回 None 表示未变化或解析失败
 pub fn load_config(
     config_file: &str,
@@ -878,6 +908,7 @@ pub fn load_config(
     }
 
     crate::diag::emit(&format!("配置文件解析完成，共加载 {} 条规则", num_rules));
+    report_offline_rules(&rules, topo);
     if fail_cnt > 0 {
         eprintln!("警告: {} 条规则因格式无效被跳过", fail_cnt);
     }

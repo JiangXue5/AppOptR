@@ -635,6 +635,7 @@ pub fn adv_configure(
     unmatched: Option<&str>,
     rt_max: Option<u8>,
     rt_timeslice: Option<u32>,
+    sysgroup: Option<&str>,
 ) -> RuleEdit {
     let _guard = crate::lock_ignore_poison(&WRITE_LOCK);
     let Ok(mut lines) = read_conf(path) else {
@@ -648,6 +649,11 @@ pub fn adv_configure(
     }
     if let Some(t) = rt_timeslice {
         directive_put(&mut lines, "rt.timeslice", Some(&t.to_string()));
+    }
+    // 系统分组策略是全局指令，与规则行、其它 @ 指令互不影响；
+    // 写 respect 而不是删行，是为了让用户能在配置文件里直接看到当前策略
+    if let Some(g) = sysgroup {
+        directive_put(&mut lines, "sysgroup", Some(g));
     }
     file_write(path, &lines)
 }
@@ -1038,7 +1044,7 @@ mod tests {
 
         // 只改 unmatched：不应凭空写出 rt.max / rt.timeslice
         assert!(matches!(
-            adv_configure(&conf, Some("all"), None, None),
+            adv_configure(&conf, Some("all"), None, None, None),
             RuleEdit::Ok
         ));
         let s = fs::read_to_string(&conf).unwrap();
@@ -1049,7 +1055,7 @@ mod tests {
 
         // 三项同写：一次落盘，各一条
         assert!(matches!(
-            adv_configure(&conf, Some("keep"), Some(4), Some(6)),
+            adv_configure(&conf, Some("keep"), Some(4), Some(6), None),
             RuleEdit::Ok
         ));
         let s = fs::read_to_string(&conf).unwrap();
@@ -1061,10 +1067,27 @@ mod tests {
         // 空参数不动文件
         let before = fs::read_to_string(&conf).unwrap();
         assert!(matches!(
-            adv_configure(&conf, None, None, None),
+            adv_configure(&conf, None, None, None, None),
             RuleEdit::Ok
         ));
         assert_eq!(before, fs::read_to_string(&conf).unwrap());
+
+        // sysgroup 独立写入：切换策略要替换原行而不是追加，
+        // 否则配置里会留下两条互相矛盾的 @sysgroup，解析取最后一条
+        assert!(matches!(
+            adv_configure(&conf, None, None, None, Some("takeover")),
+            RuleEdit::Ok
+        ));
+        let s = fs::read_to_string(&conf).unwrap();
+        assert!(s.contains("@sysgroup=takeover"));
+        assert!(matches!(
+            adv_configure(&conf, None, None, None, Some("respect")),
+            RuleEdit::Ok
+        ));
+        let s = fs::read_to_string(&conf).unwrap();
+        assert!(s.contains("@sysgroup=respect"));
+        assert!(!s.contains("@sysgroup=takeover"));
+        assert_eq!(s.matches("@sysgroup=").count(), 1);
 
         let _ = fs::remove_dir_all(&dir);
     }

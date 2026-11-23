@@ -145,6 +145,9 @@ struct Sink {
     sysgroup_announced: HashSet<SysGroup>,
     /// 已经说明过「目标被组集合裁小」的组
     clip_announced: HashSet<SysGroup>,
+    /// 已经解释过「为什么少了核」的期望集合。裁剪会在几百个线程上重复出现，
+    /// 原因却只有一个；按集合去重，避免把唯一有价值的解释刷掉
+    clip_why: HashSet<String>,
     /// 本周期「写后回读仍不一致」的样本与计数
     ineffective: Vec<Drift>,
     ineffective_n: u64,
@@ -196,6 +199,7 @@ fn sink() -> std::sync::MutexGuard<'static, Option<Sink>> {
         unreachable_sample: None,
         sysgroup_announced: HashSet::new(),
         clip_announced: HashSet::new(),
+        clip_why: HashSet::new(),
         ineffective: Vec::new(),
         ineffective_n: 0,
         stuck_skip: 0,
@@ -561,6 +565,15 @@ pub fn note_drift(tid: i32, comm: &str, expect: &CpuSet, actual: &CpuSet) {
     if s.drift.len() < DRIFT_CAP {
         s.drift.push(sample.clone());
     }
+    // 裁剪的第一条现场必须回答「少的那几个核去哪了」。这台设备的 cpuset 连
+    // effective_cpus 都没导出、父链交集又是全集，唯一能解释的实际是内核把
+    // sched_setaffinity 的掩码与在线集合求交——不写清这一点，182 次裁剪
+    // 会被读成「规则写错了核」
+    if kind == DriftKind::Clip && s.clip_why.insert(sample.expect.clone()) {
+        let line = clip_reason(&sample.expect, &sample.actual);
+        emit(&line);
+        push_event(s, line);
+    }
     // 第一批异常当场打一条，不等 60 秒摘要：掉帧往往就在这几秒内
     if s.last_drift_log.elapsed() >= DRIFT_LOG_GAP {
         s.last_drift_log = Instant::now();
@@ -575,12 +588,74 @@ pub fn note_drift(tid: i32, comm: &str, expect: &CpuSet, actual: &CpuSet) {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DriftKind {
-    /// 读回比期望小：被 cpuset 的 effective_cpus 裁掉
+    /// 读回比期望小：被 cpuset 的 effective_cpus 或离线核裁掉
     Clip,
     /// 读回比期望大：被整体重置
     Reset,
     /// 互不包含：被挪到别的簇
     Shifted,
+}
+
+/// 裁剪的差集归因。抽成纯函数是为了能脱离本机 CPU 拓扑单测：
+/// 「少了一个核」到底是核下电还是组集合限制，决定了用户该等还是该改配置
+#[derive(Debug, PartialEq)]
+enum ClipWhy {
+    /// 差集里至少有一个核当前不在线；内核会把掩码与在线集合求交
+    Offline(CpuSet),
+    /// 核都在线，差集只能来自线程所在 cpuset 组的可用集合
+    GroupLimited,
+}
+
+fn classify_clip(want: &CpuSet, online: &CpuSet) -> ClipWhy {
+    let mut lost = *want;
+    lost.and_not(online);
+    if lost.count() > 0 {
+        ClipWhy::Offline(lost)
+    } else {
+        ClipWhy::GroupLimited
+    }
+}
+
+/// 「期望比实际多几个核」的解释。差集能完全由离线解释时明确说是热插拔
+/// （这是真机上最常见的一类，且会自动恢复）；解释不了才指向组配置，
+/// 并给出可核对的落点。两种情况都必须在第一现场说清，否则读者只能
+/// 把裁剪当成规则写错了核
+fn clip_reason(expect: &str, actual: &str) -> String {
+    let want = crate::cpuset::parse_cpu_ranges(expect, None);
+    let Some(online) = crate::cpuset::online_cpus() else {
+        return format!(
+            "裁剪原因: 期望 {} 实际 {}；读不到 /sys/devices/system/cpu/online，无法区分热插拔与组限制",
+            expect, actual
+        );
+    };
+    match classify_clip(&want, &online) {
+        ClipWhy::Offline(lost) => {
+            // online 位图读得到时这层是冗余的，读不到时它是唯一依据；
+            // 顺带排掉「online 写着在、单核 online 文件写着 0」这种不一致
+            let dead: Vec<String> = (0..64)
+                .filter(|&c| lost.is_set(c) && !crate::cpuset::cpu_is_online(c))
+                .map(|c| format!("cpu{}", c))
+                .collect();
+            format!(
+                "裁剪原因: 期望 {} 实际 {}，在线 [{}]，CPU {} 不在线；内核会把 sched_setaffinity 与在线掩码求交，\
+                 核上线后下一轮自动恢复（不是规则写错）{}",
+                expect,
+                actual,
+                online.to_range_string(),
+                lost.to_range_string(),
+                if dead.is_empty() {
+                    String::new()
+                } else {
+                    format!("；{} 的 online 文件已确认为 0", dead.join("、"))
+                }
+            )
+        }
+        ClipWhy::GroupLimited => format!(
+            "裁剪原因: 期望 {} 实际 {}，但 {} 都在线；差集来自线程所在 cpuset 组的可用集合，\
+             对照该组目录下的 cpus 与 cpuset.effective_cpus（本机若无该文件，看父链 cpus 交集）可核对",
+            expect, actual, expect
+        ),
+    }
 }
 
 fn read_thread_cpuset(tid: i32) -> String {
@@ -1412,5 +1487,26 @@ mod tests {
 
         // 首次没有上一轮，仍要说明一次
         assert!(sched_period_line(None, &cur, &mut hint).is_some());
+    }
+
+    /// 「规则写 4-6、回读 4-5」有两种完全不同的根因：核被下电，或组集合限制。
+    /// 前者等核上线就好，后者才需要改配置——归因错了用户会去改一条对的规则
+    #[test]
+    fn clip_reason_distinguishes_offline_from_group_limit() {
+        let parse = |s: &str| crate::cpuset::parse_cpu_ranges(s, None);
+        assert_eq!(
+            classify_clip(&parse("4-6"), &parse("0-5,7")),
+            ClipWhy::Offline(parse("6"))
+        );
+        // 核都在线时不能推给热插拔
+        assert_eq!(
+            classify_clip(&parse("4-6"), &parse("0-7")),
+            ClipWhy::GroupLimited
+        );
+        // 一次下电两个核要一次说全，不能只报一个
+        assert_eq!(
+            classify_clip(&parse("4-7"), &parse("0-5")),
+            ClipWhy::Offline(parse("6-7"))
+        );
     }
 }

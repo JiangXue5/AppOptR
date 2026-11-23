@@ -1,5 +1,48 @@
 # AppOptR 变更记录
 
+## 2.5.3（2026-11-23）
+
+真机日志里「规则写 4-6、回读 4-5」被记成 182 次裁剪，但没有任何一条说明
+少掉的那个核去哪了。这次让日志自己回答，并把「强制绑核」开关放进 Web 界面。
+
+### 裁剪要能归因
+
+`cpuset` 侧已经排除：`/dev/cpuset/AppOpt/4-6/cpus` 回读就是 `4-6`，
+`top-app` 与 `foreground` 的 `cpus` 都是 `0-7`，`/proc/cmdline` 也没有
+`isolcpus`。而且这批内核**不导出 `cpuset.effective_cpus`**，按父链求交同样
+得到全集——两条路都解释不了「少了 6 号核」。
+
+能解释的只剩一件事：`sched_setaffinity` 的掩码会被内核与在线集合求交。
+核被 core_ctl 或 hotplug 下电时，写进去的 bit 静默消失，回读变小，校验随后
+把它记成「裁剪」。
+
+- 新增 `cpuset::online_cpus()` 与 `cpu_is_online()`，读
+  `/sys/devices/system/cpu/online` 与 `cpuN/online`；
+- 裁员的**第一条现场**附一行归因：差集能由离线解释就明确写「CPU 6 当前不在线，
+  核上线后自动恢复，不是规则写错」；解释不了才指向线程所在 cpuset 组，
+  并给出可核对的落点；
+- 启动（含热重载）时检查规则集合：有核不在线就在加载完规则后立刻警告，
+  不用等第一次漂移；
+- 同一期望集合的解释只打一次，不随 182 个线程重复。
+
+### 强制绑核按钮
+
+设置页新增「系统分组」卡片：**尊重** / **强制绑核**。
+
+系统把线程划进 `background` 等组后，该组可用核心不含规则要的大核，迁组与绑核
+都会被内核拒绝（日志记「系统分组: N 次因所在组不含目标集合被跳过」）。强制绑核
+对应 `@sysgroup=takeover`，把线程拉出系统组再绑，代价是后台应用也占大核。
+
+- `POST /api/adv` 接受 `sysgroup=respect|takeover`，写入配置文件后立即热重载；
+- 切换会替换原指令而不是追加，配置文件里始终只有一条 `@sysgroup=`；
+- 状态取自配置真值，切换后界面立即反映，不等主循环刷新。
+
+### 其它
+
+- 新增 2 个回归测试：`and_not_leaves_only_missing_cpus`、
+  `clip_reason_distinguishes_offline_from_group_limit`；`adv_configure` 补齐
+  `@sysgroup` 的替换语义断言。当前 173 passed
+
 ## 2.5.2（2026-11-23）
 
 2.5.0 引入令牌后，KernelSU WebUI 打开页面没有自动带上令牌，只能手动粘贴。

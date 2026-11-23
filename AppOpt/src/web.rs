@@ -914,6 +914,12 @@ fn config_json() -> String {
             crate::config::RT_DEFAULT_MAX,
             crate::config::RT_DEFAULT_TIMESLICE,
         ));
+    // 系统分组策略取配置真值：界面上的「强制接管」是一个开关，
+    // 切换后要立刻反映，不能等主循环刷新快照
+    let sysgroup = match cfg.as_ref() {
+        Some(c) if !c.sysgroup_respect => "takeover",
+        _ => "respect",
+    };
     let snap = lock_ignore_poison(&SCHED_SNAPSHOT)
         .clone()
         .unwrap_or_default();
@@ -941,6 +947,7 @@ fn config_json() -> String {
         "rt": rt,
         "rt_max": rt_max,
         "rt_timeslice": rt_ts,
+        "sysgroup": sysgroup,
         "sched_mode": sched_mode,
         "sched_state": s_state,
         "sched_ticks": s_ticks,
@@ -1312,12 +1319,20 @@ fn adv_api(req: &Request) -> (u16, String) {
         }
         None => None,
     };
-    if unmatched.is_none() && rt_max.is_none() && rt_ts.is_none() {
+    // `respect` 保留系统分组（后台线程不上大核），`takeover` 强行拉进 AppOpt 组。
+    // 别名与配置解析器保持一致，避免两个入口对同一策略给出不同拼写
+    let sysgroup = match v["sysgroup"].as_str() {
+        Some("respect") | Some("keep") => Some("respect"),
+        Some("takeover") | Some("force") => Some("takeover"),
+        Some(_) => return err_json(400, "sysgroup 只能是 respect 或 takeover"),
+        None => None,
+    };
+    if unmatched.is_none() && rt_max.is_none() && rt_ts.is_none() && sysgroup.is_none() {
         return err_json(400, "没有要修改的项");
     }
 
     let file = lock_ignore_poison(&CONFIG_FILE).clone();
-    match adv_configure(&file, unmatched, rt_max, rt_ts) {
+    match adv_configure(&file, unmatched, rt_max, rt_ts, sysgroup) {
         RuleEdit::Ok => {
             config_reload_now();
             (200, json!({ "ok": true }).to_string())
