@@ -1077,7 +1077,15 @@ pub fn load_config(
     report_rule_list(&rules, topo);
     report_offline_rules(&rules, topo);
     if fail_cnt > 0 {
-        crate::diag::tag("警告", &format!("{} 条规则因格式无效被跳过", fail_cnt));
+        // 指令写错也走这条路（`@screen=dim` 之类），只说「规则」会让人回头
+        // 去翻规则行，实际该看的是指令拼写
+        crate::diag::tag(
+            "警告",
+            &format!(
+                "{} 行因格式无效被跳过（规则或指令，写法见 README）",
+                fail_cnt
+            ),
+        );
     }
     let (scope, sched_pkgs) = sched_scope(&rules, topo);
     // 策略压成一行：这几项都是静态开关，逐项一行会把启动块拉长到看不清
@@ -1106,10 +1114,28 @@ pub fn load_config(
         }
         SchedMode::On => "S7 on（Worker/Background 让位，每秒最多迁 1 个）".to_string(),
     };
+    // 非默认开关必须自证：开了 `@screen=relax` 却在启动块里看不到任何变化，
+    // 用户只能靠「息屏后日志变安静」去推断，等于让他猜。默认值不出现，
+    // 因此默认配置下的启动块与 2.6.1 逐字一致
+    let mut extra: Vec<String> = Vec::new();
+    if screen_relax {
+        extra.push("息屏=relax（复核降到 60 秒）".to_string());
+    }
+    if render_guard_observe {
+        extra.push("护栏=observe（只计数不改绑定）".to_string());
+    }
+    if !group_own {
+        extra.push("接管组=mask（只写掩码，退回 2.6.1）".to_string());
+    }
+    let extra_desc = if extra.is_empty() {
+        String::new()
+    } else {
+        format!(" ｜ {}", extra.join(" ｜ "))
+    };
     crate::diag::tag(
         "策略",
         &format!(
-            "未匹配={} ｜ 系统分组={} ｜ {} ｜ {}",
+            "未匹配={} ｜ 系统分组={} ｜ {} ｜ {}{}",
             if unmatched_all {
                 "all（设为全核）"
             } else {
@@ -1121,7 +1147,8 @@ pub fn load_config(
                 "takeover（拉进 AppOpt 组，费电）"
             },
             scope_desc,
-            sched_desc
+            sched_desc,
+            extra_desc
         ),
     );
     if !rt.is_off() {
