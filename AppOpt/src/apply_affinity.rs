@@ -417,6 +417,10 @@ pub enum ApplyReason {
 /// 对单线程应用亲和性。cpuset 目录只是辅助手段，成败以内核返回为准。
 /// 返回 `(结果, 是否真的写入)`：短路的「已一致」不算写入，
 /// 定期校验可以据此判断线程是否被外部改写
+///
+/// `verify_group` 只在「首次绑定 / 目标变更」时为真：掩码已经一致但线程不在
+/// 自己的 cpuset 组里时，仍然要补写一次组归属。稳态传 `false`，不做任何
+/// 额外读取——每轮都校验等于把省下来的 open 又还回去
 pub fn affinity_apply(
     tid: i32,
     cpus: &CpuSet,
@@ -424,6 +428,7 @@ pub fn affinity_apply(
     topo: &CpuTopology,
     reason: ApplyReason,
     comm: &str,
+    verify_group: bool,
 ) -> (AffinityOutcome, bool) {
     // 上一轮已经证明「写进去也会被裁」，这一轮别再动它：
     // 反复迁移只会把线程在簇之间踢来踢去
@@ -431,26 +436,40 @@ pub fn affinity_apply(
         diag::note_stuck();
         return (AffinityOutcome::Set, false);
     }
-    // sched_getaffinity 短路，已符合目标零开销返回
+    // sched_getaffinity 短路，已符合目标零开销返回。
+    // 但「掩码对」不等于「接管成功」：线程可能仍在 top-app，系统下一次状态
+    // 变化就会把亲和性收敛回组允许集合。verify_group 为真时补一次组归属
+    let mut mask_same = false;
     if let Some(curr) = CpuSet::get_affinity(tid) {
         if curr == *cpus {
-            diag::note(reason, &AffinityOutcome::Set, false);
-            return (AffinityOutcome::Set, false);
-        }
-        // 只有定期校验能说明「绑定没坏、是被别人改回去了」。
-        // 记下期望/实际/所在 cpuset，才能区分被 cpuset 裁剪和被整体重置
-        if reason == ApplyReason::Sync {
+            if !verify_group {
+                diag::note(reason, &AffinityOutcome::Set, false);
+                return (AffinityOutcome::Set, false);
+            }
+            mask_same = true;
+        } else if reason == ApplyReason::Sync {
+            // 只有真的不一致才叫漂移：补组时掩码本来是对的，
+            // 记成漂移会让人以为系统在改写
             diag::note_drift(tid, comm, cpus, &curr);
         }
     }
     // None 表示这条路径明确不碰 cpuset（S7 迁移）。cgroup 迁移比
     // sched_setaffinity 重得多，每次动态迁移都做一遍只会放大抖动
+    let mut group_written = false;
     if topo.cpuset_enabled
         && let Some(dir) = cpuset_dir
         && cpuset_gate()
     {
         match write_task(dir, tid, topo) {
-            Ok(()) => cpuset_ok(),
+            Ok(()) => {
+                cpuset_ok();
+                group_written = true;
+                // 只有真的写进去了才报「已补写」：写组失败会走下面的
+                // note_cpuset_failure，两句话不能同时出现
+                if mask_same {
+                    diag::note_group_fix(tid, dir, comm);
+                }
+            }
             Err(f) => {
                 diag::note_cpuset_failure(tid, if dir.is_empty() { "<base>" } else { dir }, f);
                 // 只有全局性失败才计入熔断。`Target(EINVAL)` 是单个线程与目标组
@@ -461,6 +480,14 @@ pub fn affinity_apply(
                 }
             }
         }
+    }
+    // 迁组时内核会把亲和性收敛到新组允许的集合。若收敛后仍等于目标
+    // （组比目标宽），不必再写一次：这次只算了补组，不该计成「改写」
+    if mask_same && CpuSet::get_affinity(tid).is_some_and(|now| now == *cpus) {
+        // 这次调用仍然要进统计：否则「补组」在总账里完全看不见。
+        // `wrote` 传 false——亲和性没写，写的只是组归属，已单独计入 `group_fix`
+        diag::note(reason, &AffinityOutcome::Set, false);
+        return (AffinityOutcome::Set, group_written);
     }
     match cpus.set_affinity(tid) {
         Ok(()) => {
@@ -557,7 +584,7 @@ mod tests {
         let tid = self_tid();
         let curr = CpuSet::get_affinity(tid).expect("读取自身亲和性失败");
         assert_eq!(
-            affinity_apply(tid, &curr, None, &topo, ApplyReason::Rule, "").0,
+            affinity_apply(tid, &curr, None, &topo, ApplyReason::Rule, "", false).0,
             AffinityOutcome::Set
         );
     }
@@ -569,7 +596,16 @@ mod tests {
         let tid = self_tid();
         // 空集合对内核是非法参数（EINVAL），不会改变当前亲和性
         assert_eq!(
-            affinity_apply(tid, &CpuSet::new(), None, &topo, ApplyReason::Rule, "").0,
+            affinity_apply(
+                tid,
+                &CpuSet::new(),
+                None,
+                &topo,
+                ApplyReason::Rule,
+                "",
+                false
+            )
+            .0,
             AffinityOutcome::Failed
         );
     }
@@ -606,7 +642,7 @@ mod tests {
         let mut one = CpuSet::new();
         one.set(0);
         assert_eq!(
-            affinity_apply(GHOST, &one, None, &topo, ApplyReason::Rule, "").0,
+            affinity_apply(GHOST, &one, None, &topo, ApplyReason::Rule, "", false).0,
             AffinityOutcome::Gone
         );
     }

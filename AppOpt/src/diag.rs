@@ -159,6 +159,10 @@ struct Counters {
     unreachable: u64,
     ineffective: u64,
     stuck: u64,
+    /// 掩码已对、但线程不在自己的 cpuset 组里，补写组归属的次数。
+    /// 与 `rewrite` 分开统计：补组不是「被系统改回去」，混在一起会让人以为
+    /// 系统在反复冲掉绑定
+    group_fix: u64,
     /// 漂移分类计数：裁剪 / 重置 / 挪簇
     kinds: [u64; 3],
 }
@@ -179,6 +183,9 @@ struct Seen {
     /// 已经提示过渲染护栏的包。按包去重：一个包通常只有一个渲染线程，
     /// 但线程重建会换 tid，按 tid 去重会反复刷同一句话
     guard: HashSet<String>,
+    /// 已经解释过「补写组归属」的线程名。按线程名去重：同名的游戏主线程
+    /// 每局都会重建，按 tid 去重等于每局说一遍
+    group_fix: HashSet<String>,
 }
 
 /// 本周期样本：给摘要的明细行用，用完即清零。
@@ -1035,6 +1042,39 @@ pub fn note_group_clip(group: SysGroup, want: &CpuSet, got: &CpuSet, eff: &str) 
     push_event(s, line);
 }
 
+/// 掩码已经正确、但线程不在 `AppOpt/<目标集合>` 组里。
+///
+/// 这是接管语义的缺口：只写 `sched_setaffinity` 不写 cpuset 时，系统在进程
+/// 状态变化时会把亲和性收敛回「所在组允许的集合」，于是同一批线程被反复
+/// 改写。补组之后线程才真正受本模块的组约束。
+///
+/// **不是故障**：日志里明确写「已补写」，避免用户以为绑定出错
+pub fn note_group_fix(tid: i32, dir: &str, comm: &str) {
+    let mut guard = sink();
+    let Some(s) = guard.as_mut() else { return };
+    s.counters.group_fix += 1;
+    let name = if comm.is_empty() {
+        format!("tid {}", tid)
+    } else {
+        comm.to_string()
+    };
+    if !s.seen.group_fix.insert(name.clone()) {
+        return;
+    }
+    let target = if dir.is_empty() {
+        "AppOpt".to_string()
+    } else {
+        format!("AppOpt/{}", dir)
+    };
+    tag(
+        "改写",
+        &format!(
+            "{} 的掩码已正确但不在 {} 组，已补写组归属（接管语义，不是被系统改回去）",
+            name, target
+        ),
+    );
+}
+
 /// 渲染护栏命中（观察模式）：关键线程的目标集合里没有性能核，或只剩一个核。
 ///
 /// 只记数、每个包提示一次，**不改变任何绑定**。先攒真机数据：把渲染线程
@@ -1136,6 +1176,7 @@ pub fn periodic_summary(current: &SchedSnapshot) {
     let ineff_n = std::mem::take(&mut s.counters.ineffective);
     let ineff = std::mem::take(&mut s.samples.ineffective);
     let stuck = std::mem::take(&mut s.counters.stuck);
+    let group_fix = std::mem::take(&mut s.counters.group_fix);
     let guards = std::mem::take(&mut s.guard_hits);
     let tally = s.tally.take();
     let prev = s.last_snap.replace(current.clone());
@@ -1160,6 +1201,19 @@ pub fn periodic_summary(current: &SchedSnapshot) {
                 total,
                 list,
                 if top.len() > 3 { " 等" } else { "" }
+            ),
+        );
+    }
+
+    // 补组是「第一次接管」的一次性动作，通常在启动或规则变更那一分钟出现，
+    // 之后归零。单列一行是为了让用户确认它发生过，而不是被当成故障反复解释
+    if group_fix > 0 {
+        tag(
+            "改写",
+            &format!(
+                "补写组归属 {} 次（近 {} 秒）：这些线程的掩码本来是对的，但不在自己的 cpuset 组里，已迁入以免被系统收敛重置",
+                group_fix,
+                SUMMARY_GAP.as_secs()
             ),
         );
     }

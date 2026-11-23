@@ -584,6 +584,10 @@ pub fn reconcile(state: &mut EbpfState, cfg: &AppConfig) {
 }
 
 /// 应用亲和性并写 APPLIED_MAP，返回 true 表示 tid 已退出。
+///
+/// 参数多是因为它要转交 `affinity_apply` 的全部上下文（含两种布尔语义：
+/// `recheck` 决定漂移判定、`verify` 决定要不要补组），拆结构体反而多一层
+#[allow(clippy::too_many_arguments)]
 /// APPLIED_MAP 的语义是「已被本模块接管」，设置失败也保持接管关系，
 /// 否则该线程的 EXIT 事件不再上报，缓存会一直留到下次 reconcile
 fn affinity_apply_task(
@@ -594,6 +598,7 @@ fn affinity_apply_task(
     bpf: &mut Ebpf,
     comm: &str,
     recheck: bool,
+    verify_group: bool,
 ) -> AffinityOutcome {
     // 复核走 Sync 语义：只有它能区分「首次绑定」与「读回被改写」
     let reason = if recheck {
@@ -601,7 +606,16 @@ fn affinity_apply_task(
     } else {
         ApplyReason::Rule
     };
-    let outcome = affinity_apply(tid, cpus, Some(cpuset_dir), &cfg.topo, reason, comm).0;
+    let outcome = affinity_apply(
+        tid,
+        cpus,
+        Some(cpuset_dir),
+        &cfg.topo,
+        reason,
+        comm,
+        verify_group,
+    )
+    .0;
     if outcome != AffinityOutcome::Gone {
         applied_set(bpf, tid, cpus);
     }
@@ -653,8 +667,8 @@ fn event_apply(
         return false;
     };
 
-    let ok = cache.task_apply(tid, pid, &pkg, comm, cfg, |t, c, d, recheck| {
-        affinity_apply_task(t, c, d, cfg, bpf, comm, recheck)
+    let ok = cache.task_apply(tid, pid, &pkg, comm, cfg, |t, c, d, recheck, verify| {
+        affinity_apply_task(t, c, d, cfg, bpf, comm, recheck, verify)
     });
     // 规则命中且亲和性写入成功后再考虑 RT，避免把没被管理的线程提升
     if ok && let Some(e) = cache.tasks.get(&tid) {
@@ -665,7 +679,9 @@ fn event_apply(
 
 /// 定期纠正 affinity_sync 清死亡 tid
 pub fn affinity_check(state: &mut EbpfState, cfg: &AppConfig) {
-    let dead_tids = state.cache.affinity_sync(&cfg.topo, cfg.sysgroup_respect);
+    let dead_tids = state
+        .cache
+        .affinity_sync(&cfg.topo, cfg.sysgroup_respect, cfg.group_own);
     for tid in dead_tids {
         applied_del(&mut state.bpf, tid);
         // 这里的 tid 已经 ESRCH。EXIT 事件丢失时这是唯一能收回 RT 记录与配额的路径，
@@ -698,7 +714,7 @@ pub fn full_scan(cfg: &AppConfig, state: &mut EbpfState) {
                     pkg,
                     &t_name,
                     cfg,
-                    |tid, cpus, cpuset_dir, recheck| {
+                    |tid, cpus, cpuset_dir, recheck, verify| {
                         affinity_apply_task(
                             tid,
                             cpus,
@@ -707,6 +723,7 @@ pub fn full_scan(cfg: &AppConfig, state: &mut EbpfState) {
                             &mut state.bpf,
                             &t_name,
                             recheck,
+                            verify,
                         )
                     },
                 );
@@ -787,7 +804,7 @@ pub fn config_rescan(new: &AppConfig, state: &mut EbpfState) {
                         pkg,
                         &t_name,
                         new,
-                        |tid, cpus, dir, recheck| {
+                        |tid, cpus, dir, recheck, verify| {
                             affinity_apply_task(
                                 tid,
                                 cpus,
@@ -796,6 +813,7 @@ pub fn config_rescan(new: &AppConfig, state: &mut EbpfState) {
                                 &mut state.bpf,
                                 &t_name,
                                 recheck,
+                                verify,
                             )
                         },
                     );

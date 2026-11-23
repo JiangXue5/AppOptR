@@ -144,7 +144,7 @@ fn recheck_names(cfg: &AppConfig, state: &mut ProcScanState) {
         }
         if state
             .cache
-            .task_apply(tid, pid, &pkg, &comm, cfg, |_, _, _, _| {
+            .task_apply(tid, pid, &pkg, &comm, cfg, |_, _, _, _, _| {
                 AffinityOutcome::Failed
             })
         {
@@ -232,7 +232,7 @@ fn proc_tasks(
         };
         let ok = state
             .cache
-            .task_apply(tid, pid, pkg, &thread_name, cfg, |_, _, _, _| {
+            .task_apply(tid, pid, pkg, &thread_name, cfg, |_, _, _, _, _| {
                 AffinityOutcome::Failed
             });
         if ok {

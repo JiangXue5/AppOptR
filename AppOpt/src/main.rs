@@ -572,7 +572,10 @@ fn main() {
                 || cache.force_affinity
             {
                 // ESRCH 的线程同时收回 RT 记录，避免事件漏报时配额一直被占
-                for tid in cache.cache.affinity_sync(&cfg.topo, cfg.sysgroup_respect) {
+                for tid in cache
+                    .cache
+                    .affinity_sync(&cfg.topo, cfg.sysgroup_respect, cfg.group_own)
+                {
                     rt::forget(tid);
                 }
                 affinity_deadline = Instant::now();
@@ -694,7 +697,17 @@ fn main() {
 fn apply_move_ebpf(es: &mut EbpfState, cfg: &AppConfig, m: &sched::Move) -> AffinityOutcome {
     // S7 只改绑核，不写 cpuset：cgroup 迁移会带来额外抖动，
     // 失败时还会把线程留在一个比目标更宽的集合里
-    match affinity_apply(m.tid, &m.cpus, None, &cfg.topo, ApplyReason::Sched, &m.comm).0 {
+    match affinity_apply(
+        m.tid,
+        &m.cpus,
+        None,
+        &cfg.topo,
+        ApplyReason::Sched,
+        &m.comm,
+        false,
+    )
+    .0
+    {
         AffinityOutcome::Set => {
             // S7 只写 sched_setaffinity，cgroup 会把集合求交：返回 0 也可能被裁小。
             // 读回不一致就不能记落点——定期校验会按一个内核根本不接受的集合维持，
@@ -720,7 +733,17 @@ fn apply_move_ebpf(es: &mut EbpfState, cfg: &AppConfig, m: &sched::Move) -> Affi
 }
 
 fn apply_move_proc(ps: &mut ProcScanState, cfg: &AppConfig, m: &sched::Move) -> AffinityOutcome {
-    match affinity_apply(m.tid, &m.cpus, None, &cfg.topo, ApplyReason::Sched, &m.comm).0 {
+    match affinity_apply(
+        m.tid,
+        &m.cpus,
+        None,
+        &cfg.topo,
+        ApplyReason::Sched,
+        &m.comm,
+        false,
+    )
+    .0
+    {
         AffinityOutcome::Set => {
             if CpuSet::get_affinity(m.tid).is_some_and(|a| a != m.cpus) {
                 return AffinityOutcome::Failed;

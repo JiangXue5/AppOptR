@@ -190,6 +190,12 @@ pub struct AppConfig {
     /// 渲染护栏（观察模式）：关键线程被绑到没有性能核的集合时只记数，
     /// 不改绑定。用于先拿真机数据，再决定是否值得拦截
     pub render_guard_observe: bool,
+    /// 接管组归属：掩码已正确、但线程还在系统组里时补写一次 cpuset。
+    /// `@group=mask` 可退回 2.6.1 的行为（只写 sched_setaffinity）。
+    ///
+    /// 与 `@sysgroup` 的区别：那个管「交集为空时要不要硬抬」，这个管
+    /// 「交集够、但线程还没进自己的组」——后者才是「每分钟被系统重置」的根因
+    pub group_own: bool,
     /// RT 配置。off 时运行期不查询任何线程的调度策略
     pub rt: RtConfig,
     pub topo: CpuTopology,
@@ -240,6 +246,7 @@ impl AppConfig {
             sched: SchedMode::Off,
             screen_relax: false,
             render_guard_observe: false,
+            group_own: true,
             rt: RtConfig::default(),
             topo: CpuTopology::empty(),
         }
@@ -295,6 +302,7 @@ fn build_policy_sig(
     sched: SchedMode,
     screen_relax: bool,
     render_guard_observe: bool,
+    group_own: bool,
     rt: &RtConfig,
 ) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -306,6 +314,9 @@ fn build_policy_sig(
     screen_relax.hash(&mut h);
     // 护栏开关只影响诊断，但开关本身要让规则重扫一次，否则改了不生效
     render_guard_observe.hash(&mut h);
+    // 接管开关决定要不要补组，切换时必须整轮重扫，否则已绑的线程还留在
+    // 系统组里，用户看不到任何变化
+    group_own.hash(&mut h);
     (rt.scope as u8).hash(&mut h);
     match &rt.global {
         RtMatch::Auto => 0u8.hash(&mut h),
@@ -828,6 +839,9 @@ pub fn load_config(
     let mut screen_relax = false;
     // 渲染护栏默认关：打开也只观察，不改变任何绑定
     let mut render_guard_observe = false;
+    // 补组默认开：这是修接管语义的缺口，不是可选增强。出问题时用
+    // `@group=mask` 退回「只写掩码」的 2.6.1 行为
+    let mut group_own = true;
     let mut rt = RtConfig::default();
     // 分应用条目先收集原文，等 @rt.max 解析完再统一构造，避免配置行顺序影响缺省上限
     let mut rt_apps: Vec<String> = Vec::new();
@@ -863,6 +877,8 @@ pub fn load_config(
                 ("screen", "relax") => screen_relax = true,
                 ("render_guard", "off") => render_guard_observe = false,
                 ("render_guard", "observe") => render_guard_observe = true,
+                ("group", "own") => group_own = true,
+                ("group", "mask") => group_own = false,
                 ("rt", "off") => rt.scope = RtScope::Off,
                 ("rt", "global") => rt.scope = RtScope::Global,
                 ("rt", "per_app" | "per-app" | "perapp") => rt.scope = RtScope::PerApp,
@@ -1015,6 +1031,7 @@ pub fn load_config(
         sched,
         screen_relax,
         render_guard_observe,
+        group_own,
         &rt,
     );
 
@@ -1161,6 +1178,7 @@ pub fn load_config(
         sched,
         screen_relax,
         render_guard_observe,
+        group_own,
         rt,
         topo: topo.clone(),
     })
@@ -1562,6 +1580,23 @@ mod tests {
         // 打开后规则本身不变，只是多了诊断
         assert_eq!(on.rules.len(), 1);
         assert_ne!(base.policy_sig, on.policy_sig, "开关变化要触发重扫");
+    }
+
+    /// 补组默认开（修接管语义），`@group=mask` 是逃生口。
+    /// 三种情况都要明确：默认、显式关、非法值
+    #[test]
+    fn group_own_defaults_on_and_can_fall_back() {
+        let base = cfg_of("gt_def", "com.a=0-1\n");
+        assert!(base.group_own, "不写 @group 必须默认补组");
+        let mask = cfg_of("gt_mask", "@group=mask\ncom.a=0-1\n");
+        assert!(!mask.group_own, "@group=mask 必须退回只写掩码");
+        assert_eq!(mask.rules.len(), 1, "指令不能吞掉规则");
+        assert_ne!(base.policy_sig, mask.policy_sig, "开关变化要触发重扫");
+
+        // 非法值按默认处理，不牵连规则
+        let bad = cfg_of("gt_bad", "@group=maybe\ncom.a=0-1\n");
+        assert!(bad.group_own);
+        assert_eq!(bad.rules.len(), 1);
     }
 
     #[test]

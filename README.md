@@ -58,6 +58,7 @@ http://appopt.suto.top
 | `@rt.timeslice` | 1–100 | `3` | RR 时间片（毫秒），全局内核参数，仅在至少一个应用启用时写入。 |
 | `@rt.app` | `<包名> on\|off [auto\|names:名1,名2] [上限]` | — | 单个应用的 RT 条目。参数省略时按 `auto` 与 `@rt.max`。 |
 | `@sysgroup` | `respect` / `takeover` | `respect` | 线程被 Android 放进 `background`/`system-background`/`restricted` 组时，该组的生效集合只有小核。`respect` 尊重系统安排，规则要的大核绑不上就跳过并说明；`takeover` 强行把线程拉进 AppOpt 组再绑（大核跑后台，耗电上升）。 |
+| `@group` | `own` / `mask` | `own` | 首次绑定或目标变更时，把线程迁进 `AppOpt/<集合>` 组。只在掩码上绑、不接管组时，系统会在进程状态变化时把亲和性收敛回组允许集合——这是「绑上又被冲掉」的主因。`mask` 退回 2.6.1 的「只写掩码」行为。 |
 
 ```
 @unmatched=all
@@ -87,6 +88,11 @@ com.example.game {
 加载与决策细节见 [CHANGELOG.md](CHANGELOG.md)；负载感知调度（S7）已实现三档
 `off` / `shadow` / `on`，设计与判定细节见
 [docs/S7_负载感知调度策略设计.md](docs/S7_负载感知调度策略设计.md)。
+
+**关于「每分钟被改写几十次」**：日志里出现 `改写` 计数时，先看有没有
+`补写组归属 N 次`。有就说明线程原先只绑了掩码、没进 `AppOpt` 组，系统每次
+进程状态变化都会把它重置；补组后这个数字应在一个周期内归零。若持续不为零，
+检查 `@group` 是否被设成 `mask`。
 
 
 ### 内核调参（可选）

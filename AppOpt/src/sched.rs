@@ -1434,6 +1434,7 @@ mod tests {
                 &t,
                 crate::apply_affinity::ApplyReason::Rule,
                 "Thread-7",
+                false,
             )
             .0,
             AffinityOutcome::Set
