@@ -684,8 +684,9 @@ pub fn note_drift(tid: i32, comm: &str, expect: &CpuSet, actual: &CpuSet) {
     // 这里把结论直接给出，省得他去猜是不是模块自己的 bug
     if kind == DriftKind::Reset && s.reset_why.insert(sample.actual.clone()) {
         let line = format!(
-            "校验: {} 被改成 {}，规则只要 {}；多出来的核不在任何规则里，\
-             这不是 AppOpt 写的——常见来源是厂商性能 HAL 或游戏自身的 boost，下一轮已改回",
+            "校验: {} 被改成 {}，规则只要 {}；AppOpt 只会写规则集合或其子集，\
+             读回是超集就只能是外部写的——常见来源是厂商性能 HAL、游戏自身 boost \
+             或系统的 CPU 集合恢复；本轮会改回（写入失败会另打一行「绑核: 失败」）",
             sample_tag(&sample),
             sample.actual,
             sample.expect
@@ -1065,19 +1066,27 @@ fn errno_hint(errno: i32) -> String {
 /// 「此刻」与「近 60 秒」必须在一行里说清：只报后者，读者会把它当成当前状态。
 /// 这条被误读过两次（「日志说没绑上，Scene 里却是对的」），所以抽成纯函数可回归
 fn tally_line(t: SyncTally, rewrites: u64, caps: u64, kinds: [u64; 3]) -> String {
-    let mut parts = vec![format!("符合 {}", t.ok)];
+    // 主数字必须是「一致」，不能只给「符合」。真机上出现过
+    // `受管 1 个线程 —— 符合 0、本轮重绑 1`，用户盯着那个 0 问「是不是没绑上」，
+    // 而实际状态是重绑后已经一致。ok 与 rebound 只是「这次有没有动手」的区别
+    let consistent = t.ok + t.rebound;
+    let mut parts = Vec::new();
     if t.rebound > 0 {
-        parts.push(format!("本轮重绑 {}", t.rebound));
+        parts.push(format!("其中本轮重绑 {}", t.rebound));
     }
     if t.failed > 0 {
         parts.push(format!("写失败 {}", t.failed));
     }
     if t.blocked > 0 {
-        // 这一档是真的没绑，不能和「符合」混在一行里说得含糊。
+        // 这一档是真的没绑，不能和「一致」混在一行里说得含糊。
         // 用户拿 Scene 对照时，缺的正是「哪些确实没绑」这句话
         parts.push(format!("被系统组限制 {}（确实没绑）", t.blocked));
     }
-    let mut line = format!("校验: 此刻受管 {} 个线程 —— {}", t.total, parts.join("、"));
+    let mut line = format!("校验: 此刻受管 {} 个线程 —— 一致 {}", t.total, consistent);
+    for p in parts {
+        line.push('、');
+        line.push_str(&p);
+    }
     if rewrites > 0 {
         line.push_str(&format!(
             "；近 {} 秒被系统改了 {} 次（组上限 {}、裁剪 {}、重置 {}、挪簇 {}），每次都已改回",
@@ -1090,6 +1099,18 @@ fn tally_line(t: SyncTally, rewrites: u64, caps: u64, kinds: [u64; 3]) -> String
         ));
     }
     line
+}
+
+/// 只报「这段时间被改了几次」而不给「此刻」，是这套日志被误读的最老一处。
+/// 拿不到当前状态时必须自己说出来，不能默认沉默——沉默会被读成「还是那样」
+fn empty_state_hint(tally: Option<SyncTally>) -> &'static str {
+    match tally {
+        None => "此刻还没有完成首轮校验",
+        Some(t) if t.total == 0 => {
+            "此刻没有受管线程（目标进程已退出或未被扫描到），下次命中会重新接管"
+        }
+        _ => "此刻没有受管线程",
+    }
 }
 
 /// 主循环低频调用：只在有事发生时打行摘要，无事保持安静。
@@ -1160,14 +1181,19 @@ pub fn periodic_summary(current: &SchedSnapshot) {
             ));
         }
     } else if rewrites > 0 {
+        // 走到这里说明「此刻」给不出来：要么缓存里一个受管线程都没有，
+        // 要么首轮校验还没跑完。只报「被改了 N 次」会被读成「现在还是这样」，
+        // 真机上就是这么被误读的，所以状态缺失必须自己说出来
+        let state = empty_state_hint(tally);
         emit(&format!(
-            "校验: 近 {} 秒被系统改了 {} 次（组上限 {}、裁剪 {}、重置 {}、挪簇 {}）",
+            "校验: 近 {} 秒被系统改了 {} 次（组上限 {}、裁剪 {}、重置 {}、挪簇 {}）；{}",
             SUMMARY_GAP.as_secs(),
             rewrites,
             caps,
             kinds[0],
             kinds[1],
-            kinds[2]
+            kinds[2],
+            state
         ));
     }
     if ineff_n > 0 {
@@ -1702,14 +1728,32 @@ mod tests {
         };
         let line = tally_line(t, 171, 167, [3, 1, 0]);
         assert!(line.contains("此刻受管 173"), "{}", line);
-        assert!(line.contains("符合 173"), "{}", line);
-        let state = line.find("符合 173").unwrap();
+        assert!(line.contains("一致 173"), "{}", line);
+        let state = line.find("一致 173").unwrap();
         let history = line.find("近 60 秒").unwrap();
         assert!(state < history, "状态必须在前：{}", line);
         assert!(line.contains("组上限 167"), "{}", line);
         // 一次都没被改过时不要提「被系统改了 0 次」
         let quiet = tally_line(t, 0, 0, [0, 0, 0]);
         assert!(!quiet.contains("被系统改了"), "{}", quiet);
+
+        // 全部线程都是本轮重绑的：主数字仍必须是「一致 1」。
+        // 真机上这里是 `符合 0、本轮重绑 1`，用户盯着 0 以为没绑上
+        let rebound = tally_line(
+            SyncTally {
+                total: 1,
+                ok: 0,
+                rebound: 1,
+                failed: 0,
+                blocked: 0,
+            },
+            1,
+            0,
+            [0, 0, 1],
+        );
+        assert!(rebound.contains("一致 1"), "{}", rebound);
+        assert!(rebound.contains("其中本轮重绑 1"), "{}", rebound);
+        assert!(!rebound.contains("符合 0"), "{}", rebound);
 
         // 被系统组限制的线程要单独说清，否则它们会被读成「符合」
         let blocked = tally_line(
@@ -1900,6 +1944,22 @@ mod tests {
                 line
             );
         }
+    }
+
+    /// 只给次数不给状态，是这套日志被反复误读的根源。
+    /// 缓存空了必须明说，不能静默地只留一句「近 60 秒被改了 N 次」
+    #[test]
+    fn missing_state_is_announced_not_silent() {
+        assert!(empty_state_hint(None).contains("首轮校验"));
+        let empty = SyncTally::default();
+        assert!(empty_state_hint(Some(empty)).contains("没有受管线程"));
+        assert!(empty_state_hint(Some(empty)).contains("重新接管"));
+        let full = SyncTally {
+            total: 3,
+            ok: 3,
+            ..Default::default()
+        };
+        assert_eq!(empty_state_hint(Some(full)), "此刻没有受管线程");
     }
 
     /// 「受管 N 个 / 当前符合 X」必须能回答 Scene 里看到的到底是什么状态

@@ -279,8 +279,10 @@ fn offsets_inject(bpf: &mut Ebpf) -> bool {
         return false;
     }
 
+    // 这三个数都是结构体字节偏移，不是字段值。写成 `child_comm=28` 会被
+    // 读成「comm 是 28」，真机上已经有人问过这是不是异常
     println!(
-        "eBPF: tracepoint 偏移注入 [{}] fork[child_pid={}, child_comm={}] rename[newcomm={}]",
+        "eBPF: tracepoint 字段偏移注入 [{}] fork(child_pid@{}B, child_comm@{}B) rename(newcomm@{}B)",
         root, offsets.fork_child_pid, offsets.fork_child_comm, offsets.rename_newcomm
     );
     true
