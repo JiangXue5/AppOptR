@@ -18,6 +18,10 @@ use std::time::{Duration, Instant};
 use crate::apply_affinity::ApplyReason;
 use crate::cache::ProcCache;
 use crate::cpuset::{CpuSet, SysGroup};
+use crate::diag_fmt::{
+    Drift, SyncTally, classify_clip, combo_list, contra_line, delta_desc, empty_state_hint,
+    errno_hint, sample_tag, tally_line,
+};
 use crate::lock_ignore_poison;
 use crate::roles::{Role, role_of};
 use crate::sched::{SKIP_ALLOW, SKIP_LABELS, SchedSnapshot};
@@ -37,8 +41,10 @@ const JANK_WARN_MS: f64 = 4.0;
 const JANK_LOG_GAP: Duration = Duration::from_secs(30);
 /// 线程表最多保留的条目，避免 Web 一次拉太多
 const THREAD_CAP: usize = 160;
-/// 改写明细里每种「期望→实际」最多列几行，其余合并成「另 N 种」
-const COMBO_SHOW: usize = 3;
+/// 同一线程一个周期内被改写多少次才判为「持续对抗」
+const CONTRA_HITS: u32 = 3;
+/// 对抗行最多列几个线程
+const CONTRA_CAP: usize = 3;
 /// cpuset 失败后打印完整上下文的间隔
 const CPUSET_DETAIL_GAP: Duration = Duration::from_secs(300);
 
@@ -141,6 +147,57 @@ impl AffinityStats {
     }
 }
 
+/// 本周期计数：只记「发生了什么、几次」，摘要用完即清零。
+/// 与去重集合、样本分开，是为了加新的播报维度时不必再往一个大结构里堆字段
+#[derive(Default)]
+struct Counters {
+    fail: u64,
+    rewrite: u64,
+    cpuset: u64,
+    cap: u64,
+    sysgroup: u64,
+    unreachable: u64,
+    ineffective: u64,
+    stuck: u64,
+    /// 漂移分类计数：裁剪 / 重置 / 挪簇
+    kinds: [u64; 3],
+}
+
+/// 已经解释过一次的东西。这些集合跨周期保留，用来压掉重复播报
+#[derive(Default)]
+struct Seen {
+    /// 已经说明过的系统组（后台组 / 其他组）
+    sysgroup: HashSet<SysGroup>,
+    /// 已经说明过「目标被组集合裁小」的组
+    clip: HashSet<SysGroup>,
+    /// 已经解释过「为什么少了核」的期望集合。裁剪会在几百个线程上重复出现，
+    /// 原因却只有一个；按集合去重，避免把唯一有价值的解释刷掉
+    clip_why: HashSet<String>,
+    /// 已经解释过「多出来的核是谁写的」的读回集合。跨周期保留：
+    /// `4-7` 这种超集只会有一两种来源，重复解释等于每 60 秒说一遍同样的话
+    reset_why: HashSet<String>,
+}
+
+/// 本周期样本：给摘要的明细行用，用完即清零。
+/// 计数与样本分开存：计数回答「几次」，样本回答「哪种、谁」
+#[derive(Default)]
+struct Samples {
+    /// 「期望→实际」组合的精确计数：(是否超集, "a→b") → 次数。
+    /// 不能用样例去凑：真机上 7 次改写只留了 4 条样例，明细写成
+    /// 「多核写入 7（4-6→4-7 ×4）」，另外 3 次凭空消失
+    combo: HashMap<(bool, String), u32>,
+    /// 同一线程本周期被反复改写：tid → (comm, 次数, 最近读回集合)
+    reset_hits: HashMap<i32, (String, u32, String)>,
+    /// 被系统改动最多的线程名，只给前三个，不带 tid
+    cap_top: HashMap<String, u32>,
+    /// 组上限来自哪个组：path → 次数
+    cap_groups: HashMap<String, u32>,
+    /// 目标与所在组无交集的次数与首个样例
+    unreachable: Option<(String, i32, String, String)>,
+    /// 写后回读仍不一致的样本
+    ineffective: Vec<Drift>,
+}
+
 struct Sink {
     stats: AffinityStats,
     events: VecDeque<String>,
@@ -148,47 +205,11 @@ struct Sink {
     /// 每条线程各自的最近一次失败播报，避免持续失败刷屏
     fail_tid: HashMap<(i32, i32), Instant>,
     last_jank_log: Instant,
-    /// 本轮摘要周期内新增的失败数，用于决定要不要打摘要
-    fail_since_summary: u64,
-    rewrite_since_summary: u64,
-    cpuset_since_summary: u64,
-    /// 本周期「期望→实际」组合的精确计数：(是否超集, "a→b") → 次数
-    ///
-    /// 不能用样例去凑：真机上 7 次改写只留了 4 条样例，明细写成
-    /// 「多核写入 7（4-6→4-7 ×4）」，另外 3 次凭空消失，读者只能怀疑统计错了
-    drift_combo: HashMap<(bool, String), u32>,
-    /// 本周期漂移的分类计数：裁剪 / 重置 / 挪簇
-    drift_kind: [u64; 3],
-    /// 本周期「读回恰好等于线程所在组的生效集合」的次数。
-    ///
-    /// 这类不是异常：系统把线程放进 /foreground，该组 cpus 只到 0-5，
-    /// 规则要 4-6 就只能拿到 4-5。AppOpt 每轮都把它改回去，日志却把它
-    /// 算成「裁剪 167 次」，用户对着 Scene 的 4-6 怎么看都对不上
-    cap_since_summary: u64,
-    /// 被系统改动最多的线程名（本周期），只给前三个，不带 tid：
-    /// 用户要判断的是「是哪个组件在捣乱」，不是哪一号线程
-    cap_top: HashMap<String, u32>,
-    /// 组上限来自哪个组：path → 次数
-    cap_groups: HashMap<String, u32>,
-    /// 本周期因系统后台组跳过的次数
-    sysgroup_since_summary: u64,
-    /// 本周期「目标与所在组无交集」的次数与首个样例
-    unreachable_since_summary: u64,
-    unreachable_sample: Option<(String, i32, String, String)>,
-    /// 已经说明过的组，同类只播报一次
-    sysgroup_announced: HashSet<SysGroup>,
-    /// 已经说明过「目标被组集合裁小」的组
-    clip_announced: HashSet<SysGroup>,
-    /// 已经解释过「为什么少了核」的期望集合。裁剪会在几百个线程上重复出现，
-    /// 原因却只有一个；按集合去重，避免把唯一有价值的解释刷掉
-    clip_why: HashSet<String>,
-    /// 已经解释过「多出来的核是谁写的」的读回集合。跨周期保留：
-    /// `4-7` 这种超集只会有一两种来源，重复解释等于每 60 秒说一遍同样的话
-    reset_why: HashSet<String>,
-    /// 本周期「写后回读仍不一致」的样本与计数
-    ineffective: Vec<Drift>,
-    ineffective_n: u64,
-    stuck_skip: u64,
+    /// 本周期计数与样本，两者都不跨周期
+    counters: Counters,
+    samples: Samples,
+    /// 跨周期的去重集合
+    seen: Seen,
     /// 上一次 cpuset 完整上下文的打印时刻
     last_detail: Option<Instant>,
     /// 上一次看到的在线 CPU 集合，用于识别热插拔
@@ -201,45 +222,13 @@ struct Sink {
     /// 上一轮校验结束时各状态的线程数。用户最想知道的是「此刻绑上没有」，
     /// 只报「本周期重绑 17 个」会让人以为一直没绑上
     tally: Option<SyncTally>,
-    /// 最近一轮被组限制的线程集中在哪个组、该组可用哪几个核。
-    ///
-    /// 「被组限制 180（确实没绑）」只说了结果，没说为什么。180 个线程全部
-    /// 落在后台组（可用 0-3）和散落在多个组，是两种完全不同的处境：
-    /// 前者是游戏切后台、respect 下不动它，后者才是配置需要调
+    /// 最近一轮被组限制的线程集中在哪个组、该组可用哪几个核
     blocked_note: Option<(SysGroup, String)>,
     /// tid → (所属包, 是否进程主线程)。线程名常常和包名毫无关系
     /// （`HWC release`、`dns-work-0`），只印线程名时用户无法判断模块有没有
     /// 管到规则外的进程；主线程的 comm 会被内核截到 15 字节，日志里
     /// `cent.tmgp.sgame` 这种残名需要标注，否则读者以为是另一个进程
     thread_pkg: HashMap<i32, (String, bool)>,
-}
-
-/// 一轮校验结束时的状态分布。`ok + rebound + failed + blocked` 加上本轮
-/// 退出的线程就是受管总数；四个数相加对不上总数，说明有线程在中途消失
-#[derive(Clone, Copy, Default)]
-struct SyncTally {
-    total: usize,
-    ok: usize,
-    rebound: usize,
-    failed: usize,
-    blocked: usize,
-}
-
-/// 一次「读回与期望不一致」的现场。期望/实际的组合能直接区分根因：
-/// 实际是期望的子集＝被 cpuset 裁剪；实际是超集＝被整体重置；互不包含＝被挪簇
-#[derive(Clone)]
-pub struct Drift {
-    pub tid: i32,
-    pub comm: String,
-    /// 线程所属包。日志里只印线程名时，`HWC release`、`dns-work-0` 这种
-    /// 名字看不出是谁的线程，用户没法判断是不是模块管到了规则外的进程
-    pub pkg: String,
-    pub expect: String,
-    pub actual: String,
-    pub cpuset: String,
-    /// 该 tid 就是进程主线程。主线程的 comm 被内核截到 15 字节，
-    /// 日志里显示成包名残段，不标注会让读者以为出现了另一个进程
-    pub is_main: bool,
 }
 
 static SINK: Mutex<Option<Sink>> = Mutex::new(None);
@@ -254,24 +243,9 @@ fn sink() -> std::sync::MutexGuard<'static, Option<Sink>> {
         last_fail_log: None,
         fail_tid: HashMap::new(),
         last_jank_log: now,
-        fail_since_summary: 0,
-        rewrite_since_summary: 0,
-        cpuset_since_summary: 0,
-        drift_combo: HashMap::new(),
-        drift_kind: [0; 3],
-        cap_since_summary: 0,
-        cap_top: HashMap::new(),
-        cap_groups: HashMap::new(),
-        sysgroup_since_summary: 0,
-        unreachable_since_summary: 0,
-        unreachable_sample: None,
-        sysgroup_announced: HashSet::new(),
-        clip_announced: HashSet::new(),
-        clip_why: HashSet::new(),
-        reset_why: HashSet::new(),
-        ineffective: Vec::new(),
-        ineffective_n: 0,
-        stuck_skip: 0,
+        counters: Counters::default(),
+        samples: Samples::default(),
+        seen: Seen::default(),
         last_detail: None,
         last_online: None,
         last_snap: None,
@@ -333,7 +307,7 @@ pub fn note(reason: ApplyReason, outcome: &crate::apply_affinity::AffinityOutcom
         ApplyReason::Sync => {
             s.stats.sync += 1;
             if wrote {
-                s.rewrite_since_summary += 1;
+                s.counters.rewrite += 1;
             }
         }
         ApplyReason::Sched => s.stats.sched += 1,
@@ -376,7 +350,7 @@ pub fn note_failure(tid: i32, comm: &str, want: &CpuSet, errno: i32) {
     let mut guard = sink();
     let Some(s) = guard.as_mut() else { return };
     s.stats.failed += 1;
-    s.fail_since_summary += 1;
+    s.counters.fail += 1;
     match errno {
         libc::EPERM | libc::EACCES => s.stats.eperm += 1,
         libc::EINVAL => s.stats.einval += 1,
@@ -453,7 +427,7 @@ pub fn note_cpuset_failure(tid: i32, dir: &str, fail: crate::apply_affinity::Cpu
         return;
     }
     s.stats.cpuset_fail += 1;
-    s.cpuset_since_summary += 1;
+    s.counters.cpuset += 1;
     let line = match fail.errno() {
         Some(e) => format!(
             "cpuset: 写入 {}/tasks 失败（{}；{}），本次只靠绑核",
@@ -658,9 +632,9 @@ pub fn note_drift(tid: i32, comm: &str, expect: &CpuSet, actual: &CpuSet) {
     let Some(s) = guard.as_mut() else { return };
     if unreachable {
         s.stats.unreachable += 1;
-        s.unreachable_since_summary += 1;
-        if s.unreachable_sample.is_none() {
-            s.unreachable_sample = Some((
+        s.counters.unreachable += 1;
+        if s.samples.unreachable.is_none() {
+            s.samples.unreachable = Some((
                 comm.to_string(),
                 tid,
                 expect.to_range_string(),
@@ -670,23 +644,23 @@ pub fn note_drift(tid: i32, comm: &str, expect: &CpuSet, actual: &CpuSet) {
         return;
     }
     if let Some(path) = capped {
-        s.cap_since_summary += 1;
-        *s.cap_top.entry(comm.to_string()).or_insert(0) += 1;
-        *s.cap_groups.entry(path).or_insert(0) += 1;
+        s.counters.cap += 1;
+        *s.samples.cap_top.entry(comm.to_string()).or_insert(0) += 1;
+        *s.samples.cap_groups.entry(path).or_insert(0) += 1;
         return;
     }
     match kind {
         DriftKind::Clip => {
             s.stats.clip += 1;
-            s.drift_kind[0] += 1;
+            s.counters.kinds[0] += 1;
         }
         DriftKind::Reset => {
             s.stats.reset += 1;
-            s.drift_kind[1] += 1;
+            s.counters.kinds[1] += 1;
         }
         DriftKind::Shifted => {
             s.stats.shifted += 1;
-            s.drift_kind[2] += 1;
+            s.counters.kinds[2] += 1;
         }
     }
     let (pkg, is_main) = s
@@ -704,7 +678,8 @@ pub fn note_drift(tid: i32, comm: &str, expect: &CpuSet, actual: &CpuSet) {
         cpuset: read_thread_cpuset(tid),
     };
     let key = format!("{}→{}", sample.expect, sample.actual);
-    *s.drift_combo
+    *s.samples
+        .combo
         .entry((kind == DriftKind::Reset, key))
         .or_insert(0) += 1;
     // 裁剪的第一条现场必须回答「少的那几个核去哪了」。这台设备的 cpuset 连
@@ -716,7 +691,7 @@ pub fn note_drift(tid: i32, comm: &str, expect: &CpuSet, actual: &CpuSet) {
     let why_key = format!("{}@{}", sample.expect, sample.cpuset);
     match kind {
         DriftKind::Clip => {
-            if s.clip_why.insert(why_key) {
+            if s.seen.clip_why.insert(why_key) {
                 let line = clip_reason(&sample.expect, &sample.actual, &sample.cpuset);
                 tag("裁剪", &line);
                 push_event(s, line);
@@ -725,7 +700,7 @@ pub fn note_drift(tid: i32, comm: &str, expect: &CpuSet, actual: &CpuSet) {
         DriftKind::Shifted => {
             // 与裁剪共用去重集合：键里已含「期望@实际」，不会互相撞
             let key = format!("{}>{}", sample.expect, sample.actual);
-            if s.clip_why.insert(key) {
+            if s.seen.clip_why.insert(key) {
                 let line = format!(
                     "{} {} → {}（两边互不包含，被整体挪到别的簇）cpuset={}；\
                      本轮已按规则写回，若同一线程反复出现，多半是有外部组件在给它设亲和性",
@@ -739,12 +714,19 @@ pub fn note_drift(tid: i32, comm: &str, expect: &CpuSet, actual: &CpuSet) {
             }
         }
         DriftKind::Reset => {
+            let e = s
+                .samples
+                .reset_hits
+                .entry(tid)
+                .or_insert_with(|| (comm.to_string(), 0, String::new()));
+            e.1 += 1;
+            e.2 = sample.actual.clone();
             // 每次改写都留时间点（用户要的是「什么时候被动过」），
             // 但「谁写的」只解释一次：同一台设备上超集来源就那么几种
             // 只解释一次：同一台设备上超集来源就那么几种，每条都念一遍
             // 长句会把真正的「改了什么集合」埋掉
-            let first = s.reset_why.is_empty();
-            s.reset_why.insert(sample.actual.clone());
+            let first = s.seen.reset_why.is_empty();
+            s.seen.reset_why.insert(sample.actual.clone());
             let mut line = format!(
                 "{} {} → {}{} cpuset={}",
                 sample_tag(&sample),
@@ -765,41 +747,6 @@ pub fn note_drift(tid: i32, comm: &str, expect: &CpuSet, actual: &CpuSet) {
     }
 }
 
-/// 读回比规则多出来的核，写成 `（+7）` / `（+0-5）`。
-/// 只给两个集合让用户自己比，等于把判断成本推回去；差集才是「多了什么」
-fn delta_desc(expect: &str, actual: &str) -> String {
-    let mut extra = crate::cpuset::parse_cpu_ranges(actual, None);
-    extra.and_not(&crate::cpuset::parse_cpu_ranges(expect, None));
-    if extra.count() == 0 {
-        String::new()
-    } else {
-        format!("（多 {}）", extra.to_range_string())
-    }
-}
-
-/// 样例前缀：线程名 + tid + 所属包。带包名是为了让读者能自己判断
-/// 「这条线程到底是不是我规则里的包」——`HWC release`、`dns-work-0`
-/// 这类名字靠猜没用。包名为空说明没登记上，不是「不属于任何包」
-fn sample_tag(d: &Drift) -> String {
-    // 主线程的 comm 是被内核截过的包名残段（`cent.tmgp.sgame`），
-    // 不标注会被误读成「还有一个叫这个名字的进程」
-    // 主线程的 comm 只是包名残段，后面已经跟着完整包名，再念一遍是噪音：
-    // `主线程 ent.tmgp.osgame(13732)[com.tencent.tmgp.osgame]` 里那个残段
-    // 只会让人去找「谁叫 ent.tmgp.osgame」。没有包名时才退回 comm
-    let name = if d.is_main && !d.pkg.is_empty() {
-        "主线程".to_string()
-    } else if d.is_main {
-        format!("主线程 {}", d.comm)
-    } else {
-        d.comm.clone()
-    };
-    if d.pkg.is_empty() {
-        format!("{}({})", name, d.tid)
-    } else {
-        format!("{}({})[{}]", name, d.tid, d.pkg)
-    }
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DriftKind {
     /// 读回比期望小：被 cpuset 的 effective_cpus 或离线核裁掉
@@ -808,38 +755,6 @@ enum DriftKind {
     Reset,
     /// 互不包含：被挪到别的簇
     Shifted,
-}
-
-/// 裁剪的差集归因。抽成纯函数是为了能脱离本机 CPU 拓扑单测：
-/// 「少了一个核」到底是核下电还是组集合限制，决定了用户该等还是该改配置
-#[derive(Debug, PartialEq)]
-enum ClipWhy {
-    /// 差集里至少有一个核当前不在线；内核会把掩码与在线集合求交
-    Offline(CpuSet),
-    /// 核都在线，差集只能来自线程所在 cpuset 组的可用集合
-    GroupLimited,
-}
-
-fn classify_clip(want: &CpuSet, online: &CpuSet) -> ClipWhy {
-    let mut lost = *want;
-    lost.and_not(online);
-    if lost.count() > 0 {
-        return ClipWhy::Offline(lost);
-    }
-    // 汇总位图和逐核 online 文件可能不同步：MTK/高通的 core_ctl 先改单核
-    // 再刷新汇总，反过来也有。只信汇总，就会在「实际 4-5」旁边写一句
-    // 「4-6 都在线」，两边自相矛盾，读的人只能去猜
-    let mut dead = CpuSet::new();
-    for cpu in 0..64 {
-        if want.is_set(cpu) && !crate::cpuset::cpu_is_online(cpu) {
-            dead.set(cpu);
-        }
-    }
-    if dead.count() > 0 {
-        ClipWhy::Offline(dead)
-    } else {
-        ClipWhy::GroupLimited
-    }
 }
 
 /// 「期望比实际多几个核」的解释。差集能完全由离线解释时明确说是热插拔
@@ -854,8 +769,8 @@ fn clip_reason(expect: &str, actual: &str, group: &str) -> String {
             expect, actual
         );
     };
-    match classify_clip(&want, &online) {
-        ClipWhy::Offline(lost) => {
+    match classify_clip(&want, &online, crate::cpuset::cpu_is_online) {
+        crate::diag_fmt::ClipWhy::Offline(lost) => {
             // online 位图读得到时这层是冗余的，读不到时它是唯一依据；
             // 顺带排掉「online 写着在、单核 online 文件写着 0」这种不一致
             let dead: Vec<String> = (0..64)
@@ -876,7 +791,7 @@ fn clip_reason(expect: &str, actual: &str, group: &str) -> String {
                 }
             )
         }
-        ClipWhy::GroupLimited => group_clip_reason(expect, actual, &want, group),
+        crate::diag_fmt::ClipWhy::GroupLimited => group_clip_reason(expect, actual, &want, group),
     }
 }
 
@@ -968,14 +883,14 @@ pub fn note_ineffective(tid: i32, comm: &str, want: &CpuSet, after: &CpuSet) {
     let mut guard = sink();
     let Some(s) = guard.as_mut() else { return };
     s.stats.ineffective += 1;
-    s.ineffective_n += 1;
-    if s.ineffective.len() < 2 {
+    s.counters.ineffective += 1;
+    if s.samples.ineffective.len() < 2 {
         let (pkg, is_main) = s
             .thread_pkg
             .get(&tid)
             .cloned()
             .unwrap_or_else(|| (String::new(), false));
-        s.ineffective.push(Drift {
+        s.samples.ineffective.push(Drift {
             tid,
             comm: comm.to_string(),
             pkg,
@@ -992,7 +907,7 @@ pub fn note_stuck() {
     let mut guard = sink();
     let Some(s) = guard.as_mut() else { return };
     s.stats.stuck_skip += 1;
-    s.stuck_skip += 1;
+    s.counters.stuck += 1;
 }
 
 /// 线程被系统放在后台组、规则目标又不在该组生效集合内。
@@ -1004,8 +919,8 @@ pub fn note_sysgroup_skip(tid: i32, comm: &str, group: SysGroup, want: &CpuSet, 
     let mut guard = sink();
     let Some(s) = guard.as_mut() else { return };
     s.stats.sysgroup_skip += 1;
-    s.sysgroup_since_summary += 1;
-    if !s.sysgroup_announced.insert(group) {
+    s.counters.sysgroup += 1;
+    if !s.seen.sysgroup.insert(group) {
         return;
     }
     // 与改写/裁剪行同样带 [包名]：`dns-work-15` 这种名字看不出属于谁，
@@ -1040,13 +955,13 @@ pub fn note_sysgroup_batch(n: u64, hint: Option<(SysGroup, String)>) {
     let mut guard = sink();
     let Some(s) = guard.as_mut() else { return };
     s.stats.sysgroup_skip += n;
-    s.sysgroup_since_summary += n;
+    s.counters.sysgroup += n;
     // 归因留给总账：这一批线程在哪个组、该组可用哪几个核，
     // 是「游戏切后台」与「规则写错核」的唯一分界
     let (group, eff) = hint.unwrap_or((SysGroup::Unknown, "未知".to_string()));
     let eff = eff.as_str();
     s.blocked_note = Some((group, eff.to_string()));
-    if !s.sysgroup_announced.insert(group) {
+    if !s.seen.sysgroup.insert(group) {
         return;
     }
     let line = format!(
@@ -1083,7 +998,7 @@ pub fn note_sync_tally(total: usize, ok: usize, rebound: usize, failed: usize, b
 pub fn note_group_clip(group: SysGroup, want: &CpuSet, got: &CpuSet, eff: &str) {
     let mut guard = sink();
     let Some(s) = guard.as_mut() else { return };
-    if !s.clip_announced.insert(group) {
+    if !s.seen.clip.insert(group) {
         return;
     }
     // 这句曾经收在「要拿到完整集合写 @sysgroup=takeover」上，可 takeover 也要
@@ -1150,63 +1065,6 @@ fn push_event(s: &mut Sink, line: String) {
     s.events.push_back(line);
 }
 
-fn errno_hint(errno: i32) -> String {
-    match errno {
-        libc::EPERM | libc::EACCES => {
-            "权限被拒绝：SELinux、cgroup 限制或缺少 CAP_SYS_NICE".to_string()
-        }
-        libc::EINVAL => "目标集合非法，或与 cgroup cpuset 没有交集".to_string(),
-        libc::ESRCH => "线程已退出".to_string(),
-        libc::ENOSYS => "内核未实现该系统调用".to_string(),
-        e => format!("errno {}", e),
-    }
-}
-
-/// 「此刻」与「近 60 秒」必须在一行里说清：只报后者，读者会把它当成当前状态。
-/// 这条被误读过两次（「日志说没绑上，Scene 里却是对的」），所以抽成纯函数可回归
-fn tally_line(t: SyncTally, rewrites: u64, blocked_note: Option<&(SysGroup, String)>) -> String {
-    // 主数字必须是「一致」，不能只给「符合」。真机上出现过
-    // `受管 1 个线程 —— 符合 0、本轮重绑 1`，用户盯着那个 0 问「是不是没绑上」，
-    // 而实际状态是重绑后已经一致。ok 与 rebound 只是「这次有没有动手」的区别
-    let mut consistent = format!("一致 {}", t.ok + t.rebound);
-    if t.rebound > 0 {
-        // 重绑是「一致」的一部分（写了并被内核接受），并列写会被读成
-        // 「1 个一致 + 1 个重绑 = 2 个线程」
-        consistent.push_str(&format!("（其中重绑 {}）", t.rebound));
-    }
-    let mut parts = vec![format!("受管 {}", t.total), consistent];
-    if t.failed > 0 {
-        parts.push(format!("失败 {}", t.failed));
-    }
-    if t.blocked > 0 {
-        // 这一档是真的没绑，不能和「一致」混在一行里说得含糊。
-        // 用户拿 Scene 对照时，缺的正是「哪些确实没绑」这句话
-        // 再补一句它们在哪个组：180 个全在后台组是「切后台了」，
-        // 散在多个组才是「规则要的核拼不出来」，两者处理方式相反
-        let where_ = match blocked_note {
-            Some((g, eff)) => format!("，{}可用 {}", g.label(), eff),
-            None => String::new(),
-        };
-        parts.push(format!("被组限制 {}（确实没绑{}）", t.blocked, where_));
-    }
-    if rewrites > 0 {
-        parts.push(format!("本周期改写 {}", rewrites));
-    }
-    parts.join(" ｜ ")
-}
-
-/// 只报「这段时间被改了几次」而不给「此刻」，是这套日志被误读的最老一处。
-/// 拿不到当前状态时必须自己说出来，不能默认沉默——沉默会被读成「还是那样」
-fn empty_state_hint(tally: Option<SyncTally>) -> &'static str {
-    match tally {
-        None => "此刻还没有完成首轮校验",
-        Some(t) if t.total == 0 => {
-            "此刻没有受管线程（目标进程已退出或未被扫描到），下次命中会重新接管"
-        }
-        _ => "此刻没有受管线程",
-    }
-}
-
 /// 主循环低频调用：每 60 秒给一条「总账」，有异常才追加明细行。
 ///
 /// 布局刻意做成「一行总账 + 若干明细」：
@@ -1222,21 +1080,23 @@ fn empty_state_hint(tally: Option<SyncTally>) -> &'static str {
 pub fn periodic_summary(current: &SchedSnapshot) {
     let mut guard = sink();
     let Some(s) = guard.as_mut() else { return };
-    let fails = std::mem::take(&mut s.fail_since_summary);
-    let rewrites = std::mem::take(&mut s.rewrite_since_summary);
-    let cpuset = std::mem::take(&mut s.cpuset_since_summary);
-    let sysgroup = std::mem::take(&mut s.sysgroup_since_summary);
-    let unreach = std::mem::take(&mut s.unreachable_since_summary);
-    let unreach_sample = s.unreachable_sample.take();
-    let kinds = std::mem::take(&mut s.drift_kind);
-    let combo = std::mem::take(&mut s.drift_combo);
-    let caps = std::mem::take(&mut s.cap_since_summary);
-    let cap_top = std::mem::take(&mut s.cap_top);
-    let mut cap_groups: Vec<(String, u32)> =
-        std::mem::take(&mut s.cap_groups).into_iter().collect();
-    let ineff_n = std::mem::take(&mut s.ineffective_n);
-    let ineff = std::mem::take(&mut s.ineffective);
-    let stuck = std::mem::take(&mut s.stuck_skip);
+    let fails = std::mem::take(&mut s.counters.fail);
+    let rewrites = std::mem::take(&mut s.counters.rewrite);
+    let cpuset = std::mem::take(&mut s.counters.cpuset);
+    let sysgroup = std::mem::take(&mut s.counters.sysgroup);
+    let unreach = std::mem::take(&mut s.counters.unreachable);
+    let unreach_sample = s.samples.unreachable.take();
+    let kinds = std::mem::take(&mut s.counters.kinds);
+    let combo = std::mem::take(&mut s.samples.combo);
+    let reset_hits = std::mem::take(&mut s.samples.reset_hits);
+    let caps = std::mem::take(&mut s.counters.cap);
+    let cap_top = std::mem::take(&mut s.samples.cap_top);
+    let mut cap_groups: Vec<(String, u32)> = std::mem::take(&mut s.samples.cap_groups)
+        .into_iter()
+        .collect();
+    let ineff_n = std::mem::take(&mut s.counters.ineffective);
+    let ineff = std::mem::take(&mut s.samples.ineffective);
+    let stuck = std::mem::take(&mut s.counters.stuck);
     let tally = s.tally.take();
     let prev = s.last_snap.replace(current.clone());
 
@@ -1292,6 +1152,14 @@ pub fn periodic_summary(current: &SchedSnapshot) {
     match tally.filter(|t| t.total > 0) {
         Some(t) => tag("周期", &tally_line(t, rewrites, s.blocked_note.as_ref())),
         None => tag("周期", empty_state_hint(tally)),
+    }
+
+    // ── 持续对抗：同一个线程被反复改写 ────────────────────────
+    // 聚合与排版在 diag_fmt，这里只提供 pkg 表
+    if let Some(line) = contra_line(&reset_hits, CONTRA_HITS, CONTRA_CAP, |tid| {
+        s.thread_pkg.get(&tid).map(|(p, _)| p.clone())
+    }) {
+        tag("周期", &line);
     }
 
     // ── 明细：每类一行，没有就不打 ───────────────────────────
@@ -1393,41 +1261,6 @@ pub fn periodic_summary(current: &SchedSnapshot) {
     } else {
         s.allow_hint_shown = hint;
     }
-}
-
-/// 本周期「期望→实际」组合，按次数排序后给前三种。
-/// `resets` 为真取超集（被外部改大），否则取子集（被裁小）。
-///
-/// 计数在 `note_drift` 里逐次累加，不依赖样例数组：真机上 7 次改写
-/// 只留了 4 条样例，明细写成「7（4-6→4-7 ×4）」，另外 3 次凭空消失，
-/// 读者最先怀疑的就是统计本身。种类多于三种时把剩下的合并成「另 N 种 ×M」，
-/// 保证「列出来的次数之和 = 总数」
-fn combo_list(combo: &HashMap<(bool, String), u32>, resets: bool) -> String {
-    let mut v: Vec<(&String, u32)> = combo
-        .iter()
-        .filter(|((is_reset, _), _)| *is_reset == resets)
-        .map(|((_, k), n)| (k, *n))
-        .collect();
-    if v.is_empty() {
-        return "样例已略".to_string();
-    }
-    // 次数多的在前；同次数按组合字典序，输出稳定，便于逐次对比日志
-    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
-    let head: Vec<String> = v
-        .iter()
-        .take(COMBO_SHOW)
-        .map(|(k, n)| format!("{} ×{}", k, n))
-        .collect();
-    if v.len() <= COMBO_SHOW {
-        return head.join("、");
-    }
-    let rest: u32 = v.iter().skip(COMBO_SHOW).map(|(_, n)| *n).sum();
-    format!(
-        "{}，另 {} 种 ×{}",
-        head.join("、"),
-        v.len() - COMBO_SHOW,
-        rest
-    )
 }
 
 /// S7 周期说明。开着的策略必须能自证「在看、在判、为什么不动」，
@@ -1844,126 +1677,30 @@ mod tests {
         ));
     }
 
-    /// 总账的主数字必须是「一致」，且「此刻」必须排在「本周期改写」之前。
-    /// 真机上 `符合 0、本轮重绑 1` 被读成「一个都没绑上」，前后误读三次。
-    /// 明细（组上限/多核写入）不得挤进总账，否则第一眼又变成讲历史
+    /// 外部改写要一路走到事件环：Drift 构造 → 包名标注 → 差集描述。
+    /// 日志层拆分后这条链路跨了两个模块，必须有一个端到端用例盯着
     #[test]
-    fn tally_line_puts_current_state_first() {
-        let t = SyncTally {
-            total: 173,
-            ok: 173,
-            rebound: 0,
-            failed: 0,
-            blocked: 0,
-        };
-        let line = tally_line(t, 171, None);
-        assert!(line.contains("受管 173"), "{}", line);
-        assert!(line.contains("一致 173"), "{}", line);
-        let state = line.find("一致 173").unwrap();
-        let history = line.find("本周期改写").unwrap();
-        assert!(state < history, "状态必须在前：{}", line);
-        assert!(!line.contains("组上限"), "明细不该挤进总账：{}", line);
-
-        // 一次都没被改过时不要提「本周期改写 0」
-        let quiet = tally_line(t, 0, None);
-        assert!(!quiet.contains("改写"), "{}", quiet);
-
-        // 全部线程都是本轮重绑的：主数字仍必须是「一致 1」。
-        // 真机上这里是 `符合 0、本轮重绑 1`，用户盯着 0 以为没绑上
-        let rebound = tally_line(
-            SyncTally {
-                total: 1,
-                ok: 0,
-                rebound: 1,
-                failed: 0,
-                blocked: 0,
-            },
-            1,
-            None,
+    fn reset_rewrite_reaches_the_event_ring_with_package() {
+        let tid = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
+        bind_pkg(tid, "com.audit.game", true);
+        // 期望是子集、读回是超集 → 分类为 Reset（被整体改大）
+        note_drift(
+            tid,
+            "com.audit.game",
+            &set_of(&[4, 5, 6]),
+            &set_of(&[4, 5, 6, 7]),
         );
-        assert!(rebound.contains("一致 1"), "{}", rebound);
-        assert!(rebound.contains("重绑 1"), "{}", rebound);
-        assert!(!rebound.contains("符合"), "{}", rebound);
-
-        // 被系统组限制的线程要单独说清，否则它们会被读成「一致」
-        let blocked = tally_line(
-            SyncTally {
-                total: 170,
-                ok: 0,
-                rebound: 0,
-                failed: 0,
-                blocked: 170,
-            },
-            0,
-            None,
-        );
-        assert!(blocked.contains("被组限制 170（确实没绑）"), "{}", blocked);
-
-        // 被挡的线程集中在后台组：总账要把「在哪个组、可用哪几个核」带上，
-        // 否则「一致 0」只能靠翻下一行才知道是切了后台
-        let hint = (SysGroup::Background, "0-3".to_string());
-        let blocked = tally_line(
-            SyncTally {
-                total: 170,
-                ok: 0,
-                rebound: 0,
-                failed: 0,
-                blocked: 170,
-            },
-            0,
-            Some(&hint),
-        );
-        assert!(blocked.contains("后台组可用 0-3"), "{}", blocked);
-    }
-
-    /// 明细必须与总数对得上。真机 7 次改写只列了「4-6→4-7 ×4」，
-    /// 另 3 次凭空消失——那 3 次是 4-6→0-7 ×2 与 7→4-7 ×1，样例数组放不下
-    #[test]
-    fn combo_totals_add_up_to_the_kind_count() {
-        let mut m: HashMap<(bool, String), u32> = HashMap::new();
-        for (k, n) in [("4-6→4-7", 4), ("4-6→0-7", 2), ("7→4-7", 1)] {
-            *m.entry((true, k.to_string())).or_insert(0) += n;
-        }
-        let line = combo_list(&m, true);
-        assert!(line.contains("4-6→4-7 ×4"), "{}", line);
-        assert!(line.contains("4-6→0-7 ×2"), "{}", line);
-        assert!(line.contains("7→4-7 ×1"), "{}", line);
-
-        // 种类超过上限时合并成「另 N 种 ×M」，不能丢
-        for i in 0..4 {
-            *m.entry((true, format!("1-{}→0-7", i))).or_insert(0) += 1;
-        }
-        let line = combo_list(&m, true);
-        assert!(line.contains("另 4 种 ×4"), "{}", line);
-
-        // 子集（被裁小）不能混进超集（被改大）的明细
-        *m.entry((false, "1-7→0-3".to_string())).or_insert(0) += 5;
-        assert!(combo_list(&m, true).contains("4-6→4-7 ×4"));
-        let clip = combo_list(&m, false);
-        assert!(clip.contains("1-7→0-3 ×5"), "{}", clip);
-        assert!(!clip.contains("4-6→4-7"), "{}", clip);
-    }
-
-    /// 主线程的 comm 是包名残段，后面已有完整包名时不该再念一遍
-    #[test]
-    fn main_thread_sample_does_not_repeat_the_truncated_comm() {
-        let d = Drift {
-            tid: 13732,
-            comm: "ent.tmgp.osgame".to_string(),
-            pkg: "com.tencent.tmgp.osgame".to_string(),
-            expect: "4-6".to_string(),
-            actual: "4-7".to_string(),
-            cpuset: "/top-app".to_string(),
-            is_main: true,
-        };
-        let s = sample_tag(&d);
-        assert_eq!(s, "主线程(13732)[com.tencent.tmgp.osgame]");
-        // 没登记到包名时仍要留 comm，否则只剩一个 tid 无从核对
-        let orphan = Drift {
-            pkg: String::new(),
-            ..d
-        };
-        assert!(sample_tag(&orphan).contains("ent.tmgp.osgame"));
+        let sn = snapshot();
+        let line = sn
+            .events
+            .iter()
+            .rev()
+            .find(|e| e.contains("4-6 → 4-7"))
+            .expect("改写行必须进入事件环");
+        assert!(line.contains("[com.audit.game]"), "{}", line);
+        assert!(line.contains("（多 7）"), "{}", line);
+        // 主线程不再重复念截断的 comm
+        assert!(!line.contains("主线程 com.audit.game("), "{}", line);
     }
 
     /// S7 开着却不动时，摘要必须说清「跑了几轮、为什么跳过」
@@ -2198,26 +1935,5 @@ mod tests {
         let mut moved = wait.clone();
         moved.state = "等待采样窗口";
         assert!(sched_period_line(Some(&wait), &moved, &mut hint).is_some());
-    }
-
-    /// 「规则写 4-6、回读 4-5」有两种完全不同的根因：核被下电，或组集合限制。
-    /// 前者等核上线就好，后者才需要改配置——归因错了用户会去改一条对的规则
-    #[test]
-    fn clip_reason_distinguishes_offline_from_group_limit() {
-        let parse = |s: &str| crate::cpuset::parse_cpu_ranges(s, None);
-        assert_eq!(
-            classify_clip(&parse("4-6"), &parse("0-5,7")),
-            ClipWhy::Offline(parse("6"))
-        );
-        // 核都在线时不能推给热插拔
-        assert_eq!(
-            classify_clip(&parse("4-6"), &parse("0-7")),
-            ClipWhy::GroupLimited
-        );
-        // 一次下电两个核要一次说全，不能只报一个
-        assert_eq!(
-            classify_clip(&parse("4-7"), &parse("0-5")),
-            ClipWhy::Offline(parse("6-7"))
-        );
     }
 }

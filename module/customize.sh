@@ -193,4 +193,13 @@ copy_default_rules
 extract_bin
 module_instructions
 set_perm_recursive "$MODPATH" 0 0 0755 0644
-set_perm_recursive "$MODPATH/*.sh $MODPATH/AppOpt $MODPATH/AppOpt-ebpf" 0 2000 0755 0755 u:object_r:magisk_file:s0
+# 上面这条会把所有文件压到 0644（含主程序与 *.sh），必须逐个恢复。
+# 旧版把三个路径塞进同一个参数：set_perm_recursive 只接受单个目录，
+# 于是这条命令一直在报「no such file」，失败又被脚本忽略，二进制停在 0644，
+# service.sh 里 `nohup $MODDIR/AppOpt` 直接 Permission denied
+set_perm "$MODPATH/AppOpt" 0 2000 0755 u:object_r:magisk_file:s0
+set_perm "$MODPATH/AppOpt-ebpf" 0 2000 0755 u:object_r:magisk_file:s0
+for _sh in "$MODPATH"/*.sh; do
+	[ -f "$_sh" ] || continue
+	set_perm "$_sh" 0 2000 0755 u:object_r:magisk_file:s0
+done

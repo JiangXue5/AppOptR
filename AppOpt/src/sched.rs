@@ -74,13 +74,17 @@ pub const SKIP_LOAD: usize = 2;
 pub const SKIP_DWELL: usize = 3;
 pub const SKIP_COOLDOWN: usize = 4;
 pub const SKIP_QUOTA: usize = 5;
-pub const SKIP_LABELS: [&str; 6] = [
+/// 采样本身拿不到（`/proc/stat` 读失败、计数器回绕）：与「负载不达标」分开，
+/// 前者该降频，后者是正常判定结果
+pub const SKIP_SAMPLE: usize = 6;
+pub const SKIP_LABELS: [&str; 7] = [
     "允许集合不足两层",
     "线程角色不可迁移",
     "目标没有明显更空",
     "驻留时间不足",
     "冷却中",
     "目标簇配额已满",
+    "负载采样不可用",
 ];
 
 const CLUSTER_NAME: [&str; 3] = ["e-core", "p-core", "hp-core"];
@@ -108,6 +112,9 @@ struct ThreadState {
     applied: CpuSet,
     /// 连续同向确认次数
     streak: u8,
+    /// 这串确认指向的目标簇。目标在两轮之间变了说明负载还在飘，
+    /// 必须重新计数——否则 p→hp→p 交替三次也会被当成「连续三次同向」
+    streak_target: Option<u8>,
     last_move: Option<Instant>,
     /// 最小驻留起点
     first_seen: Instant,
@@ -127,6 +134,7 @@ impl ThreadState {
             own: false,
             applied: CpuSet::new(),
             streak: 0,
+            streak_target: None,
             last_move: None,
             first_seen: now,
             last_from: None,
@@ -136,11 +144,18 @@ impl ThreadState {
         }
     }
 
+    /// 清零连续确认。凡是「这次判断不作数」的路径都要连目标一起清，
+    /// 只清计数会把上一次的目标留在 streak_target 里，下一轮换目标时看不出变化
+    fn clear_streak(&mut self) {
+        self.streak = 0;
+        self.streak_target = None;
+    }
+
     fn reset(&mut self) {
         self.cur = None;
         self.own = false;
         self.applied = CpuSet::new();
-        self.streak = 0;
+        self.clear_streak();
         self.last_move = None;
         self.last_from = None;
         self.window = Instant::now();
@@ -202,21 +217,21 @@ fn judge(
     mode: SchedMode,
 ) -> Action {
     if base < 0 {
-        return Action::Skip(SKIP_LOAD);
+        return Action::Skip(SKIP_SAMPLE);
     }
     let Some(target) = pick_target(&load, allow, st.cur) else {
         return Action::Skip(SKIP_LOAD);
     };
     if Some(target) == st.cur {
-        st.streak = 0;
+        st.clear_streak();
         return Action::Skip(SKIP_LOAD);
     }
     if base - load[target as usize] < LOAD_GAP {
-        st.streak = 0;
+        st.clear_streak();
         return Action::Skip(SKIP_LOAD);
     }
     if !target_ok(target, &load, allow, &home.cpus, topo) {
-        st.streak = 0;
+        st.clear_streak();
         return Action::Skip(SKIP_LOAD);
     }
     if st.first_seen.elapsed() < MIN_DWELL {
@@ -234,21 +249,28 @@ fn judge(
             .last_move
             .is_some_and(|t| now.duration_since(t) < REVERSE_COOLDOWN)
     {
-        st.streak = 0;
+        st.clear_streak();
         return Action::Bounce;
     }
     if placed[target as usize] >= quota(target, topo) {
         return Action::Skip(SKIP_QUOTA);
     }
 
+    // 三次确认必须指向同一个簇。目标一变就重新计数：真机上 1 秒一轮，
+    // 负载在 p 与 hp 之间来回飘时，旧实现照样累到 3 就迁，等于没有确认
+    if st.streak_target != Some(target) {
+        st.streak = 0;
+        st.streak_target = Some(target);
+    }
     st.streak = st.streak.saturating_add(1);
     if st.streak < CONFIRM_TICKS {
         return Action::Nothing;
     }
     let Some(cpus) = target_cpus(target, &home.cpus, topo) else {
+        st.clear_streak();
         return Action::Skip(SKIP_LOAD);
     };
-    st.streak = 0;
+    st.clear_streak();
     if mode == SchedMode::On {
         Action::Move { target, cpus }
     } else {
@@ -278,7 +300,7 @@ pub struct SchedSnapshot {
     /// 因角色、目标簇核数等约束被拒的线程次
     pub blocked: u64,
     /// 各跳过原因计数，下标见 `SKIP_LABELS`
-    pub skip: [u64; 6],
+    pub skip: [u64; 7],
     /// 被反悔冷却拦住的次数
     pub bounced: u64,
     /// 抖动过多被冻结的线程数
@@ -299,7 +321,7 @@ pub struct SchedState {
     moved: u64,
     failed: u64,
     blocked: u64,
-    skip: [u64; 6],
+    skip: [u64; 7],
     bounced: u64,
     frozen: u64,
     threads: HashMap<i32, ThreadState>,
@@ -312,6 +334,8 @@ pub struct SchedState {
     ring: VecDeque<String>,
     /// 连续「全部跳过、零迁移」的轮数，用于判断判定是否在白跑
     idle_rounds: u32,
+    /// 最近的降频是因为采样不可用（而不是规则单簇），状态文案据此区分
+    idle_sample: bool,
     /// 上一次真正做判定的时刻，降频时用
     last_decide: Option<Instant>,
     /// 轮转游标，保证线程数超过 MAX_PROBE 时仍能全覆盖
@@ -335,12 +359,13 @@ impl SchedState {
             ticks: 0,
             probed: 0,
             idle_rounds: 0,
+            idle_sample: false,
             last_decide: None,
             would: 0,
             moved: 0,
             failed: 0,
             blocked: 0,
-            skip: [0; 6],
+            skip: [0; 7],
             bounced: 0,
             frozen: 0,
             threads: HashMap::new(),
@@ -415,10 +440,11 @@ impl SchedState {
         // 连续几轮如此就降频，情况一变（规则改成跨簇、或出现可让位线程）
         // idle_rounds 会清零并立刻恢复每秒判定
         if self.should_idle(Instant::now()) {
-            self.state = if self.idle_rounds >= DEAD_ROUNDS {
-                "规则单簇，判定已休眠"
-            } else {
-                "规则单簇，判定已降频"
+            self.state = match (self.idle_rounds >= DEAD_ROUNDS, self.idle_sample) {
+                (true, false) => "规则单簇，判定已休眠",
+                (false, false) => "规则单簇，判定已降频",
+                (true, true) => "负载采样不可用，判定已休眠",
+                (false, true) => "负载采样不可用，判定已降频",
             };
             return Vec::new();
         }
@@ -440,26 +466,29 @@ impl SchedState {
         }
         self.state = "运行中";
         let before_allow = self.skip[SKIP_ALLOW];
+        let before_sample = self.skip[SKIP_SAMPLE];
         let probed_now = cache.tasks.len().min(MAX_PROBE) as u64;
         let moves = self.tick_at(cfg, cache, load, Instant::now());
         self.last_decide = Some(Instant::now());
-        // 本轮的跳过如果全部来自「允许集合不足两层」，说明规则本身就是单簇，
-        // 不是负载不达标——这种白跑会持续到规则改变为止
-        self.note_round(
-            probed_now,
-            self.skip[SKIP_ALLOW].saturating_sub(before_allow),
-            !moves.is_empty(),
-        );
+        // 两类「白跑」要一起算：规则本身单簇，与采样根本拿不到。只看前者时，
+        // `/proc/stat` 长期读不出来（格式异常、计数器回绕）的设备会一直按
+        // 每秒一轮空转，永远不会进降频档
+        let allow_skip = self.skip[SKIP_ALLOW].saturating_sub(before_allow);
+        let sample_skip = self.skip[SKIP_SAMPLE].saturating_sub(before_sample);
+        self.note_round(probed_now, allow_skip + sample_skip, !moves.is_empty());
         moves
     }
 
     /// 一轮判定后更新「白跑」计数。只有「探到了线程、一个都没迁、
     /// 且跳过原因全是允许集合不足」才算白跑；负载不达标属于正常判定
-    fn note_round(&mut self, probed_now: u64, skipped_allow: u64, moved: bool) {
-        if probed_now > 0 && !moved && skipped_allow >= probed_now {
+    fn note_round(&mut self, probed_now: u64, skipped_idle: u64, moved: bool) {
+        if probed_now > 0 && !moved && skipped_idle >= probed_now {
             self.idle_rounds = self.idle_rounds.saturating_add(1);
+            // 采样不可用优先归因：它比「规则单簇」更需要用户处理
+            self.idle_sample = self.skip[SKIP_SAMPLE] > 0;
         } else {
             self.idle_rounds = 0;
+            self.idle_sample = false;
         }
     }
 
@@ -705,7 +734,7 @@ impl SchedState {
                     // shadow 只把候选记进 would / 环形缓冲，绝不产出 Move；
                     // on 只产出候选，状态等 settle 确认后再提交
                     if let Some(st) = self.threads.get_mut(&tid) {
-                        st.streak = 0;
+                        st.clear_streak();
                     }
                     placed[target as usize] = placed[target as usize].saturating_add(1);
                     out.push(Move {
@@ -1496,6 +1525,105 @@ mod tests {
         let mv = st.tick_at(&cfg, &cache, [-1, 600, 100], now);
         assert!(mv.is_empty(), "反悔冷却内不得迁回");
         assert_eq!(st.bounced, 1);
+    }
+
+    /// 三次确认必须指向同一个簇：负载在 p 与 hp 之间交替时，
+    /// 旧实现照样在第三轮凑满计数并迁移，三次确认形同虚设。
+    /// 直接调 `judge`，把 `base` 固定住，避免 `decide` 的加权平均干扰判定
+    #[test]
+    fn confirm_streak_restarts_when_target_flips() {
+        let t = topo();
+        let mut allowed = CpuSet::new();
+        allowed.or(&t.p_core);
+        allowed.or(&t.hp_core);
+        let home = crate::rule_match::AffinityResult {
+            cpus: allowed,
+            cpuset_dir: String::new(),
+            is_thread_rule: true,
+        };
+        let allow = [false, true, true];
+        let placed = [0u16; 3];
+        let now = Instant::now();
+        let mut th = ThreadState::new(now - Duration::from_secs(10));
+
+        // hp 最空 → 候选 hp，计 1
+        assert!(matches!(
+            judge(
+                &mut th,
+                &home,
+                &allow,
+                [-1, 600, 100],
+                600,
+                &t,
+                now,
+                &placed,
+                SchedMode::On
+            ),
+            Action::Nothing
+        ));
+        assert_eq!((th.streak, th.streak_target), (1, Some(2)));
+
+        // p 最空 → 换了目标：计数必须从 1 重来，而不是累到 2
+        assert!(matches!(
+            judge(
+                &mut th,
+                &home,
+                &allow,
+                [-1, 100, 600],
+                600,
+                &t,
+                now,
+                &placed,
+                SchedMode::On
+            ),
+            Action::Nothing
+        ));
+        assert_eq!(th.streak, 1, "目标变了不能继续累加");
+        assert_eq!(th.streak_target, Some(1));
+    }
+
+    /// 采样不可用（`/proc/stat` 读不出）也要计入空转降频：
+    /// 旧实现只看「允许集合不足」，这类设备会一直每秒空转
+    #[test]
+    fn sample_failure_counts_toward_idle_backoff() {
+        let mut st = SchedState::new();
+        // 让 note_round 看到本轮跳过全部来自采样不可用
+        st.skip[SKIP_SAMPLE] = MAX_PROBE as u64;
+        for _ in 0..IDLE_ROUNDS {
+            st.note_round(MAX_PROBE as u64, MAX_PROBE as u64, false);
+        }
+        assert!(st.idle_rounds >= IDLE_ROUNDS);
+        assert!(
+            st.idle_sample,
+            "降频原因要能被区分，状态文案才不是「规则单簇」"
+        );
+
+        // 恢复正常判定后立刻清零
+        st.skip[SKIP_SAMPLE] = 0;
+        st.note_round(MAX_PROBE as u64, 0, false);
+        assert_eq!(st.idle_rounds, 0);
+        assert!(!st.idle_sample);
+    }
+
+    /// 跳过原因的标签与计数槽必须一一对应（Web 按标签下标取数）
+    #[test]
+    fn skip_labels_match_counter_slots() {
+        assert_eq!(SKIP_LABELS.len(), SchedState::new().skip.len());
+    }
+
+    /// 同一目标连续三轮才真正提交迁移
+    #[test]
+    fn confirm_streak_needs_three_rounds_on_same_target() {
+        let (cfg, cache) = span_cache("streak_same");
+        let mut st = state_for(&cache, SchedMode::On);
+        let now = Instant::now();
+        let load = [-1, 600, 100];
+        assert!(st.tick_at(&cfg, &cache, load, now).is_empty());
+        assert!(st.tick_at(&cfg, &cache, load, now).is_empty());
+        let mv = st.tick_at(&cfg, &cache, load, now);
+        assert_eq!(mv.len(), 1, "第三轮应产出一次迁移");
+        assert_eq!(mv[0].target, 2);
+        assert_eq!(st.threads[&1001].streak, 0, "提交后计数归零");
     }
 
     /// 预算窗口内迁移三次即冻结，且不再产出 Move

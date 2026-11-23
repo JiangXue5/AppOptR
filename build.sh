@@ -169,6 +169,8 @@ build_userspace() {
 # ---------- 5. 打包 ----------
 package() {
 	local abi="$1"
+	# 第二参数只改包名后缀，不参与目录布局（host 调试包用 -dev 与正式包区分）
+	local suffix="${2:-}"
 	local stage zipname version
 	stage="$WORK/module-$abi"
 	version=$(sed -n 's/^version=//p' "$ROOT/module/module.prop" | head -1)
@@ -189,7 +191,7 @@ package() {
 	chmod 0755 "$stage/bin/$abi/AppOpt"
 
 	mkdir -p "$OUT_DIR"
-	zipname="$OUT_DIR/AppOpt-$version-$abi.zip"
+	zipname="$OUT_DIR/AppOpt-$version-$abi$suffix.zip"
 	rm -f "$zipname"
 	(
 		cd "$stage"
@@ -209,12 +211,30 @@ fi
 
 case "$ARCH" in
 host)
+	# 默认构建只在「Rust 宿主就是 Android」时有意义（Termux）。
+	# 普通 Linux/macOS 上 cargo build 出的是宿主 ELF，按 uname -m 塞进
+	# android ABI 目录后刷进设备必然起不来：缺 bionic，解释器路径也不对。
+	# 这里必须拦住，否则一个 ./build.sh 就能做出「看起来正常」的坏包
+	HOST_TRIPLE=$(rustc -vV | sed -n 's/^host: //p')
+	HOST_SUFFIX=""
+	case "$HOST_TRIPLE" in
+	*android*) ;;
+	*)
+		if [ "${ALLOW_NON_ANDROID_HOST:-0}" != "1" ]; then
+			die "默认构建的 Rust host 是 $HOST_TRIPLE（非 Android），产物无法在设备上运行。
+       请改用交叉编译：./build.sh -a arm64 ｜ -a x64 ｜ -a all
+       只做本地逻辑验证时，设 ALLOW_NON_ANDROID_HOST=1，产物名会带 -dev 后缀"
+		fi
+		say "    警告: host 为 $HOST_TRIPLE，产物仅供本地调试，不可发布"
+		HOST_SUFFIX="-dev"
+		;;
+	esac
 	BIN_USR=""
 	build_userspace "host" ""
 	if [ "$SKIP_EBPF" -eq 0 ]; then
 		build_ebpf
 	fi
-	package "$(host_abi)"
+	package "$(host_abi)" "$HOST_SUFFIX"
 	;;
 arm64 | x64)
 	check_target "$ARCH"

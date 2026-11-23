@@ -9,6 +9,11 @@ wait_sys_boot_completed
 MODDIR=${0%/*}
 cd $MODDIR
 
+# 旧版安装脚本把主程序权限压成 0644（set_perm_recursive 把多路径当成了一个
+# 参数），升级上来的设备不会重跑 customize.sh 的恢复逻辑，这里兜一次。
+# 失败不阻塞：真正的原因是安装包有问题，日志里会看到 Permission denied
+[ -x "${MODDIR}/AppOpt" ] || chmod 0755 "${MODDIR}/AppOpt" 2>/dev/null
+
 # 日志写入模块目录，超过 1 MiB 时启动前轮转一次，避免无限增长
 LOG_FILE=${MODDIR}/appopt.log
 LOG_MAX_KB=1024

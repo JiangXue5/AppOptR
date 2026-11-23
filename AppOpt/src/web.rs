@@ -6,7 +6,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -883,7 +883,31 @@ fn rank_top(counts: BTreeMap<String, usize>, lq: &str) -> Vec<(String, usize)> {
         .collect()
 }
 
-fn suggest_pkgs(q: &str) -> Vec<(String, usize)> {
+/// 联想结果的缓存时长。`/api/suggest` 由输入触发，每次都要全量遍历
+/// `/proc` 与 `/data/data`；前端虽然有 250ms 防抖，连续输入仍会打出
+/// 多次全量扫描。扫描结果只随安装/启动变化，5 秒足够，且排序在 q 上做，
+/// 缓存全量列表不影响过滤
+const SUGGEST_TTL: Duration = Duration::from_secs(5);
+
+/// (扫描时刻, 全量结果)
+type ScanCache = (Instant, Vec<(String, usize)>);
+/// (扫描时刻, 包名, 该包的线程名结果)
+type ThreadScanCache = (Instant, String, Vec<(String, usize)>);
+
+static PKG_SCAN: Mutex<Option<ScanCache>> = Mutex::new(None);
+static THREAD_SCAN: Mutex<Option<ThreadScanCache>> = Mutex::new(None);
+
+/// 全量包名与同名进程数，命中缓存直接返回
+fn pkg_counts() -> Vec<(String, usize)> {
+    let cached = {
+        let g = lock_ignore_poison(&PKG_SCAN);
+        g.as_ref()
+            .filter(|(t, _)| t.elapsed() < SUGGEST_TTL)
+            .map(|(_, v)| v.clone())
+    };
+    if let Some(v) = cached {
+        return v;
+    }
     let mut counts: BTreeMap<String, usize> =
         installed_pkgs().into_iter().map(|p| (p, 0)).collect();
     for_each_pid(|pid| {
@@ -891,6 +915,13 @@ fn suggest_pkgs(q: &str) -> Vec<(String, usize)> {
             *counts.entry(name).or_insert(0) += 1;
         }
     });
+    let v: Vec<(String, usize)> = counts.into_iter().collect();
+    *lock_ignore_poison(&PKG_SCAN) = Some((Instant::now(), v.clone()));
+    v
+}
+
+fn suggest_pkgs(q: &str) -> Vec<(String, usize)> {
+    let counts: BTreeMap<String, usize> = pkg_counts().into_iter().collect();
     rank_top(counts, &q.to_ascii_lowercase())
 }
 
@@ -901,17 +932,33 @@ fn thread_comm(pid: i32, tid: i32) -> Option<String> {
 }
 
 fn suggest_threads(pkg: &str, q: &str) -> Vec<(String, usize)> {
-    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
-    for_each_pid(|pid| {
-        if read_cmdline(pid).as_deref() == Some(pkg) {
-            for tid in task_tids(pid).unwrap_or_default() {
-                if let Some(comm) = thread_comm(pid, tid) {
-                    *counts.entry(comm).or_insert(0) += 1;
+    // 线程名变化比包名快，缓存短一些，且按包名分开存：
+    // 用户先看 A 包再看 B 包时不能拿 A 的列表顶上去
+    let cached = {
+        let g = lock_ignore_poison(&THREAD_SCAN);
+        g.as_ref()
+            .filter(|(t, p, _)| p == pkg && t.elapsed() < SUGGEST_TTL)
+            .map(|(_, _, v)| v.clone())
+    };
+    let list = match cached {
+        Some(v) => v,
+        None => {
+            let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+            for_each_pid(|pid| {
+                if read_cmdline(pid).as_deref() == Some(pkg) {
+                    for tid in task_tids(pid).unwrap_or_default() {
+                        if let Some(comm) = thread_comm(pid, tid) {
+                            *counts.entry(comm).or_insert(0) += 1;
+                        }
+                    }
                 }
-            }
+            });
+            let v: Vec<(String, usize)> = counts.into_iter().collect();
+            *lock_ignore_poison(&THREAD_SCAN) = Some((Instant::now(), pkg.to_string(), v.clone()));
+            v
         }
-    });
-    rank_top(counts, &q.to_ascii_lowercase())
+    };
+    rank_top(list.into_iter().collect(), &q.to_ascii_lowercase())
 }
 
 fn config_json() -> String {
@@ -1909,6 +1956,26 @@ mod tests {
     }
 
     /// WebUI 读的是模块 webroot 里的 token.js，格式必须能直接被页面正则识别
+    /// 联想结果必须命中缓存：每次请求都全量扫 /proc，连续输入会把
+    /// 读放大成每秒几十次（审计报告里点名的那处）
+    #[test]
+    fn suggest_scan_is_cached() {
+        let a = pkg_counts();
+        let t1 = lock_ignore_poison(&PKG_SCAN).as_ref().map(|(t, _)| *t);
+        let b = pkg_counts();
+        let t2 = lock_ignore_poison(&PKG_SCAN).as_ref().map(|(t, _)| *t);
+        assert_eq!(a, b);
+        assert_eq!(t1, t2, "TTL 内不得重新扫描");
+
+        // 线程名缓存按包分开：换一个包必须重新扫，不能拿上一个包的结果
+        let _ = suggest_threads("com.appopt.none_a", "");
+        let _ = suggest_threads("com.appopt.none_b", "");
+        let owner = lock_ignore_poison(&THREAD_SCAN)
+            .as_ref()
+            .map(|(_, p, _)| p.clone());
+        assert_eq!(owner.as_deref(), Some("com.appopt.none_b"));
+    }
+
     #[test]
     fn token_js_is_a_parseable_assignment() {
         let js = token_js("0123456789abcdef0123456789abcdef");

@@ -7,6 +7,7 @@ mod cache;
 mod config;
 mod cpuset;
 mod diag;
+mod diag_fmt;
 mod ebpf_mode;
 mod proc_mode;
 mod roles;

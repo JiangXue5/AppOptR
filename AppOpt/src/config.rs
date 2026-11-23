@@ -360,14 +360,34 @@ fn sched_scope(rules: &[AffinityRule], topo: &CpuTopology) -> (SchedScope, HashS
         return (scope, pkgs);
     }
 
+    // 与 rule_match::thread_affinity 同口径：同一包内「相同线程模式」的多行
+    // 规则会 OR 合并成一个集合。逐条统计会把
+    //   com.a { Worker-*=p-core
+    //           Worker-*=hp-core }
+    // 判成「两条各占一个簇」，scope.rules 归零，S7 直接把采样关掉，
+    // 而线程实际拿到的是 p-core ∪ hp-core —— 用户配的正是跨簇规则
+    let mut merged: HashMap<(String, String), (CpuSet, usize)> = HashMap::new();
     for r in rules {
-        if r.cpus.count() == 0 || r.cpus == topo.present_cpus {
+        if r.cpus.count() == 0 {
             continue;
         }
-        let hit = levels.iter().filter(|l| intersects(&r.cpus, l)).count();
+        let e = merged
+            .entry((r.pkg.clone(), r.thread.clone()))
+            .or_insert_with(|| (CpuSet::new(), 0));
+        e.0.or(&r.cpus);
+        e.1 += 1;
+    }
+    for ((pkg, _), (cpus, n)) in merged {
+        // 合并后等于在线全集才视为「不限制」：单条写 0-7 与两条各写一半
+        // 都要区分开，后者合起来仍可能是全集
+        if cpus == topo.present_cpus {
+            continue;
+        }
+        let hit = levels.iter().filter(|l| intersects(&cpus, l)).count();
         if hit > 1 {
-            scope.rules += 1;
-            pkgs.insert(r.pkg.clone());
+            // 计的是原始规则条数，日志里的「跨簇 N/总条数」才对得上
+            scope.rules += n;
+            pkgs.insert(pkg);
         }
     }
     scope.pkgs = pkgs.len();
@@ -1440,6 +1460,21 @@ mod tests {
         let conf = "com.a {\n  A=2-5\n  B=3-6\n}\n";
         let s = scope_of("dedup", conf, &topo);
         assert_eq!((s.levels, s.rules, s.pkgs), (3, 2, 1));
+    }
+
+    /// 同一条线程规则拆成两行时，线程拿到的是并集；逐条统计会把 S7 关掉
+    #[test]
+    fn same_thread_pattern_rules_merge_before_scope_check() {
+        let topo = topo_of(&[0, 1, 2, 3], &[4, 5], &[6, 7]);
+        let conf = "com.a {\n  Worker-*=p-core\n  Worker-*=hp-core\n}\n";
+        let s = scope_of("merge", conf, &topo);
+        // 合并后 4-7 跨 p/hp 两层；rules 仍按原始两条计，便于与总条数对齐
+        assert_eq!((s.levels, s.rules, s.pkgs), (3, 2, 1));
+
+        // 不同线程名各自单簇：没有任何线程会同时命中，仍不算跨簇
+        let conf = "com.a {\n  Worker-1=p-core\n  Worker-2=hp-core\n}\n";
+        let s = scope_of("merge2", conf, &topo);
+        assert_eq!((s.levels, s.rules, s.pkgs), (3, 0, 0));
     }
 
     #[test]
