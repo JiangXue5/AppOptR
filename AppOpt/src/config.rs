@@ -672,10 +672,30 @@ fn report_rule_list(rules: &[AffinityRule]) {
             line.push_str(&format!("（组 {}）", r.cpuset_dir));
         }
         crate::diag::emit(&line);
+        // 包名只能由字母、数字、下划线、点组成。含冒号几乎一定是想写
+        // `pkg:thread=cpus`——这种写法会被整串当成包名，规则永远匹配不到进程，
+        // 而且日志里看起来「规则已加载」，不警告就只能靠用户自己发现绑没上
+        if r.thread.is_empty() && r.pkg.contains(':') {
+            crate::diag::emit(&format!(
+                "规则警告: 「{}」不是合法包名，线程规则请写成 pkg{{thread}}=cpus；\
+                 按现在这条写，它会被当成一个叫这个名字的包，永远匹配不到任何进程",
+                r.pkg
+            ));
+        }
     }
     if rules.len() > CAP {
         crate::diag::emit(&format!("规则: 另有 {} 条未列出", rules.len() - CAP));
     }
+    // 只处理规则内的包，这一点要能自证：后面每条线程日志都带 [包名]，
+    // 出现别的包就说明匹配出了问题，而不是「看起来像」
+    let pkgs: std::collections::BTreeSet<&str> = rules.iter().map(|r| r.pkg.as_str()).collect();
+    let list: Vec<&str> = pkgs.into_iter().collect();
+    crate::diag::emit(&format!(
+        "匹配范围: 只处理 {} 这 {} 个包的线程（按 cmdline + 属主双重校验）；\
+         其余进程不绑核、不改 cpuset。日志里每条线程都会带 [包名]，可据此核对",
+        list.join("、"),
+        list.len()
+    ));
 }
 
 fn report_offline_rules(rules: &[AffinityRule], topo: &CpuTopology) {

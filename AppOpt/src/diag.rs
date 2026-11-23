@@ -159,6 +159,9 @@ struct Sink {
     /// 已经解释过「为什么少了核」的期望集合。裁剪会在几百个线程上重复出现，
     /// 原因却只有一个；按集合去重，避免把唯一有价值的解释刷掉
     clip_why: HashSet<String>,
+    /// 已经解释过「多出来的核是谁写的」的读回集合。跨周期保留：
+    /// `4-7` 这种超集只会有一两种来源，重复解释等于每 60 秒说一遍同样的话
+    reset_why: HashSet<String>,
     /// 本周期「写后回读仍不一致」的样本与计数
     ineffective: Vec<Drift>,
     ineffective_n: u64,
@@ -177,6 +180,9 @@ struct Sink {
     /// 上一轮校验结束时各状态的线程数。用户最想知道的是「此刻绑上没有」，
     /// 只报「本周期重绑 17 个」会让人以为一直没绑上
     tally: Option<SyncTally>,
+    /// tid → 所属包。线程名常常和包名毫无关系（`HWC release`、`dns-work-0`），
+    /// 只印线程名时用户无法判断模块有没有管到规则外的进程
+    thread_pkg: HashMap<i32, String>,
 }
 
 /// 一轮校验结束时的状态分布。`ok + rebound + failed + blocked` 加上本轮
@@ -196,6 +202,9 @@ struct SyncTally {
 pub struct Drift {
     pub tid: i32,
     pub comm: String,
+    /// 线程所属包。日志里只印线程名时，`HWC release`、`dns-work-0` 这种
+    /// 名字看不出是谁的线程，用户没法判断是不是模块管到了规则外的进程
+    pub pkg: String,
     pub expect: String,
     pub actual: String,
     pub cpuset: String,
@@ -228,6 +237,7 @@ fn sink() -> std::sync::MutexGuard<'static, Option<Sink>> {
         sysgroup_announced: HashSet::new(),
         clip_announced: HashSet::new(),
         clip_why: HashSet::new(),
+        reset_why: HashSet::new(),
         ineffective: Vec::new(),
         ineffective_n: 0,
         stuck_skip: 0,
@@ -238,6 +248,7 @@ fn sink() -> std::sync::MutexGuard<'static, Option<Sink>> {
         last_drift_log: now.checked_sub(DRIFT_LOG_GAP).unwrap_or(now),
         allow_hint_shown: false,
         tally: None,
+        thread_pkg: HashMap::new(),
     });
     guard
 }
@@ -253,6 +264,30 @@ pub fn announce() {
         "诊断: 行首 [+秒] 是启动后耗时；绑核失败会带 errno 与 cpuset 现场，\
          校验发现被改写会给出「期望/实际/线程所在 cpuset」，S7 无动作时每个周期说明原因",
     );
+}
+
+/// 记录 tid 属于哪个包。只在接管线程时写一次，后续漂移样例直接查表。
+///
+/// 不查表的代价是每条样例多读一次 `/proc/<tid>/cmdline`，而样例每分钟
+/// 只有几条——真正的理由是线程名和包名的对应关系在这里最可靠：
+/// 接管时已经完成 `pkg_owned` 校验，不会把规则外的进程记进来
+pub fn bind_pkg(tid: i32, pkg: &str) {
+    let mut guard = sink();
+    let Some(s) = guard.as_mut() else { return };
+    if s.thread_pkg.len() >= 8192 {
+        // 线程退出后条目不会自己消失，超过上限整表清空重来。
+        // 代价是清空后极少数样例的包名显示为空，远好过无界增长
+        s.thread_pkg.clear();
+    }
+    s.thread_pkg.insert(tid, pkg.to_string());
+}
+
+/// 线程退出：条目跟着走，避免长期运行时表只增不减
+pub fn unbind_pkg(tid: i32) {
+    let mut guard = sink();
+    if let Some(s) = guard.as_mut() {
+        s.thread_pkg.remove(&tid);
+    }
 }
 
 /// 记录一次写入结果。`wrote` 为 true 表示内核真的接受了新集合
@@ -545,18 +580,25 @@ fn unreachable_group(tid: i32, want: &CpuSet) -> bool {
 /// 线程所在组的天花板恰好等于读回的集合时，返回该组路径。
 ///
 /// 这不是「被裁」：系统把线程放进 /foreground，该组 `cpus` 只到 0-5，
-/// 规则要 4-6 就只能拿到 4-5。每组读一次 `cpuset.effective_cpus`（有缓存），
-/// 判定「这已经是该组能给的全部」，比反复播报「又被裁了」有用得多
-fn cap_group(tid: i32, actual: &CpuSet) -> Option<String> {
+/// 规则要 4-6，内核求交只能给 4-5。**判据必须是「期望∩组上限」而不是
+/// 「读回==组上限」**——线程的亲和性是规则与组的交集，组自己是 0-5、
+/// 线程拿到的是 4-5，直接比 0-5 永远不相等，2.5.5 第一版就栽在这里
+fn cap_group(tid: i32, expect: &CpuSet, actual: &CpuSet) -> Option<String> {
     let path = crate::cpuset::thread_cgroup(tid)?;
     let eff = crate::cpuset::group_effective_cached(&path)?;
-    is_group_cap(actual, &eff).then_some(path)
+    is_group_cap(expect, actual, &eff).then_some(path)
 }
 
-/// 纯判定：读回是不是正好等于所在组的天花板。抽出来能脱离 /dev/cpuset 单测
-fn is_group_cap(actual: &CpuSet, eff: &str) -> bool {
+/// 纯判定：读回是不是「期望在所在组里能拿到的最大值」。抽出来能脱离
+/// /dev/cpuset 单测——这条判错一次，日志每分钟就会多出上百条「裁剪」
+fn is_group_cap(expect: &CpuSet, actual: &CpuSet, eff: &str) -> bool {
     let eff_set = crate::cpuset::parse_cpu_ranges(eff, None);
-    eff_set.count() > 0 && eff_set == *actual
+    if eff_set.count() == 0 {
+        return false;
+    }
+    let mut inter = *expect;
+    inter.and(&eff_set);
+    inter.count() > 0 && inter == *actual
 }
 
 /// 校验时读回与期望不一致：记录分类与现场样本。
@@ -575,7 +617,7 @@ pub fn note_drift(tid: i32, comm: &str, expect: &CpuSet, actual: &CpuSet) {
     // 读回正好是所在组的天花板：这是系统组的稳态，不是这一轮的异常。
     // 单独成一类，否则每分钟几百条「裁剪」会把真正被改写的线程埋掉
     let capped = if kind == DriftKind::Clip {
-        cap_group(tid, actual)
+        cap_group(tid, expect, actual)
     } else {
         None
     };
@@ -617,6 +659,7 @@ pub fn note_drift(tid: i32, comm: &str, expect: &CpuSet, actual: &CpuSet) {
     let sample = Drift {
         tid,
         comm: comm.to_string(),
+        pkg: s.thread_pkg.get(&tid).cloned().unwrap_or_default(),
         expect: expect.to_range_string(),
         actual: actual.to_range_string(),
         cpuset: read_thread_cpuset(tid),
@@ -636,15 +679,43 @@ pub fn note_drift(tid: i32, comm: &str, expect: &CpuSet, actual: &CpuSet) {
         emit(&line);
         push_event(s, line);
     }
+    // 读回比规则多出几个核：规则里根本没有这些核，AppOpt 不可能写出这样的
+    // 集合。用户看到「期望 4-6 实际 4-7」第一反应是「是不是管到别的进程了」，
+    // 这里把结论直接给出，省得他去猜是不是模块自己的 bug
+    if kind == DriftKind::Reset && s.reset_why.insert(sample.actual.clone()) {
+        let line = format!(
+            "校验: {} 被改成 {}，规则只要 {}；多出来的核不在任何规则里，\
+             这不是 AppOpt 写的——常见来源是厂商性能 HAL 或游戏自身的 boost，下一轮已改回",
+            sample_tag(&sample),
+            sample.actual,
+            sample.expect
+        );
+        emit(&line);
+        push_event(s, line);
+    }
     // 第一批异常当场打一条，不等 60 秒摘要：掉帧往往就在这几秒内
     if s.last_drift_log.elapsed() >= DRIFT_LOG_GAP {
         s.last_drift_log = Instant::now();
         let line = format!(
-            "漂移: {}({}) 期望 {} 实际 {} cpuset={}",
-            sample.comm, sample.tid, sample.expect, sample.actual, sample.cpuset
+            "漂移: {} 期望 {} 实际 {} cpuset={}",
+            sample_tag(&sample),
+            sample.expect,
+            sample.actual,
+            sample.cpuset
         );
         emit(&line);
         push_event(s, line);
+    }
+}
+
+/// 样例前缀：线程名 + tid + 所属包。带包名是为了让读者能自己判断
+/// 「这条线程到底是不是我规则里的包」——`HWC release`、`dns-work-0`
+/// 这类名字靠猜没用。包名为空说明没登记上，不是「不属于任何包」
+fn sample_tag(d: &Drift) -> String {
+    if d.pkg.is_empty() {
+        format!("{}({})", d.comm, d.tid)
+    } else {
+        format!("{}({})[{}]", d.comm, d.tid, d.pkg)
     }
 }
 
@@ -818,9 +889,11 @@ pub fn note_ineffective(tid: i32, comm: &str, want: &CpuSet, after: &CpuSet) {
     s.stats.ineffective += 1;
     s.ineffective_n += 1;
     if s.ineffective.len() < 2 {
+        let pkg = s.thread_pkg.get(&tid).cloned().unwrap_or_default();
         s.ineffective.push(Drift {
             tid,
             comm: comm.to_string(),
+            pkg,
             expect: want.to_range_string(),
             actual: after.to_range_string(),
             cpuset: read_thread_cpuset(tid),
@@ -1000,7 +1073,9 @@ fn tally_line(t: SyncTally, rewrites: u64, caps: u64, kinds: [u64; 3]) -> String
         parts.push(format!("写失败 {}", t.failed));
     }
     if t.blocked > 0 {
-        parts.push(format!("被系统组限制 {}", t.blocked));
+        // 这一档是真的没绑，不能和「符合」混在一行里说得含糊。
+        // 用户拿 Scene 对照时，缺的正是「哪些确实没绑」这句话
+        parts.push(format!("被系统组限制 {}（确实没绑）", t.blocked));
     }
     let mut line = format!("校验: 此刻受管 {} 个线程 —— {}", t.total, parts.join("、"));
     if rewrites > 0 {
@@ -1066,8 +1141,11 @@ pub fn periodic_summary(current: &SchedSnapshot) {
         if rewrites >= 8 {
             for d in drift {
                 emit(&format!(
-                    "校验样例: {}({}) 期望 {} 实际 {} cpuset={}",
-                    d.comm, d.tid, d.expect, d.actual, d.cpuset
+                    "校验样例: {} 期望 {} 实际 {} cpuset={}",
+                    sample_tag(&d),
+                    d.expect,
+                    d.actual,
+                    d.cpuset
                 ));
             }
         }
@@ -1101,8 +1179,11 @@ pub fn periodic_summary(current: &SchedSnapshot) {
         ));
         for d in ineff {
             emit(&format!(
-                "无效绑定: {}({}) 期望 {} 实际 {} cpuset={}",
-                d.comm, d.tid, d.expect, d.actual, d.cpuset
+                "无效绑定: {} 期望 {} 实际 {} cpuset={}",
+                sample_tag(&d),
+                d.expect,
+                d.actual,
+                d.cpuset
             ));
         }
     }
@@ -1582,19 +1663,30 @@ mod tests {
         assert!(after.shifted > before.shifted, "互不包含应计为挪簇");
     }
 
-    /// 读回正好等于所在组的天花板时，不是「被裁」而是「这组只能给这么多」。
-    /// 判定错一次，日志每分钟就会多出上百条「裁剪」，把真正被改写的线程埋掉
+    /// 读回正好等于「期望在所在组里能拿到的最大值」时，不是「被裁」而是
+    /// 「这组只能给这么多」。判定错一次，日志每分钟就会多出上百条「裁剪」，
+    /// 把真正被改写的线程埋掉。第一版用「读回==组上限」比，永远不成立
     #[test]
     fn group_cap_is_ceiling_not_failure() {
-        // 规则 4-6，线程在 /foreground（0-5），读回 4-5：正是该组的天花板
-        assert!(is_group_cap(&set_of(&[4, 5]), "4-5"));
-        // 同组但读回 4 核，说明还少了一个，属于真裁剪
-        assert!(!is_group_cap(&set_of(&[4]), "4-5"));
-        // 读回比组还大，不是组上限能解释的
-        assert!(!is_group_cap(&set_of(&[4, 5, 6]), "4-5"));
+        // 规则 4-6，线程在 /foreground（0-5），读回 4-5：正是交集，也是该组能给的全部
+        assert!(is_group_cap(&set_of(&[4, 5, 6]), &set_of(&[4, 5]), "0-5"));
+        // 同组但读回只剩 4，还少一个，属于真裁剪
+        assert!(!is_group_cap(&set_of(&[4, 5, 6]), &set_of(&[4]), "0-5"));
+        // 读回比交集还大：不是组上限能解释的
+        assert!(!is_group_cap(
+            &set_of(&[4, 5, 6]),
+            &set_of(&[4, 5, 6]),
+            "0-5"
+        ));
+        // 交集为空（后台组 0-3）时，任何非空读回都不是「组上限」
+        assert!(!is_group_cap(&set_of(&[4, 5, 6]), &set_of(&[0, 1]), "0-3"));
         // 生效集合读不到或为空时不能倒推结论
-        assert!(!is_group_cap(&set_of(&[4, 5]), ""));
-        assert!(!is_group_cap(&set_of(&[4, 5]), "读不到"));
+        assert!(!is_group_cap(&set_of(&[4, 5, 6]), &set_of(&[4, 5]), ""));
+        assert!(!is_group_cap(
+            &set_of(&[4, 5, 6]),
+            &set_of(&[4, 5]),
+            "读不到"
+        ));
     }
 
     /// 「此刻绑上没有」必须排在「近 60 秒被改了多少次」前面。
@@ -1632,7 +1724,11 @@ mod tests {
             0,
             [0, 0, 0],
         );
-        assert!(blocked.contains("被系统组限制 170"), "{}", blocked);
+        assert!(
+            blocked.contains("被系统组限制 170（确实没绑）"),
+            "{}",
+            blocked
+        );
     }
 
     /// S7 开着却不动时，摘要必须说清「跑了几轮、为什么跳过」

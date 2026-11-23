@@ -187,6 +187,7 @@ impl ProcCache {
     pub fn task_del(&mut self, tid: i32) {
         self.tasks.remove(&tid);
         self.sched.remove(&tid);
+        crate::diag::unbind_pkg(tid);
     }
 
     /// S7 迁移成功。落点单独存，重建缓存后仍能维持
@@ -244,6 +245,10 @@ impl ProcCache {
         } else {
             ""
         };
+        // 只登记已经通过 pkg_owned 校验、且确实命中规则的包：日志里的每条
+        // 样例都要能回答「这是谁的线程」，否则 `HWC release` 这种名字
+        // 说它是游戏进程还是 surfaceflinger 的，全凭读者猜
+        crate::diag::bind_pkg(tid, pkg);
         let Some(result) = thread_affinity(pkg, thread_name, cfg) else {
             return false;
         };
