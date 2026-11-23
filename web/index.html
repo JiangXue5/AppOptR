@@ -410,10 +410,13 @@ const API_BASE=location.port==='8889'?'':'http://127.0.0.1:8889';
 // 一个只写在模块目录（0700 root）里的令牌；浏览器拿不到文件，只能从模块日志
 // 或这里的输入框粘贴，KernelSU WebUI 则可以直接用 root shell 读
 const TOK_KEY='appopt_token';
+const TOK_RE=/^[0-9a-f]{32}$/;
+// 先从本地存储取一个候选值，真正的取值在 initToken 里做：文件/ksu 是权威来源，
+// 升级后令牌可能变过，旧值只作最后兜底，不能在启动时直接认定它有效
 let TOKEN=localStorage.getItem(TOK_KEY)||'';
 function setToken(t){
   TOKEN=(t||'').trim().toLowerCase();
-  if(/^[0-9a-f]{32}$/.test(TOKEN)){localStorage.setItem(TOK_KEY,TOKEN)}
+  if(TOK_RE.test(TOKEN)){localStorage.setItem(TOK_KEY,TOKEN)}
   else{localStorage.removeItem(TOK_KEY);TOKEN=''}
 }
 function showGate(){
@@ -423,15 +426,55 @@ function showGate(){
   setTimeout(()=>$('tok-input').focus(),50);
 }
 function hideGate(){const g=$('tok-gate');if(g)g.style.display='none'}
-async function ksuToken(){
-  // KernelSU WebUI 暴露 ksu.exec，返回值有 string 与 {errno,stdout} 两种形态
+// 守护进程会把令牌发布成模块 webroot/token.js。WebUI 通过 WebViewAssetLoader
+// 加载页面，同源相对路径读到的是这个文件，不经过 8889，因此不需要令牌也不需要
+// ksu 注入；浏览器直连 8889 时没有这条路由，会 404 后回退下一步
+async function fileToken(){
   try{
-    if(!window.ksu||typeof window.ksu.exec!=='function')return '';
-    const r=await window.ksu.exec('cat /data/adb/modules/AppOpt/web.token');
-    const s=typeof r==='string'?r:(r&&(r.stdout||r.result))||'';
-    const m=String(s).match(/[0-9a-fA-F]{32}/);
-    return m?m[0]:'';
+    const ctl=new AbortController();
+    const tm=setTimeout(()=>ctl.abort(),1500);
+    const r=await fetch('token.js?ts='+Date.now(),{cache:'no-store',signal:ctl.signal});
+    clearTimeout(tm);
+    if(!r.ok)return '';
+    const m=(await r.text()).match(/[0-9a-fA-F]{32}/);
+    return m?m[0].toLowerCase():'';
   }catch(e){return ''}
+}
+// ksu 由 WebView 在 onPageFinished 注入，页面脚本往往更早跑完，所以不能查一次
+// 就走；这里轮询等它出现。部分版本把接口挂在顶层 window，页面本身在 iframe 里
+function ksuRef(){
+  const cand=[];
+  try{cand.push(window)}catch(e){}
+  try{cand.push(window.top)}catch(e){}
+  try{cand.push(window.parent)}catch(e){}
+  for(const w of cand){
+    if(w&&w.ksu&&typeof w.ksu.exec==='function')return w.ksu;
+  }
+  return null;
+}
+async function ksuToken(){
+  let k=null;
+  for(let i=0;i<30;i++){
+    k=ksuRef();
+    if(k)break;
+    await new Promise(r=>setTimeout(r,100));
+  }
+  if(!k)return '';
+  // 先用模块目录，再用工作目录兜底（service.sh 的 cwd 就是模块目录）
+  for(const cmd of ['cat /data/adb/modules/AppOpt/web.token','cat web.token']){
+    try{
+      const r=await k.exec(cmd);
+      const s=typeof r==='string'?r:(r&&(r.stdout||r.result))||'';
+      const m=String(s).match(/[0-9a-fA-F]{32}/);
+      if(m)return m[0].toLowerCase();
+    }catch(e){}
+  }
+  return '';
+}
+async function autoToken(){
+  const t=await fileToken();
+  if(t)return t;
+  return await ksuToken();
 }
 async function initToken(){
   const m=location.hash.match(/[#&]t=([0-9a-fA-F]{32})/);
@@ -440,16 +483,32 @@ async function initToken(){
     history.replaceState(null,'',location.pathname+location.search);
     return;
   }
+  const t=await autoToken();
+  if(t){setToken(t);return}
   if(TOKEN)return;
-  const t=await ksuToken();
-  if(t)setToken(t);
+  showGate();
 }
+let authRetried=false;
 async function api(path,body){
-  const h=TOKEN?{'X-AppOpt-Token':TOKEN}:{};
-  const opts=body!==undefined?{method:'POST',headers:{...h,'Content-Type':'application/json'},body:JSON.stringify(body)}:{headers:h};
+  const send=()=>{
+    const h=TOKEN?{'X-AppOpt-Token':TOKEN}:{};
+    const opts=body!==undefined?{method:'POST',headers:{...h,'Content-Type':'application/json'},body:JSON.stringify(body)}:{headers:h};
+    return fetch(API_BASE+path,opts);
+  };
   let r;
-  try{r=await fetch(API_BASE+path,opts);}catch(e){throw new Error('无法连接本机服务，请用浏览器打开 http://127.0.0.1:8889/')}
-  if(r.status===401){showGate();throw new Error('需要访问令牌')}
+  try{r=await send();}catch(e){throw new Error('无法连接本机服务，请用浏览器打开 http://127.0.0.1:8889/')}
+  if(r.status===401){
+    // 令牌可能来自升级前的旧版本：从文件/ksu 再取一次，取到不同的就重试一遍
+    if(!authRetried){
+      authRetried=true;
+      const t=await autoToken();
+      if(t&&t!==TOKEN){
+        setToken(t);
+        try{r=await send();}catch(e){}
+      }
+    }
+    if(r.status===401){showGate();throw new Error('需要访问令牌')}
+  }
   const d=await r.json().catch(()=>({}));
   if(!r.ok)throw new Error(d.err||('HTTP '+r.status));
   return d;
@@ -999,7 +1058,7 @@ $('donate-ali').onclick=()=>location.href='https://qr.alipay.com/tsx183072iwa3ig
 $('tok-ok').onclick=()=>{
   const v=$('tok-input').value.trim();
   if(!/^[0-9a-fA-F]{32}$/.test(v))return toast('令牌应为 32 位十六进制');
-  setToken(v);hideGate();
+  setToken(v);hideGate();authRetried=false;
   // 令牌刚设置好，把当前页签的数据重拉一遍
   if(activeTab==='status')startStat();
   else if(activeTab==='rules')loadRules();

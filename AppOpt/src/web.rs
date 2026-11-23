@@ -99,6 +99,50 @@ fn token_shape_ok(s: &str) -> bool {
     s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+fn token_js(tok: &str) -> String {
+    format!("window.__APPOPT_TOKEN=\"{}\";\n", tok)
+}
+
+/// 把令牌发布成模块 `webroot/token.js`，供 KernelSU / APatch 的 WebUI 同源读取。
+///
+/// WebUI 用 WebViewAssetLoader 把页面映射到模块的 webroot 目录，页面里的
+/// `fetch('token.js')` 走的是加载器而不是 8889，因此能拿到这份文件；浏览器直连
+/// 8889 时没有这条路由，仍走日志里的链接或手动粘贴。文件落在 /data/adb 下，
+/// 普通应用读不到，不削弱认证。
+///
+/// 写不进去只是少一条自动路径，不阻止启动——ksu.exec 与手动输入仍然可用
+fn publish_webroot_token(tok: &str) {
+    use std::io::Write as _;
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let Some(webroot) = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("webroot")))
+        .filter(|d| d.is_dir())
+    else {
+        return;
+    };
+    let path = webroot.join("token.js");
+    let Ok(name) = std::ffi::CString::new(path.as_os_str().to_string_lossy().as_bytes()) else {
+        return;
+    };
+    // O_NOFOLLOW：预先放一个同名链接不能把令牌写到模块目录之外
+    let fd = unsafe {
+        libc::open(
+            name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return;
+    }
+    let mut f = unsafe { fs::File::from_raw_fd(fd) };
+    let _ = f.write_all(token_js(tok).as_bytes());
+    let _ = f.sync_all();
+    unsafe { libc::fchmod(f.as_raw_fd(), 0o600) };
+}
+
 /// 读取或生成令牌。已存在且格式正确时沿用，重启后前端不必重输。
 /// 写不进去（只读挂载、权限损坏）返回空串，调用方必须据此拒绝启动 Web——
 /// 没有令牌就等于没有认证，宁可不开也不留一个 root 的后门
@@ -189,6 +233,7 @@ pub fn web_start() -> bool {
         eprintln!("Web: 没有可用令牌，拒绝启动（避免无认证的 root 接口）");
         return false;
     }
+    publish_webroot_token(&tok);
     *lock_ignore_poison(&WEB_TOKEN) = tok;
     WEB_ENABLED.store(true, Ordering::Release);
     println!(
@@ -1817,5 +1862,19 @@ mod tests {
         assert!(create_config_file(&p).is_err());
         assert_eq!(std::fs::read_to_string(&p).unwrap(), CONFIG_HEADER);
         let _ = std::fs::remove_file(&p);
+    }
+
+    /// WebUI 读的是模块 webroot 里的 token.js，格式必须能直接被页面正则识别
+    #[test]
+    fn token_js_is_a_parseable_assignment() {
+        let js = token_js("0123456789abcdef0123456789abcdef");
+        assert_eq!(
+            js,
+            "window.__APPOPT_TOKEN=\"0123456789abcdef0123456789abcdef\";\n"
+        );
+        // 只有十六进制才会写进这个文件，不存在引号逃逸
+        assert!(token_shape_ok("0123456789abcdef0123456789abcdef"));
+        assert!(!token_shape_ok("0123456789abcdef0123456789abcde\""));
+        assert!(!token_shape_ok("0123456789abcdef0123456789abcde\n"));
     }
 }

@@ -1,3 +1,17 @@
+### v2.5.2更新日志
+- 修复 KernelSU / APatch WebUI 打开页面不自动带令牌、只能手动粘贴的问题
+- 守护进程启动时把令牌发布成模块 `webroot/token.js`（0600 root）。WebUI 用
+  `WebViewAssetLoader` 把页面映射到 webroot，页面里同源 `fetch('token.js')`
+  就能读到，不经过 8889 也不依赖 ksu 注入；浏览器直连 8889 时没有这条路由，
+  不会泄露令牌
+- `ksu.exec` 改为轮询等待注入（最多 3 秒）后再取，并在 `window` / `window.top` /
+  `window.parent` 三处查找。旧实现在页面解析时查一次 `window.ksu`，那时 WebView
+  还没注入，必然拿到 `undefined`
+- 取令牌顺序改为 `#t=` → 同源 `token.js` → `ksu.exec` → localStorage 旧值，
+  文件与 ksu 为权威来源，升级后不会再被陈旧令牌卡住
+- 请求遇到 401 时自动重取一次令牌并重试，不再直接弹框
+- 新增 1 个回归测试，当前 171 passed
+
 ### v2.5.1更新日志
 - **诊断**：线程已退出（ESRCH）不再被描述成「已抬到 base 组，目标组仍拒绝」。
   旧文案与代码实际路径相反，会把人引去查 cpuset 配置

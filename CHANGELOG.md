@@ -1,5 +1,30 @@
 # AppOptR 变更记录
 
+## 2.5.2（2026-11-23）
+
+2.5.0 引入令牌后，KernelSU WebUI 打开页面没有自动带上令牌，只能手动粘贴。
+根因是取令牌的两条自动路径都不可靠。
+
+### 为什么不自动
+
+- `ksu.exec` 由 WebView 在**页面加载完成后**注入，而页面脚本在解析时就同步查了
+  一次 `window.ksu`。查到的是 `undefined`，直接放弃，于是只剩输入框。
+- 页面本身也可能在 iframe 里，接口挂在顶层 `window`，`window.ksu` 取不到。
+- `localStorage` 里的旧令牌被当成有效值直接返回，升级后令牌若变过就只会撞 401。
+
+### 改法
+
+- 守护进程启动时把令牌**发布成模块 `webroot/token.js`**（`window.__APPOPT_TOKEN=…`，
+  0600 root）。WebUI 用 `WebViewAssetLoader` 把页面映射到 webroot，页面里
+  `fetch('token.js')` 读到的是这个文件，既不经过 8889 也不依赖 ksu 注入。
+  浏览器直连 8889 时该路径不存在（服务端不提供这条路由），不会泄露令牌。
+- `ksu` 路径改为**轮询等待注入**（最多 3 秒），并在 `window`、`window.top`、
+  `window.parent` 三处查找；`ksu.exec` 仍兼容 string 与 `{stdout}` 两种返回。
+- 取令牌顺序改为 `#t=` → 同源 `token.js` → `ksu.exec` → localStorage 旧值。
+  文件与 ksu 是权威来源，旧值只作最后兜底。
+- 请求遇到 401 时自动重取一次令牌并重试（只重试一次），陈旧令牌不再把页面卡死。
+- 新增回归测试 `token_js_is_a_parseable_assignment`，当前 171 passed。
+
 ## 2.5.1（2026-11-23）
 
 真机日志暴露的是**诊断输出本身不准**，不是调度逻辑出错。改动集中在
