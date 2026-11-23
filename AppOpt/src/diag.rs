@@ -19,8 +19,8 @@ use crate::apply_affinity::ApplyReason;
 use crate::cache::ProcCache;
 use crate::cpuset::{CpuSet, SysGroup};
 use crate::diag_fmt::{
-    Drift, SyncTally, classify_clip, combo_list, contra_line, delta_desc, empty_state_hint,
-    errno_hint, sample_tag, tally_line,
+    Drift, RewriteHit, SyncTally, classify_clip, combo_list, contra_line, delta_desc,
+    empty_state_hint, errno_hint, sample_tag, tally_line,
 };
 use crate::lock_ignore_poison;
 use crate::roles::{Role, role_of};
@@ -186,8 +186,8 @@ struct Samples {
     /// 不能用样例去凑：真机上 7 次改写只留了 4 条样例，明细写成
     /// 「多核写入 7（4-6→4-7 ×4）」，另外 3 次凭空消失
     combo: HashMap<(bool, String), u32>,
-    /// 同一线程本周期被反复改写：tid → (comm, 次数, 最近读回集合)
-    reset_hits: HashMap<i32, (String, u32, String)>,
+    /// 同一线程本周期被反复改写：tid → 汇总（含改名前的 comm）
+    reset_hits: HashMap<i32, RewriteHit>,
     /// 被系统改动最多的线程名，只给前三个，不带 tid
     cap_top: HashMap<String, u32>,
     /// 组上限来自哪个组：path → 次数
@@ -224,6 +224,9 @@ struct Sink {
     tally: Option<SyncTally>,
     /// 最近一轮被组限制的线程集中在哪个组、该组可用哪几个核
     blocked_note: Option<(SysGroup, String)>,
+    /// 自启动以来是否成功接管过线程。用来区分「游戏还没开」与「进程退出了」，
+    /// 两者的处理动作相反
+    ever_bound: bool,
     /// tid → (所属包, 是否进程主线程)。线程名常常和包名毫无关系
     /// （`HWC release`、`dns-work-0`），只印线程名时用户无法判断模块有没有
     /// 管到规则外的进程；主线程的 comm 会被内核截到 15 字节，日志里
@@ -252,6 +255,7 @@ fn sink() -> std::sync::MutexGuard<'static, Option<Sink>> {
         allow_hint_shown: false,
         tally: None,
         blocked_note: None,
+        ever_bound: false,
         thread_pkg: HashMap::new(),
     });
     guard
@@ -718,13 +722,18 @@ pub fn note_drift(tid: i32, comm: &str, expect: &CpuSet, actual: &CpuSet) {
                 .samples
                 .reset_hits
                 .entry(tid)
-                .or_insert_with(|| (comm.to_string(), 0, String::new()));
-            e.1 += 1;
-            e.2 = sample.actual.clone();
+                .or_insert_with(|| RewriteHit {
+                    comm: comm.to_string(),
+                    first_comm: comm.to_string(),
+                    ..Default::default()
+                });
+            // 线程会改名：comm 跟最新一次走，first_comm 留作对照
+            e.comm = comm.to_string();
+            e.n += 1;
+            e.actual = sample.actual.clone();
             // 每次改写都留时间点（用户要的是「什么时候被动过」），
-            // 但「谁写的」只解释一次：同一台设备上超集来源就那么几种
-            // 只解释一次：同一台设备上超集来源就那么几种，每条都念一遍
-            // 长句会把真正的「改了什么集合」埋掉
+            // 但「谁写的」只解释一次：同一台设备上超集来源就那么几种，
+            // 每条都念一遍长句会把「改了什么集合」埋掉
             let first = s.seen.reset_why.is_empty();
             s.seen.reset_why.insert(sample.actual.clone());
             let mut line = format!(
@@ -983,6 +992,9 @@ pub fn note_sysgroup_batch(n: u64, hint: Option<(SysGroup, String)>) {
 pub fn note_sync_tally(total: usize, ok: usize, rebound: usize, failed: usize, blocked: usize) {
     let mut guard = sink();
     let Some(s) = guard.as_mut() else { return };
+    if total > 0 {
+        s.ever_bound = true;
+    }
     s.tally = Some(SyncTally {
         total,
         ok,
@@ -1151,13 +1163,13 @@ pub fn periodic_summary(current: &SchedSnapshot) {
     // ── 总账 ──────────────────────────────────────────────────
     match tally.filter(|t| t.total > 0) {
         Some(t) => tag("周期", &tally_line(t, rewrites, s.blocked_note.as_ref())),
-        None => tag("周期", empty_state_hint(tally)),
+        None => tag("周期", empty_state_hint(tally, s.ever_bound)),
     }
 
     // ── 持续对抗：同一个线程被反复改写 ────────────────────────
     // 聚合与排版在 diag_fmt，这里只提供 pkg 表
     if let Some(line) = contra_line(&reset_hits, CONTRA_HITS, CONTRA_CAP, |tid| {
-        s.thread_pkg.get(&tid).map(|(p, _)| p.clone())
+        s.thread_pkg.get(&tid).cloned()
     }) {
         tag("周期", &line);
     }
@@ -1180,7 +1192,7 @@ pub fn periodic_summary(current: &SchedSnapshot) {
             ));
         }
         if kinds[2] > 0 {
-            segs.push(format!("挪折 {}", kinds[2]));
+            segs.push(format!("挪簇 {}", kinds[2]));
         }
         tag("周期", &format!("改写明细 {}", segs.join(" ｜ ")));
     }
@@ -1199,7 +1211,7 @@ pub fn periodic_summary(current: &SchedSnapshot) {
         tag(
             "周期",
             &format!(
-                "组上限 {}  {}；线程被系统放回这些组，规则集合超出该组可用集合，\
+                "组上限 {} {}；线程被系统放回这些组，规则集合超出该组可用集合，\
                  每轮已拉回规则集合——系统行为，不是绑定失败",
                 caps,
                 segs.join("、")
@@ -1211,7 +1223,7 @@ pub fn periodic_summary(current: &SchedSnapshot) {
             v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
             v.truncate(3);
             let list: Vec<String> = v.iter().map(|(c, n)| format!("{} {}", c, n)).collect();
-            tag("周期", &format!("组上限高频线程  {}", list.join("、")));
+            tag("周期", &format!("组上限高频线程 {}", list.join("、")));
         }
     }
     if ineff_n > 0 {
@@ -1240,14 +1252,24 @@ pub fn periodic_summary(current: &SchedSnapshot) {
     if sysgroup > 0 {
         // 两个数必须各自标清来源：`sysgroup` 是判定次数之和（含 eBPF 新线程的
         // 即时判定），`最近一轮` 只看周期校验。上一版把它们写成一句话，
-        // 真机上出现「刚报 dns-work-15 被跳过」紧接「最近一轮没有这类线程」
-        let now = tally.map(|t| t.blocked).unwrap_or(0);
+        // 真机上出现「刚报 dns-work-15 被跳过」紧接「最近一轮没有这类线程」。
+        //
+        // 总账那一行已经写了「被组限制 N」，这里不再重复同一个数字：
+        // 相邻两行说同一个 228，读者会以为是两件事
+        let head = match tally {
+            // 总账刚说过同一个数字，不再重复
+            Some(t) if t.blocked > 0 => String::new(),
+            // 周期校验没看到、但 eBPF 事件里出现过：说明这些线程已经退出或被搬回，
+            // 也要说清「最近一轮是干净的」，否则读者以为两个来源在打架
+            Some(_) => "最近一轮没有线程被所在组挡住；".to_string(),
+            None => String::new(),
+        };
         tag(
             "周期",
             &format!(
-                "跳过明细  最近一轮 {} 个线程被所在组挡住；近 {} 秒 {} 次判定（含 eBPF 新线程即时判定）\
+                "跳过明细 {}近 {} 秒累计跳过 {} 次（同一线程每轮各计一次，含 eBPF 新线程的即时判定）\
                  ｜ respect 下不硬抢，切前台自动恢复；强制接管写 @sysgroup=takeover",
-                now,
+                head,
                 SUMMARY_GAP.as_secs(),
                 sysgroup
             ),
@@ -1878,16 +1900,22 @@ mod tests {
     /// 缓存空了必须明说，不能静默地只留一句「近 60 秒被改了 N 次」
     #[test]
     fn missing_state_is_announced_not_silent() {
-        assert!(empty_state_hint(None).contains("首轮校验"));
+        assert!(empty_state_hint(None, false).contains("首轮校验"));
         let empty = SyncTally::default();
-        assert!(empty_state_hint(Some(empty)).contains("没有受管线程"));
-        assert!(empty_state_hint(Some(empty)).contains("重新接管"));
+        // 从未接管过 = 游戏还没启动，属正常状态，不能说成「进程已退出」
+        let never = empty_state_hint(Some(empty), false);
+        assert!(never.contains("还没命中"), "{}", never);
+        assert!(!never.contains("已退出"), "{}", never);
+        // 接管过又归零才算「退出了」
+        let gone = empty_state_hint(Some(empty), true);
+        assert!(gone.contains("已退出"), "{}", gone);
+        assert!(gone.contains("重新接管"), "{}", gone);
         let full = SyncTally {
             total: 3,
             ok: 3,
             ..Default::default()
         };
-        assert_eq!(empty_state_hint(Some(full)), "此刻没有受管线程");
+        assert_eq!(empty_state_hint(Some(full), true), "此刻没有受管线程");
     }
 
     /// 「受管 N 个 / 当前符合 X」必须能回答 Scene 里看到的到底是什么状态

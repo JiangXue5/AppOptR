@@ -191,14 +191,36 @@ pub(crate) fn tally_line(
 
 /// 只报「这段时间被改了几次」而不给「此刻」，是这套日志被误读的最老一处。
 /// 拿不到当前状态时必须自己说出来，不能默认沉默——沉默会被读成「还是那样」
-pub(crate) fn empty_state_hint(tally: Option<SyncTally>) -> &'static str {
+pub(crate) fn empty_state_hint(tally: Option<SyncTally>, ever_bound: bool) -> &'static str {
     match tally {
         None => "此刻还没有完成首轮校验",
-        Some(t) if t.total == 0 => {
-            "此刻没有受管线程（目标进程已退出或未被扫描到），下次命中会重新接管"
+        // 「还没启动」和「已经退出」是两件事：前者是正常状态（开机就装、
+        // 游戏还没开），后者才需要看一眼。真机首条摘要在 +60s 说
+        // 「目标进程已退出或未被扫描到」，可游戏 6 秒后才起来——把
+        // 正常状态说成异常，用户第一反应是去查模块
+        Some(t) if t.total == 0 && !ever_bound => {
+            "自启动以来还没命中规则内的线程（游戏未启动时属正常），命中后立即接管"
         }
+        Some(t) if t.total == 0 => "此刻没有受管线程（进程已退出或被系统回收），下次命中会重新接管",
         _ => "此刻没有受管线程",
     }
+}
+
+/// 一个受管线程在本周期内被外部改写的汇总。
+///
+/// 名字要记最新的：Android 上驱动与池化线程会改自己的 comm
+/// （真机上 tid 14636 先叫 `HWC release`、后叫 `GPU completion`）。
+/// 只留首次的名字，「共 3 次」就和逐条「改写」行对不上——读者 grep
+/// 到的那个名字只出现过一次，最先怀疑的是统计本身
+#[derive(Clone, Default)]
+pub(crate) struct RewriteHit {
+    /// 最近一次看到的线程名
+    pub comm: String,
+    /// 首次看到的线程名，与 comm 不同说明本周期内改过名
+    pub first_comm: String,
+    pub n: u32,
+    /// 最近一次被改成的集合
+    pub actual: String,
 }
 
 /// 同一线程一个周期内被反复改写时的汇总行。
@@ -207,31 +229,42 @@ pub(crate) fn empty_state_hint(tally: Option<SyncTally>) -> &'static str {
 /// 后者是 HAL/boost 在周期覆盖，调规则解决不了。`pkg_of` 由调用方提供，
 /// 免去把 `thread_pkg` 表也传进来
 pub(crate) fn contra_line(
-    hits: &HashMap<i32, (String, u32, String)>,
+    hits: &HashMap<i32, RewriteHit>,
     threshold: u32,
     cap: usize,
-    pkg_of: impl Fn(i32) -> Option<String>,
+    info_of: impl Fn(i32) -> Option<(String, bool)>,
 ) -> Option<String> {
-    let mut v: Vec<(i32, &str, u32, &str)> = hits
+    let mut v: Vec<(i32, &RewriteHit)> = hits
         .iter()
-        .filter(|(_, (_, n, _))| *n >= threshold)
-        .map(|(tid, (comm, n, actual))| (*tid, comm.as_str(), *n, actual.as_str()))
+        .filter(|(_, h)| h.n >= threshold)
+        .map(|(tid, h)| (*tid, h))
         .collect();
     if v.is_empty() {
         return None;
     }
-    v.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
-    let total: u32 = v.iter().map(|c| c.2).sum();
+    v.sort_by(|a, b| b.1.n.cmp(&a.1.n).then(a.0.cmp(&b.0)));
+    let total: u32 = v.iter().map(|c| c.1.n).sum();
     let n_threads = v.len();
     v.truncate(cap);
     let list: Vec<String> = v
         .iter()
-        .map(|(tid, comm, n, actual)| {
-            let who = match pkg_of(*tid) {
-                Some(p) if !p.is_empty() => format!("{}({})[{}]", comm, tid, p),
-                _ => format!("{}({})", comm, tid),
+        .map(|(tid, h)| {
+            // 与 `sample_tag` 同口径：主线程不再念被截断的 comm，
+            // 否则同一行里前面写「主线程(14572)」、这里写「ent.tmgp.osgame(14572)」，
+            // 读者会以为是两个线程
+            let who = match info_of(*tid) {
+                Some((p, true)) if !p.is_empty() => format!("主线程({})[{}]", tid, p),
+                Some((p, false)) if !p.is_empty() => format!("{}({})[{}]", h.comm, tid, p),
+                _ => format!("{}({})", h.comm, tid),
             };
-            format!("{} {} 次（最近被改成 {}）", who, n, actual)
+            // 改过名就把旧名带上：否则「3 次」与日志里唯一那行
+            // 「HWC release 1 次」永远对不上
+            let mut tail = String::new();
+            if !h.first_comm.is_empty() && h.first_comm != h.comm {
+                tail.push_str(&format!("本周期内由 {} 改名；", h.first_comm));
+            }
+            tail.push_str(&format!("最近被改成 {}", h.actual));
+            format!("{} {} 次（{}）", who, h.n, tail)
         })
         .collect();
     Some(format!(
@@ -402,11 +435,27 @@ mod tests {
     /// 同一线程反复被改要单独成行：偶发一次与「一分钟十几次」处置方式相反
     #[test]
     fn repeated_rewrites_of_one_thread_are_summarized() {
-        let mut hits: HashMap<i32, (String, u32, String)> = HashMap::new();
-        hits.insert(13920, ("UnityMain".into(), 7, "4-7".into()));
-        hits.insert(13732, ("main".into(), 1, "0-7".into()));
+        let mut hits: HashMap<i32, RewriteHit> = HashMap::new();
+        hits.insert(
+            13920,
+            RewriteHit {
+                comm: "UnityMain".into(),
+                first_comm: "UnityMain".into(),
+                n: 7,
+                actual: "4-7".into(),
+            },
+        );
+        hits.insert(
+            13732,
+            RewriteHit {
+                comm: "main".into(),
+                first_comm: "main".into(),
+                n: 1,
+                actual: "0-7".into(),
+            },
+        );
         let line = contra_line(&hits, 3, 3, |tid| {
-            (tid == 13920).then(|| "com.tencent.tmgp.osgame".to_string())
+            (tid == 13920).then(|| ("com.tencent.tmgp.osgame".to_string(), false))
         })
         .expect("达到阈值必须出这一行");
         assert!(line.starts_with("对抗 1 个线程"), "{}", line);
@@ -419,14 +468,78 @@ mod tests {
         assert!(!line.contains("main(13732)"), "{}", line);
 
         // 没到阈值就完全不出声（偶发改写已经有一条独立的「改写」行）
-        let quiet: HashMap<i32, (String, u32, String)> =
-            [(1, ("a".into(), 2, "0-7".into()))].into_iter().collect();
+        let quiet: HashMap<i32, RewriteHit> = [(
+            1,
+            RewriteHit {
+                comm: "a".into(),
+                first_comm: "a".into(),
+                n: 2,
+                actual: "0-7".into(),
+            },
+        )]
+        .into_iter()
+        .collect();
         assert!(contra_line(&quiet, 3, 3, |_| None).is_none());
+    }
+
+    /// 线程改名后要报最新名并把旧名带上：真机上 tid 14636 先叫
+    /// `HWC release` 后叫 `GPU completion`，「共 3 次」若挂在旧名下，
+    /// 读者 grep 到的那个名字只出现过一行，会以为统计错了
+    #[test]
+    fn rename_within_cycle_keeps_both_names() {
+        let hits: HashMap<i32, RewriteHit> = [(
+            14636,
+            RewriteHit {
+                comm: "GPU completion".into(),
+                first_comm: "HWC release".into(),
+                n: 3,
+                actual: "0-7".into(),
+            },
+        )]
+        .into_iter()
+        .collect();
+        let line = contra_line(&hits, 3, 3, |_| {
+            Some(("com.tencent.tmgp.sgame".into(), false))
+        })
+        .unwrap();
+        assert!(
+            line.contains("GPU completion(14636)[com.tencent.tmgp.sgame] 3 次"),
+            "{}",
+            line
+        );
+        assert!(line.contains("本周期内由 HWC release 改名"), "{}", line);
+    }
+
+    /// 主线程在「对抗」行里也要写成 `主线程(tid)[包名]`：
+    /// 逐条「改写」行用的是这个写法，同一份日志里不能两种叫法
+    #[test]
+    fn main_thread_keeps_the_same_name_in_contra_line() {
+        let hits: HashMap<i32, RewriteHit> = [(
+            14572,
+            RewriteHit {
+                comm: "ent.tmgp.osgame".into(),
+                first_comm: "ent.tmgp.osgame".into(),
+                n: 5,
+                actual: "0-7".into(),
+            },
+        )]
+        .into_iter()
+        .collect();
+        let line = contra_line(&hits, 3, 3, |_| {
+            Some(("com.tencent.tmgp.osgame".into(), true))
+        })
+        .unwrap();
+        assert!(
+            line.contains("主线程(14572)[com.tencent.tmgp.osgame] 5 次"),
+            "{}",
+            line
+        );
+        assert!(!line.contains("ent.tmgp.osgame(14572)"), "{}", line);
     }
 
     #[test]
     fn empty_tally_never_stays_silent() {
-        assert!(empty_state_hint(None).contains("首轮"));
-        assert!(empty_state_hint(Some(SyncTally::default())).contains("没有受管线程"));
+        assert!(empty_state_hint(None, false).contains("首轮"));
+        assert!(empty_state_hint(Some(SyncTally::default()), true).contains("没有受管线程"));
     }
 }

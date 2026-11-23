@@ -366,9 +366,10 @@ fn main() {
     } else {
         ebpf_init()
     };
-    // 启动块收尾：所有组件就绪后才说「开始运行」，否则这条会排在 eBPF/Web
-    // 之前，读者以为它们没起来
-    diag::announce();
+    // 启动块收尾：所有组件就绪后才说「开始运行」。但 eBPF 白名单是在第一轮
+    // 循环里写进 map 的，在这里打「就绪」会让「组件  eBPF 白名单已配置」
+    // 落到它后面，启动块看着像没收尾。改到第一轮白名单处理完之后再打
+    let mut announced = false;
     // 仅自动模式失败一次即放弃；强制 eBPF 需持续重试，强制 proc 无需 eBPF
     if ebpf_state.is_none() && MODE_FORCE.load(Ordering::Relaxed) == 0 {
         EBPF_GAVE_UP.store(true, Ordering::Relaxed);
@@ -482,6 +483,12 @@ fn main() {
                 ebpf_state = Some(new_es);
             }
             continue;
+        }
+
+        // 白名单已在上一段处理完，此刻启动块才真正收尾
+        if !announced {
+            diag::announce();
+            announced = true;
         }
 
         if let Some(es) = ebpf_state.as_mut() {
