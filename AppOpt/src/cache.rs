@@ -141,6 +141,25 @@ fn resolve_group(path: Option<&str>, prev: Option<&TaskEntry>) -> SysGroup {
 /// 返回的第二个值是该落点是否仍然有效，调用方据此决定要不要删除记录。
 /// 「落点有效」的判据有两条：仍在规则集合内，且这次规划没有把它裁小
 /// （迁不进自己的组时，被裁小的落点 S7 自己也维持不住，交回规则更稳定）
+/// 渲染护栏判定：关键线程被绑到「不含性能核」或「只有一个核」的集合。
+/// 返回命中原因，None 表示不命中。只用于观察，不参与目标计算——
+/// 把它接进目标计算就等于替用户改规则，那是另一件事
+fn guard_reason(target: &CpuSet, perf: &CpuSet) -> Option<&'static str> {
+    // 空集合通常是 blocked 或拓扑未知，交给现有诊断，不在这里重复报警
+    if target.count() == 0 {
+        return None;
+    }
+    let mut hit = *target;
+    hit.and(perf);
+    if hit.count() == 0 {
+        return Some("目标集合不含性能核");
+    }
+    if target.count() < 2 {
+        return Some("目标只剩一个核");
+    }
+    None
+}
+
 fn plan_entry(
     rule: &CpuSet,
     landing: Option<CpuSet>,
@@ -257,8 +276,9 @@ impl ProcCache {
             return true;
         }
 
-        // 组归属只在首次接管时读一次：/proc/<tid>/cgroup 一次 open，
-        // 之后跟着缓存走，不会变成每轮开销
+        // 组归属每轮重新读：系统随时可能把线程在 top-app / background 之间挪，
+        // 沿用上一轮的缓存在「刚挪组」的那一轮会算出错误的有效集合。
+        // 一次 open 的代价远小于按错组绑核，暂不做缓存（如需优化先测量）。
         let prev = self.tasks.get(&tid);
         let path = crate::cpuset::thread_cgroup(tid);
         // 组名必须跟这一轮的 path 走。沿用上一轮的缓存，会在「系统刚把线程
@@ -287,6 +307,21 @@ impl ProcCache {
         }
         if let Some(eff) = &target.clipped {
             crate::diag::note_group_clip(group, &result.cpus, &target.cpus, eff);
+        }
+        // 渲染护栏（观察）：关键线程被绑到没有性能核、或只剩一个核的集合时
+        // 记一次数并首行提示。只诊断不改目标——是否拦截要等真机 A/B 数据。
+        // 只对线程规则包生效：包级规则没有 comm，判定不了角色
+        if cfg.render_guard_observe
+            && result.is_thread_rule
+            && !thread_name.is_empty()
+            && !target.blocked
+            && crate::roles::role_of(thread_name) == crate::roles::Role::Critical
+        {
+            let mut perf = cfg.topo.p_core;
+            perf.or(&cfg.topo.hp_core);
+            if let Some(reason) = guard_reason(&target.cpus, &perf) {
+                crate::diag::note_render_guard(pkg, thread_name, &target.cpus, reason);
+            }
         }
         // 规则没变、且确实写过：这次不是「首次绑定」而是「复核」。
         // 复核必须走校验语义，才能把「被外部改写」记成漂移而不是正常写入
@@ -448,6 +483,21 @@ mod tests {
 
     fn set_of(spec: &str) -> CpuSet {
         crate::cpuset::parse_cpu_ranges(spec, None)
+    }
+
+    /// 护栏只看「有没有性能核、够不够两个核」，三条边界都要明确：
+    /// 误报会让用户去改本来正确的规则，漏报则观察模式白开
+    #[test]
+    fn render_guard_flags_missing_perf_cores() {
+        let perf = set_of("6-7");
+        assert_eq!(
+            guard_reason(&set_of("0-3"), &perf),
+            Some("目标集合不含性能核")
+        );
+        assert_eq!(guard_reason(&set_of("6"), &perf), Some("目标只剩一个核"));
+        assert_eq!(guard_reason(&set_of("4-7"), &perf), None);
+        // 空集合是 blocked / 拓扑未知，交给现有诊断，不在这里重复报
+        assert_eq!(guard_reason(&CpuSet::new(), &perf), None);
     }
 
     /// 后台组 + 目标在大核 + 交集为空，是「写多少遍都 EINVAL」的那一类

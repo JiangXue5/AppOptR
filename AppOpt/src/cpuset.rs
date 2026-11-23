@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::fmt::Write as _;
 use std::fs;
@@ -500,6 +500,65 @@ pub(crate) fn create_cpuset_dir(path: &str, cpus: &str, mems: &str) -> bool {
     }
     let mems_path = format!("{}/mems", path);
     fs::write(&mems_path, mems).is_ok()
+}
+
+/// 回收 `AppOpt/` 下不再被规则引用、且没有线程驻留的空子目录。
+///
+/// 只读 + `rmdir`，不做递归：`tasks` 非空一律跳过，`referenced` 里的名字跳过。
+/// `rmdir` 失败（非空 / 权限 / 已被删除）全部忽略——清目录是尽力而为，
+/// 一个删不掉不该让整轮 GC 报错。返回实际删除的数量。
+///
+/// 调用方必须在删除后让 `READY_DIRS` 失效（本函数内部已做），否则缓存仍认为
+/// 目录就绪，下一次写入会得到 ENOENT，白白触发一轮重建。
+pub fn gc_empty_dirs(referenced: &HashSet<String>) -> usize {
+    let removed = gc_empty_dirs_at(&base_cpuset(), referenced);
+    if removed > 0 {
+        crate::apply_affinity::reset_cpuset_dir_cache();
+    }
+    removed
+}
+
+/// `gc_empty_dirs` 的实现，base 可注入以便测试
+fn gc_empty_dirs_at(base: &str, referenced: &HashSet<String>) -> usize {
+    let entries = match fs::read_dir(base) {
+        Ok(e) => e,
+        Err(_) => return 0,
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        // file_type 不跟随符号链接：cgroupfs 里不该有，但别的一旦有就跳过
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let name = match entry.file_name().to_str() {
+            Some(n) if !n.is_empty() => n.to_string(),
+            _ => continue,
+        };
+        if !gc_reclaimable(base, &name, referenced) {
+            continue;
+        }
+        let path = format!("{}/{}", base, name);
+        let Ok(c_path) = CString::new(path) else {
+            continue;
+        };
+        // 直接 rmdir 由内核判定是否为空，避免 stat 与删除之间的竞态
+        if unsafe { libc::rmdir(c_path.as_ptr()) } == 0 {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// 单个目录是否满足回收条件：无引用、且 `tasks` 可读且为空。
+/// 读不到 `tasks` 就当成「可能有线程」，宁可留一个空目录。
+fn gc_reclaimable(base: &str, name: &str, referenced: &HashSet<String>) -> bool {
+    if referenced.contains(name) {
+        return false;
+    }
+    match fs::read_to_string(format!("{}/{}/tasks", base, name)) {
+        Ok(s) => s.trim().is_empty(),
+        Err(_) => false,
+    }
 }
 
 /// 把一个线程号写进 cgroup 的 `tasks`。
@@ -1291,5 +1350,44 @@ mod tests {
         fs::remove_file(dir.join("cpuset.cpus.effective")).unwrap();
         assert_eq!(read_effective(dir.to_str().unwrap()), None);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 回收判定只放行「无引用 + tasks 为空」的目录：有线程驻留的目录一旦被删，
+    /// 线程会瞬间落回 root cpuset，等于把系统分组限制整个绕开
+    #[test]
+    fn gc_only_reclaims_unreferenced_empty_dirs() {
+        let base = std::env::temp_dir().join(format!("ao_gc_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+
+        // 空、无引用 → 可回收
+        fs::create_dir_all(base.join("0-3")).unwrap();
+        fs::write(base.join("0-3/tasks"), "").unwrap();
+
+        // 空、但被规则引用 → 不可回收
+        fs::create_dir_all(base.join("4-7")).unwrap();
+        fs::write(base.join("4-7/tasks"), "\n").unwrap();
+
+        // 有线程 → 不可回收
+        fs::create_dir_all(base.join("0-7")).unwrap();
+        fs::write(base.join("0-7/tasks"), "1234\n").unwrap();
+
+        // 没有 tasks（不是 cgroup 目录 / 读失败）→ 不可回收
+        fs::create_dir_all(base.join("6-7")).unwrap();
+
+        let b = base.to_str().unwrap();
+        let mut referenced = HashSet::new();
+        referenced.insert("4-7".to_string());
+        assert!(gc_reclaimable(b, "0-3", &referenced), "空且无引用应回收");
+        assert!(!gc_reclaimable(b, "4-7", &referenced), "被引用不能回收");
+        assert!(!gc_reclaimable(b, "0-7", &referenced), "有线程不能回收");
+        assert!(
+            !gc_reclaimable(b, "6-7", &referenced),
+            "读不到 tasks 不能回收"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+        // base 不存在时整体返回 0，不 panic
+        assert_eq!(gc_empty_dirs_at(b, &referenced), 0);
     }
 }

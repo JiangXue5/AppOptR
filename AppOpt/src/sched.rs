@@ -411,6 +411,32 @@ impl SchedState {
         self.last_decide = None;
     }
 
+    /// 息屏暂停判定：丢掉采样基准，线程状态（落点、冷却、冻结）保留。
+    ///
+    /// 不清基准的话，亮屏首轮会拿「息屏那段几乎没有负载」的平均值做裁决，
+    /// 刚稳定下来的线程会被判成「该回小核」，等于每次息屏都抖一次。
+    /// 不清线程状态则相反：落点与冷却仍然有效，亮屏后不必重新学习
+    pub fn pause(&mut self) {
+        self.prev = None;
+        self.load = [-1; 3];
+        self.idle_rounds = 0;
+        self.last_decide = None;
+        if self.mode != SchedMode::Off {
+            self.state = "息屏暂停";
+        }
+    }
+
+    /// 亮屏恢复：与 `pause` 清同一批基准，状态回到采样预热
+    pub fn resume(&mut self) {
+        self.prev = None;
+        self.load = [-1; 3];
+        self.idle_rounds = 0;
+        self.last_decide = None;
+        if self.mode != SchedMode::Off {
+            self.state = "采样预热";
+        }
+    }
+
     /// 主循环每轮调用。off 模式零开销直接返回。
     pub fn tick(&mut self, cfg: &AppConfig, cache: &ProcCache) -> Vec<Move> {
         if self.mode == SchedMode::Off {

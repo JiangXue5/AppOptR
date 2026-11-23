@@ -15,6 +15,7 @@ mod rt;
 mod rule_edit;
 mod rule_match;
 mod sched;
+mod screen;
 mod web;
 
 use std::env;
@@ -353,6 +354,9 @@ fn main() {
 
     // S7 状态。模式由配置驱动，off 时 tick 立即返回，不读 /proc/stat
     let mut sched_state = SchedState::new();
+    // 息屏判定。只有 @screen=relax 时才探测，默认配置下不读任何 /sys 节点
+    let mut screen_state = screen::ScreenState::new();
+    let mut screen_relaxed = false;
     let mut sched_deadline = Instant::now();
     // 诊断：卡顿信号 1 秒采样（样本够多才可信），线程表 5 秒刷新一次
     let mut jank = diag::JankSampler::new();
@@ -394,6 +398,29 @@ fn main() {
         // 是「刚才绑住了、过一会儿又散了」最常见的成因，必须留下时间点
         diag::watch_cpu_online();
 
+        // 息屏放松：只有 @screen=relax 才探测，默认配置下不读任何 /sys 节点。
+        // 切换时清掉 S7 采样基准，避免亮屏首轮拿「息屏那段没负载」的平均值裁决；
+        // 线程的落点与冷却保留，亮屏后不必重新学习
+        let relax = cfg.screen_relax && !screen_state.observe();
+        let mut resume_now = false;
+        if relax != screen_relaxed {
+            screen_relaxed = relax;
+            if relax {
+                crate::diag::tag(
+                    "事件",
+                    &format!(
+                        "屏幕熄灭（判据 {}）：周期复核降为 60 秒，S7 与卡顿采样暂停",
+                        screen_state.source()
+                    ),
+                );
+                sched_state.pause();
+            } else {
+                crate::diag::tag("事件", "屏幕点亮：恢复常规周期复核");
+                sched_state.resume();
+                resume_now = true;
+            }
+        }
+
         // 模式切换必须立即生效：`on -> off` 依赖 policy_sig 变化触发全量重扫，
         // 这里同时清空 S7 状态，让已迁移线程按规则重新落地
         if config_changed {
@@ -414,6 +441,19 @@ fn main() {
             // 先按新配置复核 RT 所有权，再决定时间片是否需要改写或还原
             rt::prune(&cfg);
             rt::prepare(&cfg);
+            // 规则删掉后，对应的空 cpuset 目录不会自己消失；留在这里的
+            // 空目录会让下一次同集合规则命中时复用旧 cpus 值（如果生效集合变过）。
+            // 只删「无引用 + tasks 为空」的目录，有线程驻留的一律跳过
+            let referenced: std::collections::HashSet<String> = cfg
+                .rules
+                .iter()
+                .filter(|r| !r.cpuset_dir.is_empty())
+                .map(|r| r.cpuset_dir.clone())
+                .collect();
+            let removed = crate::cpuset::gc_empty_dirs(&referenced);
+            if removed > 0 {
+                crate::diag::tag("配置", &format!("回收 {} 个空 cpuset 目录", removed));
+            }
         }
 
         // 配置加载线程 panic 恢复
@@ -505,7 +545,10 @@ fn main() {
                 }
             }
 
-            if affinity_deadline.elapsed() >= Duration::from_secs(3 * interval) {
+            // 息屏时复查降到 60 秒：事件仍逐个处理，新建线程的首次绑定不受影响，
+            // 只是「已绑定线程是否被外部改写」这件事没那么急
+            let ebpf_gap = if relax { 60 } else { 3 * interval };
+            if resume_now || affinity_deadline.elapsed() >= Duration::from_secs(ebpf_gap) {
                 affinity_check(es, &cfg);
                 affinity_deadline = Instant::now();
             }
@@ -521,7 +564,11 @@ fn main() {
                 cache.request_full_scan();
             }
             cache_sync(&cfg, cache);
-            if affinity_deadline.elapsed() >= Duration::from_secs(5 * interval)
+            // 息屏时降到 60 秒；force_affinity（新线程、配置变更、回退重建）
+            // 仍然立即执行，否则息屏期间新启动的应用会迟迟绑不上
+            let proc_gap = if relax { 60 } else { 5 * interval };
+            if resume_now
+                || affinity_deadline.elapsed() >= Duration::from_secs(proc_gap)
                 || cache.force_affinity
             {
                 // ESRCH 的线程同时收回 RT 记录，避免事件漏报时配额一直被占
@@ -545,42 +592,56 @@ fn main() {
         // S7 采样与迁移。off 时 tick 立即返回，只刷新一次快照供 Web 显示
         if sched_deadline.elapsed() >= sched::sample_period() {
             sched_deadline = Instant::now();
-            let _ = sched_state.set_mode(cfg.sched);
-            let moves = if cfg.sched == SchedMode::On {
-                match (&ebpf_state, &proc_state) {
-                    (Some(es), _) => sched_state.tick(&cfg, &es.cache),
-                    (None, Some(ps)) => sched_state.tick(&cfg, &ps.cache),
-                    _ => Vec::new(),
+            // 息屏期间不采样也不迁移：这段时间的负载不代表前台体验，
+            // 采到的平均值只会让亮屏首轮的裁决偏向「该回小核」。
+            // 仍 publish 一次，让 Web 上的状态显示「息屏暂停」而不是停在旧结论
+            if relax {
+                // 息屏期间改 @sched 也要立即生效：`on -> off` 必须让已迁移的
+                // 线程按规则落地，不能等到亮屏。模式真变了就重新进入暂停态
+                if sched_state.set_mode(cfg.sched) {
+                    sched_state.pause();
                 }
+                sched_state.publish();
             } else {
-                // off / shadow：只推进采样与 would 统计，候选迁移直接丢弃。
-                // 主循环只有这一条通往亲和性写入的路径，shadow 不可能执行迁移
-                match (&ebpf_state, &proc_state) {
-                    (Some(es), _) => {
-                        sched_state.tick(&cfg, &es.cache);
+                let _ = sched_state.set_mode(cfg.sched);
+                let moves = if cfg.sched == SchedMode::On {
+                    match (&ebpf_state, &proc_state) {
+                        (Some(es), _) => sched_state.tick(&cfg, &es.cache),
+                        (None, Some(ps)) => sched_state.tick(&cfg, &ps.cache),
+                        _ => Vec::new(),
                     }
-                    (None, Some(ps)) => {
-                        sched_state.tick(&cfg, &ps.cache);
+                } else {
+                    // off / shadow：只推进采样与 would 统计，候选迁移直接丢弃。
+                    // 主循环只有这一条通往亲和性写入的路径，shadow 不可能执行迁移
+                    match (&ebpf_state, &proc_state) {
+                        (Some(es), _) => {
+                            sched_state.tick(&cfg, &es.cache);
+                        }
+                        (None, Some(ps)) => {
+                            sched_state.tick(&cfg, &ps.cache);
+                        }
+                        _ => {}
                     }
-                    _ => {}
-                }
-                Vec::new()
-            };
-            for m in &moves {
-                let outcome = match (&mut ebpf_state, &mut proc_state) {
-                    (Some(es), _) => apply_move_ebpf(es, &cfg, m),
-                    (None, Some(ps)) => apply_move_proc(ps, &cfg, m),
-                    _ => AffinityOutcome::Failed,
+                    Vec::new()
                 };
-                // 只有内核确认写入成功，settle 才会提交落点与 moved
-                sched_state.settle(m, outcome);
+                for m in &moves {
+                    let outcome = match (&mut ebpf_state, &mut proc_state) {
+                        (Some(es), _) => apply_move_ebpf(es, &cfg, m),
+                        (None, Some(ps)) => apply_move_proc(ps, &cfg, m),
+                        _ => AffinityOutcome::Failed,
+                    };
+                    // 只有内核确认写入成功，settle 才会提交落点与 moved
+                    sched_state.settle(m, outcome);
+                }
+
+                sched_state.publish();
             }
-            sched_state.publish();
         }
 
         // 诊断快照：线程表回答「谁没绑住」，卡顿采样回答「绑了之后渲染线程还等不等 CPU」。
         // 两件事都只在被管理线程上做，enumerate 上限由 diag 内部兜住
-        if jank_deadline.elapsed() >= Duration::from_secs(1) {
+        // 息屏不采卡顿：没有前台渲染，采到的全是 0，只会污染恢复后的第一次统计
+        if !relax && jank_deadline.elapsed() >= Duration::from_secs(1) {
             jank_deadline = Instant::now();
             match (&ebpf_state, &proc_state) {
                 (Some(es), _) => {

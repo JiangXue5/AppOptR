@@ -184,6 +184,12 @@ pub struct AppConfig {
     pub sched_pkgs: HashSet<String>,
     /// S7 模式，off 时运行期零开销
     pub sched: SchedMode,
+    /// 息屏时放松周期复核：`@screen=relax` 打开。只降低「复查频率」，
+    /// 不影响新线程的首次绑定；息屏判定本身不依赖该开关
+    pub screen_relax: bool,
+    /// 渲染护栏（观察模式）：关键线程被绑到没有性能核的集合时只记数，
+    /// 不改绑定。用于先拿真机数据，再决定是否值得拦截
+    pub render_guard_observe: bool,
     /// RT 配置。off 时运行期不查询任何线程的调度策略
     pub rt: RtConfig,
     pub topo: CpuTopology,
@@ -232,6 +238,8 @@ impl AppConfig {
             sched_scope: SchedScope::default(),
             sched_pkgs: HashSet::new(),
             sched: SchedMode::Off,
+            screen_relax: false,
+            render_guard_observe: false,
             rt: RtConfig::default(),
             topo: CpuTopology::empty(),
         }
@@ -285,12 +293,19 @@ fn build_policy_sig(
     unmatched_all: bool,
     sysgroup_respect: bool,
     sched: SchedMode,
+    screen_relax: bool,
+    render_guard_observe: bool,
     rt: &RtConfig,
 ) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     unmatched_all.hash(&mut h);
     sysgroup_respect.hash(&mut h);
     (sched as u8).hash(&mut h);
+    // 息屏放松只影响复查节奏，但切换时要让主循环立即按新策略排下一次复查，
+    // 所以也进指纹；否则改了这一行要等下一次规则变化才生效
+    screen_relax.hash(&mut h);
+    // 护栏开关只影响诊断，但开关本身要让规则重扫一次，否则改了不生效
+    render_guard_observe.hash(&mut h);
     (rt.scope as u8).hash(&mut h);
     match &rt.global {
         RtMatch::Auto => 0u8.hash(&mut h),
@@ -809,6 +824,10 @@ pub fn load_config(
     let mut sysgroup_respect = true;
     // 动态调度默认全关，配置里不写就与 2.3.0 行为一致
     let mut sched = SchedMode::Off;
+    // 息屏放松默认关：默认行为必须与 2.6.1 完全一致
+    let mut screen_relax = false;
+    // 渲染护栏默认关：打开也只观察，不改变任何绑定
+    let mut render_guard_observe = false;
     let mut rt = RtConfig::default();
     // 分应用条目先收集原文，等 @rt.max 解析完再统一构造，避免配置行顺序影响缺省上限
     let mut rt_apps: Vec<String> = Vec::new();
@@ -840,6 +859,10 @@ pub fn load_config(
                 ("sched", "off") => sched = SchedMode::Off,
                 ("sched", "shadow") => sched = SchedMode::Shadow,
                 ("sched", "on") => sched = SchedMode::On,
+                ("screen", "off") => screen_relax = false,
+                ("screen", "relax") => screen_relax = true,
+                ("render_guard", "off") => render_guard_observe = false,
+                ("render_guard", "observe") => render_guard_observe = true,
                 ("rt", "off") => rt.scope = RtScope::Off,
                 ("rt", "global") => rt.scope = RtScope::Global,
                 ("rt", "per_app" | "per-app" | "perapp") => rt.scope = RtScope::PerApp,
@@ -986,7 +1009,14 @@ pub fn load_config(
     let trunc_keys = build_trunc_keys(&pkgs);
     let rule_index = build_rule_index(&rules);
     let pkg_sig = build_pkg_sig(&rules);
-    let policy_sig = build_policy_sig(unmatched_all, sysgroup_respect, sched, &rt);
+    let policy_sig = build_policy_sig(
+        unmatched_all,
+        sysgroup_respect,
+        sched,
+        screen_relax,
+        render_guard_observe,
+        &rt,
+    );
 
     // 同一包多条包级规则按并集生效，顺序无关；只提示不改变语义
     let mut multi: Vec<&str> = rule_index
@@ -1129,6 +1159,8 @@ pub fn load_config(
         sched_scope: scope,
         sched_pkgs,
         sched,
+        screen_relax,
+        render_guard_observe,
         rt,
         topo: topo.clone(),
     })
@@ -1518,6 +1550,33 @@ mod tests {
         // 非法值回退 off，但不能牵连规则
         let bad = cfg_of("s_bad", "@sched=turbo\ncom.a=0-1\n");
         assert_eq!(bad.sched, SchedMode::Off);
+        assert_eq!(bad.rules.len(), 1);
+    }
+
+    #[test]
+    fn render_guard_directive_is_observe_only() {
+        let base = cfg_of("rg_off", "com.a=0-1\n");
+        assert!(!base.render_guard_observe, "不写 @render_guard 必须保持关");
+        let on = cfg_of("rg_obs", "@render_guard=observe\ncom.a=0-1\n");
+        assert!(on.render_guard_observe);
+        // 打开后规则本身不变，只是多了诊断
+        assert_eq!(on.rules.len(), 1);
+        assert_ne!(base.policy_sig, on.policy_sig, "开关变化要触发重扫");
+    }
+
+    #[test]
+    fn screen_directive_defaults_off_and_tracks_sig() {
+        let base = cfg_of("sc_off", "com.a=0-1\n");
+        assert!(!base.screen_relax, "不写 @screen 必须保持关");
+        let relax = cfg_of("sc_relax", "@screen=relax\ncom.a=0-1\n");
+        assert!(relax.screen_relax);
+        assert_eq!(relax.rules.len(), 1, "指令不能吞掉规则");
+        // 只改这一行也必须换指纹，否则主循环不会立即按新节奏排复查
+        assert_ne!(base.policy_sig, relax.policy_sig);
+
+        // 非法值不生效、不牵连规则
+        let bad = cfg_of("sc_bad", "@screen=dim\ncom.a=0-1\n");
+        assert!(!bad.screen_relax);
         assert_eq!(bad.rules.len(), 1);
     }
 

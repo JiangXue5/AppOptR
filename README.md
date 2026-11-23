@@ -18,6 +18,11 @@ http://appopt.suto.top
 | `rule_edit.rs` | 规则增删改与归一化 |
 | `apply_affinity.rs` | 亲和性应用（cpuset 目录就绪缓存 + 写 tasks + sched_setaffinity） |
 | `cache.rs` | 统一缓存 |
+| `roles.rs` | 线程名角色分类（渲染 / 延迟敏感 / 工作线程 / 后台前缀） |
+| `sched.rs` | S7 负载感知调度（`off` / `shadow` / `on` 三档，按 `/proc/stat` 判定迁移） |
+| `rt.rs` | RT 实时调度（`SCHED_RR` + `RESET_ON_FORK`，含时间片备份与恢复） |
+| `diag.rs` | 诊断采集与计数（分层标签、失败节流、周期摘要） |
+| `diag_fmt.rs` | 诊断文本排版（纯函数，便于单测） |
 | `ebpf_mode.rs` | eBPF 事件驱动 |
 | `proc_mode.rs` | Proc 轮询模式 |
 | `web.rs` | 轻量 HTTP 管理面板服务 |
@@ -46,6 +51,8 @@ http://appopt.suto.top
 |------|------|------|------|
 | `@unmatched` | `keep` / `all` | `keep` | 包内有线程规则但某线程未命中、且包无包级规则时的行为。`keep` 保持该线程原有亲和性；`all` 沿用 2.2.x 行为设为全部核心。 |
 | `@sched` | `off` / `shadow` / `on` | `off` | S7 负载感知：`shadow` 只判定不迁移，`on` 才真正改亲和性。 |
+| `@screen` | `off` / `relax` | `off` | 息屏时放松周期复核。`relax` 把已绑定线程的复查从每 3/5 个 interval 降到 60 秒，并暂停 S7 与卡顿采样；新线程的首次绑定不受影响。 |
+| `@render_guard` | `off` / `observe` | `off` | 渲染护栏（只观察）。`observe` 下，若 `RenderThread` 等关键线程的目标集合不含性能核、或只剩一个核，按包记一次数并提示一行，**不改变绑定**。 |
 | `@rt` | `off` / `global` / `per_app` | `off` | RT 调度范围。`global` 对全部受管应用生效，`per_app` 只对 `@rt.app` 里显式开启的包生效。 |
 | `@rt.max` | 1–8 | `2` | 每应用最多提升多少个线程。 |
 | `@rt.timeslice` | 1–100 | `3` | RR 时间片（毫秒），全局内核参数，仅在至少一个应用启用时写入。 |
@@ -77,7 +84,8 @@ com.example.game {
 模块已附带 `applist.asoulopt.conf`（AsoulOpt 内置 **333** 个游戏、29 组线程规则，
 共 926 条），**不自动启用**；需要时在设置页把「规则配置文件」指向它，或复制覆盖
 `applist.conf`。包名与规则从 AsoulOpt Kana 的二进制逐组还原，核对方法见迁移文档第九节。
-加载与决策细节见 [CHANGELOG.md](CHANGELOG.md)；负载感知调度仅完成设计，见
+加载与决策细节见 [CHANGELOG.md](CHANGELOG.md)；负载感知调度（S7）已实现三档
+`off` / `shadow` / `on`，设计与判定细节见
 [docs/S7_负载感知调度策略设计.md](docs/S7_负载感知调度策略设计.md)。
 
 
@@ -101,6 +109,7 @@ rm /data/adb/modules/AppOpt/keep_cores       # 关闭：下次启动按 core_ctl
 | `-c <file>` | 指定配置文件路径 | `./applist.conf` |
 | `-s <seconds>` | 检查间隔（秒，≥1） | `2` |
 | `-b <name>` | 指定 BASE_CPUSET 目录名（不可含 `/`） | `AppOpt` |
+| `-w` | 启动 Web 管理面板（仅监听 `127.0.0.1:8889`） | 关闭 |
 | `-v` | 显示版本信息 | — |
 | `-h` | 显示帮助 | — |
 
