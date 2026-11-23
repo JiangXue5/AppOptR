@@ -340,7 +340,13 @@ impl ProcCache {
     /// 只有 ESRCH 才算退出，设置失败（EPERM/EINVAL）的线程保留在缓存里等下一轮
     pub fn affinity_sync(&mut self, topo: &CpuTopology, respect: bool) -> Vec<i32> {
         let mut dead_tids: Vec<i32> = Vec::new();
-        let mut blocked_now = 0u64;
+        let mut blocked_now = 0usize;
+        // 本轮结束时的状态分布，摘要要直接回答「此刻绑上没有」。
+        // `ok` 是读回就一致、一次都没写的线程，`rebound` 是写过且内核接受的
+        let total = self.tasks.len();
+        let mut ok_now = 0usize;
+        let mut rebind_now = 0usize;
+        let mut fail_now = 0usize;
         let migrate = topo.cpuset_enabled && !crate::apply_affinity::cpuset_paused();
         // 已退出的线程不会再有事件，落点留在这里只会慢慢堆积。
         // 每轮按在线条目裁剪一次，成本是一次哈希遍历
@@ -397,6 +403,17 @@ impl ProcCache {
                 affinity_apply(*tid, &e.cpus, Some(&e.cpuset_dir), topo, reason, &e.comm);
             if wrote {
                 e.applied = true;
+                rebind_now += 1;
+            }
+            match outcome {
+                AffinityOutcome::Set => {
+                    if !wrote {
+                        ok_now += 1;
+                    }
+                }
+                AffinityOutcome::Failed => fail_now += 1,
+                // Gone 的线程本轮退出，不计入任何一档，总数里也已经被移除
+                AffinityOutcome::Gone => {}
             }
             // 线程已退出与设置失败要分开：前者清缓存，后者保留等下一轮
             if outcome == AffinityOutcome::Gone {
@@ -408,8 +425,9 @@ impl ProcCache {
             self.task_del(*tid);
         }
         if blocked_now > 0 {
-            crate::diag::note_sysgroup_batch(blocked_now);
+            crate::diag::note_sysgroup_batch(blocked_now as u64);
         }
+        crate::diag::note_sync_tally(total, ok_now, rebind_now, fail_now, blocked_now);
         dead_tids
     }
 }

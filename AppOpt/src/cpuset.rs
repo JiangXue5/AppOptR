@@ -205,6 +205,30 @@ pub fn effective_at(dir: &str) -> Option<String> {
     effective_by_walk("/dev/cpuset", &cgroup_rel(d)).filter(|s| !s.is_empty())
 }
 
+/// 组目录自己的 `cpus` 原文，不做父链求交。
+///
+/// 生效集合是「所有祖先的交集」，用它无法区分「这一层就没写进去」和
+/// 「祖先把它卡住了」。裁剪归因要把两个数都摆出来：用户看到
+/// 「组 cpus=4-5、effective=4-5」就知道是组本身只有 4-5，而不是核坏了
+pub fn group_cpus(dir: &str) -> Option<String> {
+    read_cpus_file(dir.trim_end_matches('/')).map(|(s, _)| s)
+}
+
+/// 线程所在组的现场：组自己的 cpus、生效集合，以及生效集合是否来自内核导出。
+///
+/// 裁剪归因不能只给结论，必须给可核对的数字。真机上出现过日志说
+/// 「差集来自组集合」，用户去翻组目录却发现 `cpus=0-7` 的情况——
+/// 那时结论是错的，真正原因是 CPU 在 online 里却不可调度
+pub fn group_evidence(path: &str) -> (Option<String>, Option<String>, bool) {
+    let p = path.trim();
+    if p.is_empty() || p == "-" {
+        return (None, None, false);
+    }
+    let dir = format!("/dev/cpuset{}", p.trim_end_matches('/'));
+    let exported = read_effective(&dir).is_some();
+    (group_cpus(&dir), effective_at(&dir), exported)
+}
+
 /// 当前在线的 CPU 集合（`/sys/devices/system/cpu/online`）。
 ///
 /// 真机上「规则写 4-6、回读 4-5」不能只归因于 cpuset：这批设备连

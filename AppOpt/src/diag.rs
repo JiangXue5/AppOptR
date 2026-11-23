@@ -163,6 +163,20 @@ struct Sink {
     /// 「规则只覆盖一个簇」这条说明已经给过：它是静态结论，
     /// 每 60 秒重复一遍只会把真正变化的行挤掉
     allow_hint_shown: bool,
+    /// 上一轮校验结束时各状态的线程数。用户最想知道的是「此刻绑上没有」，
+    /// 只报「本周期重绑 17 个」会让人以为一直没绑上
+    tally: Option<SyncTally>,
+}
+
+/// 一轮校验结束时的状态分布。`ok + rebound + failed + blocked` 加上本轮
+/// 退出的线程就是受管总数；四个数相加对不上总数，说明有线程在中途消失
+#[derive(Clone, Copy, Default)]
+struct SyncTally {
+    total: usize,
+    ok: usize,
+    rebound: usize,
+    failed: usize,
+    blocked: usize,
 }
 
 /// 一次「读回与期望不一致」的现场。期望/实际的组合能直接区分根因：
@@ -209,6 +223,7 @@ fn sink() -> std::sync::MutexGuard<'static, Option<Sink>> {
         // 首条漂移立即打印，不因初始化时刻被 30 秒节流挡住
         last_drift_log: now.checked_sub(DRIFT_LOG_GAP).unwrap_or(now),
         allow_hint_shown: false,
+        tally: None,
     });
     guard
 }
@@ -569,8 +584,11 @@ pub fn note_drift(tid: i32, comm: &str, expect: &CpuSet, actual: &CpuSet) {
     // effective_cpus 都没导出、父链交集又是全集，唯一能解释的实际是内核把
     // sched_setaffinity 的掩码与在线集合求交——不写清这一点，182 次裁剪
     // 会被读成「规则写错了核」
-    if kind == DriftKind::Clip && s.clip_why.insert(sample.expect.clone()) {
-        let line = clip_reason(&sample.expect, &sample.actual);
+    // 按「期望集合 + 所在组」去重：同一组同一目标只解释一次，
+    // 但线程换到另一个组后仍然要重新解释——结论依赖组，不能复用
+    let why_key = format!("{}@{}", sample.expect, sample.cpuset);
+    if kind == DriftKind::Clip && s.clip_why.insert(why_key) {
+        let line = clip_reason(&sample.expect, &sample.actual, &sample.cpuset);
         emit(&line);
         push_event(s, line);
     }
@@ -610,7 +628,19 @@ fn classify_clip(want: &CpuSet, online: &CpuSet) -> ClipWhy {
     let mut lost = *want;
     lost.and_not(online);
     if lost.count() > 0 {
-        ClipWhy::Offline(lost)
+        return ClipWhy::Offline(lost);
+    }
+    // 汇总位图和逐核 online 文件可能不同步：MTK/高通的 core_ctl 先改单核
+    // 再刷新汇总，反过来也有。只信汇总，就会在「实际 4-5」旁边写一句
+    // 「4-6 都在线」，两边自相矛盾，读的人只能去猜
+    let mut dead = CpuSet::new();
+    for cpu in 0..64 {
+        if want.is_set(cpu) && !crate::cpuset::cpu_is_online(cpu) {
+            dead.set(cpu);
+        }
+    }
+    if dead.count() > 0 {
+        ClipWhy::Offline(dead)
     } else {
         ClipWhy::GroupLimited
     }
@@ -620,7 +650,7 @@ fn classify_clip(want: &CpuSet, online: &CpuSet) -> ClipWhy {
 /// （这是真机上最常见的一类，且会自动恢复）；解释不了才指向组配置，
 /// 并给出可核对的落点。两种情况都必须在第一现场说清，否则读者只能
 /// 把裁剪当成规则写错了核
-fn clip_reason(expect: &str, actual: &str) -> String {
+fn clip_reason(expect: &str, actual: &str, group: &str) -> String {
     let want = crate::cpuset::parse_cpu_ranges(expect, None);
     let Some(online) = crate::cpuset::online_cpus() else {
         return format!(
@@ -650,11 +680,81 @@ fn clip_reason(expect: &str, actual: &str) -> String {
                 }
             )
         }
-        ClipWhy::GroupLimited => format!(
-            "裁剪原因: 期望 {} 实际 {}，但 {} 都在线；差集来自线程所在 cpuset 组的可用集合，\
-             对照该组目录下的 cpus 与 cpuset.effective_cpus（本机若无该文件，看父链 cpus 交集）可核对",
-            expect, actual, expect
-        ),
+        ClipWhy::GroupLimited => group_clip_reason(expect, actual, &want, group),
+    }
+}
+
+/// 核都「在线」却写不进去时，两种可能必须分开说：
+/// 组本身就不含这几个核（改规则或让接管搬组），还是组含这几个核但内核
+/// 当下不接受（收核/热插拔/隔离，等下一轮）。
+///
+/// 曾经的版本一律判成前者，于是真机上打出「差集来自组集合」，用户对着
+/// `cpus=0-7` 的组目录反复核对，什么也查不出来——结论本身是错的
+fn group_clip_reason(expect: &str, actual: &str, want: &CpuSet, group: &str) -> String {
+    let (gcpus, geff, exported) = crate::cpuset::group_evidence(group);
+    let gpath = if group.trim().is_empty() || group.trim() == "-" {
+        "未知组（/proc/<tid>/cpuset 读不到）".to_string()
+    } else {
+        group.trim().to_string()
+    };
+    let eff_note = match (&geff, exported) {
+        (Some(v), true) => format!("cpuset.effective_cpus={}", v),
+        (Some(v), false) => format!("effective={}（未导出，按父链交集推算）", v),
+        (None, _) => "effective 读不到".to_string(),
+    };
+    let cpus_note = gcpus
+        .as_deref()
+        .map(|v| format!("cpus={}", if v.is_empty() { "空" } else { v }))
+        .unwrap_or_else(|| "cpus 读不到".to_string());
+
+    // 差集里有哪些核其实不在组集合内
+    let mut gone = *want;
+    // 两个文件都读不到时不要下结论：这正是上一版「照着日志查不出问题」的根源
+    if gcpus.is_none() && geff.is_none() {
+        return format!(
+            "裁剪原因: 期望 {} 实际 {}，{}（{}，{}）读不到任何集合，无法判断是组限制还是核下电；\
+             内核会把写入的掩码与可用集合求交，下一轮会自动重试，届时若仍裁剪请对照组目录",
+            expect, actual, gpath, cpus_note, eff_note
+        );
+    }
+    if let Some(g) = gcpus.as_deref() {
+        let gset = crate::cpuset::parse_cpu_ranges(g, None);
+        gone.and_not(&gset);
+    } else {
+        // 组 cpus 读不到就按生效集合算，至少不会把「组确实没有」说反
+        if let Some(e) = geff.as_deref() {
+            let eset = crate::cpuset::parse_cpu_ranges(e, None);
+            gone.and_not(&eset);
+        }
+    }
+    if gone.count() > 0 {
+        format!(
+            "裁剪原因: 期望 {} 实际 {}，{}({})，该组不含 CPU {}，取交只能是 {}；\
+             要拿到完整集合需把线程迁进 AppOpt 组（切「强制绑核」或写 @sysgroup=takeover），\
+             否则把规则改成组内集合",
+            expect,
+            actual,
+            gpath,
+            cpus_note,
+            gone.to_range_string(),
+            actual
+        )
+    } else if geff
+        .as_deref()
+        .is_some_and(|e| crate::cpuset::parse_cpu_ranges(e, None).count() == 0)
+    {
+        format!(
+            "裁剪原因: 期望 {} 实际 {}，{}({}) 的生效集合为空，该组当前不接受任何任务；\
+             内核会把写入全部丢弃，等组配置恢复后下一轮自动重试",
+            expect, actual, gpath, cpus_note
+        )
+    } else {
+        format!(
+            "裁剪原因: 期望 {} 实际 {}，{} 里的核都在线，{}({}，{}) 本应容纳目标却写不进去——\
+             说明被扣掉的核此刻不可调度（core_ctl 收核、热插拔进行中或 sched 隔离），\
+             不是规则写错，下一轮会自动重试",
+            expect, actual, expect, gpath, cpus_note, eff_note
+        )
     }
 }
 
@@ -711,8 +811,9 @@ pub fn note_sysgroup_skip(tid: i32, comm: &str, group: SysGroup, want: &CpuSet, 
         format!("{}({})", comm, tid)
     };
     let eff = eff.filter(|s| !s.is_empty()).unwrap_or("未知");
+    // label 自带「组」字（后台组 / 其他组），模板里不能再补一个
     let line = format!(
-        "系统分组: {} 在 {} 组（生效集合 {}），规则要求 {} 不在该组内，内核会拒绝绑定；已跳过（不计失败）。要强制接管写 @sysgroup=takeover",
+        "系统分组: {} 在 {}（生效集合 {}），规则要求 {} 不在该组内，内核会拒绝绑定；已跳过（不计失败）。要强制接管写 @sysgroup=takeover",
         name,
         group.label(),
         eff,
@@ -733,11 +834,29 @@ pub fn note_sysgroup_batch(n: u64) {
         return;
     }
     let line = format!(
-        "系统分组: {} 个线程被系统限定在后台组，规则要求的大核不在该组生效集合内，内核会拒绝绑定；已跳过（不计失败）。切回前台会自动恢复，要强制接管写 @sysgroup=takeover",
+        "系统分组: 本轮 {} 个线程被系统放在后台组，规则要求的核不在该组生效集合内，内核会拒绝绑定；\
+         已跳过（不计失败）。切回前台会自动恢复，要强制接管写 @sysgroup=takeover",
         n
     );
     emit(&line);
     push_event(s, line);
+}
+
+/// 校验轮结束时登记全局状态：受管多少、此刻符合多少、多少被系统组挡住。
+///
+/// 「近 60 秒重绑 17 个」不能回答「现在绑上没有」——重绑成功、失败、被组
+/// 限制的线程混在一起，只能靠读的人自己去减。这一行把它摊开，
+/// 用户在 Scene 里看到的和日志给出的必须是同一件事
+pub fn note_sync_tally(total: usize, ok: usize, rebound: usize, failed: usize, blocked: usize) {
+    let mut guard = sink();
+    let Some(s) = guard.as_mut() else { return };
+    s.tally = Some(SyncTally {
+        total,
+        ok,
+        rebound,
+        failed,
+        blocked,
+    });
 }
 
 /// 目标集合被所在组的生效集合裁小。写全集时内核会求交，返回成功但回读永远是
@@ -846,6 +965,7 @@ pub fn periodic_summary(current: &SchedSnapshot) {
     let ineff_n = std::mem::take(&mut s.ineffective_n);
     let ineff = std::mem::take(&mut s.ineffective);
     let stuck = std::mem::take(&mut s.stuck_skip);
+    let tally = s.tally.take();
     let prev = s.last_snap.replace(current.clone());
     let st = &s.stats;
 
@@ -879,6 +999,21 @@ pub fn periodic_summary(current: &SchedSnapshot) {
                 ));
             }
         }
+    }
+    // 「本周期重绑了多少」与「此刻绑上没有」是两件事。用户拿日志对照
+    // Scene 时对不上账，缺的就是这一行
+    if let Some(t) = tally
+        && t.total > 0
+    {
+        let tail = if t.blocked > 0 {
+            format!("、被系统组限制 {}（这些此刻绑不了）", t.blocked)
+        } else {
+            String::new()
+        };
+        emit(&format!(
+            "校验: 受管 {} 个线程，当前符合 {}、本轮重绑 {}、写失败 {}{}",
+            t.total, t.ok, t.rebound, t.failed, tail
+        ));
     }
     if ineff_n > 0 {
         emit(&format!(
@@ -919,7 +1054,8 @@ pub fn periodic_summary(current: &SchedSnapshot) {
         // 两个数字必须同源：曾经用「最近一批的线程数」配「本周期跳过次数」，
         // 会打出「当前 0 个线程被限定在小核（近 60 秒跳过 2 次）」
         emit(&format!(
-            "系统分组: 近 {} 秒 {} 次因所在组不含目标集合被跳过（累计 {}）；不改规则就绑不上，切回前台会自动恢复",
+            "系统分组: 近 {} 秒 {} 个线程因所在组不含目标集合被跳过（累计 {} 次判定）；\
+             这些线程此刻在小核上，切回前台会自动恢复，要强制绑写 @sysgroup=takeover",
             SUMMARY_GAP.as_secs(),
             sysgroup,
             st.sysgroup_skip
@@ -1466,6 +1602,62 @@ mod tests {
             .expect("应有系统分组播报");
         assert!(line.contains("0-3"), "{}", line);
         assert!(line.contains("4-6"), "{}", line);
+        assert!(
+            !line.contains("组 组"),
+            "标签自带「组」字，不能再补一个：{}",
+            line
+        );
+    }
+
+    /// 裁剪归因必须给出可核对的值，不能只说「来自组集合」。
+    /// 组路径读不到时也要明确说读不到，而不是编一个组名
+    #[test]
+    fn clip_reason_states_group_values_or_says_unknown() {
+        let line = clip_reason("4-6", "4-5", "-");
+        assert!(line.contains("裁剪原因"), "{}", line);
+        assert!(line.contains("4-5"), "{}", line);
+        assert!(
+            line.contains("未知组"),
+            "读不到 cpuset 时必须直说，不能指向不存在的组：{}",
+            line
+        );
+    }
+
+    /// 组目录存在但判成「组不含目标」还是「核不可调度」，两句话指向的处理
+    /// 方式完全不同：前者要改规则，后者只需等。这里用真实目录验证分支
+    /// 不 panic 且必定给出下一步，避免真机上再出现「照着日志查不出问题」
+    #[test]
+    fn clip_reason_always_names_a_next_step() {
+        for path in [
+            "/top-app",
+            "/foreground",
+            "/background",
+            "/nonexistent-group",
+        ] {
+            let line = clip_reason("4-6", "4-5", path);
+            assert!(
+                line.contains("规则") || line.contains("自动"),
+                "{} 的解释没有给出处理方式：{}",
+                path,
+                line
+            );
+        }
+    }
+
+    /// 「受管 N 个 / 当前符合 X」必须能回答 Scene 里看到的到底是什么状态
+    #[test]
+    fn sync_tally_is_kept_for_summary() {
+        note_sync_tally(200, 12, 3, 1, 184);
+        let t = sink()
+            .as_ref()
+            .and_then(|s| s.tally)
+            .expect("摘要要取到 tally");
+        assert_eq!(
+            (t.total, t.ok, t.rebound, t.failed, t.blocked),
+            (200, 12, 3, 1, 184)
+        );
+        // 四个分档加本轮退出的线程应能对上总数
+        assert!(t.ok + t.rebound + t.failed + t.blocked <= t.total);
     }
 
     /// 状态没变时不重复刷同一行（实测 5 分钟刷了 5 遍「规则无跨簇」），

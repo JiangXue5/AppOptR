@@ -655,6 +655,29 @@ fn parse_rt_app(arg: &str, default_max: u8) -> Option<(String, AppRt)> {
 /// 真机上「规则写 4-6、日志一直记裁剪 4-5」最常见的成因是中核簇被 core_ctl
 /// 或 hotplug 下电：`sched_setaffinity` 的掩码会与在线集合求交，写进去的 bit
 /// 静默消失，随后被校验判成「被裁剪」。启动行先说清楚，省得用户以为规则错了
+/// 启动时把规则原文逐条摊开。
+///
+/// 日志后面每一句「期望 4-6」都是从这张表推出来的。不打印它，用户拿着
+/// 自己写的配置去核对时只能靠记忆——真机上出现过「我写的是 4-7」与
+/// 「日志说期望 4-6」对不上的争执，实际是规则里另有更窄的一条线程规则
+fn report_rule_list(rules: &[AffinityRule]) {
+    const CAP: usize = 12;
+    for r in rules.iter().take(CAP) {
+        let mut line = format!("规则: {}", r.pkg);
+        if !r.thread.is_empty() {
+            line.push_str(&format!(" 线程 {}", r.thread));
+        }
+        line.push_str(&format!(" → {}", r.cpus.to_range_string()));
+        if !r.cpuset_dir.is_empty() {
+            line.push_str(&format!("（组 {}）", r.cpuset_dir));
+        }
+        crate::diag::emit(&line);
+    }
+    if rules.len() > CAP {
+        crate::diag::emit(&format!("规则: 另有 {} 条未列出", rules.len() - CAP));
+    }
+}
+
 fn report_offline_rules(rules: &[AffinityRule], topo: &CpuTopology) {
     // 优先现读：热重载时 topo 是启动快照，中间可能发生过热插拔
     let online = crate::cpuset::online_cpus().unwrap_or(topo.present_cpus);
@@ -908,6 +931,7 @@ pub fn load_config(
     }
 
     crate::diag::emit(&format!("配置文件解析完成，共加载 {} 条规则", num_rules));
+    report_rule_list(&rules);
     report_offline_rules(&rules, topo);
     if fail_cnt > 0 {
         eprintln!("警告: {} 条规则因格式无效被跳过", fail_cnt);
