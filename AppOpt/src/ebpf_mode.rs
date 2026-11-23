@@ -189,7 +189,7 @@ pub fn comm_map_init(bpf: &mut Ebpf, pkgs: &HashSet<String>, comm_capacity: u32)
     }
 
     crate::diag_say!(
-        "eBPF 白名单已配置，{} 个包名，对应 {} 条匹配规则",
+        "eBPF 白名单已配置，{} 个包名 → {} 个 comm 键（各取包名前 15/末 15 字节，重复的合并）",
         pkgs.len(),
         count
     );

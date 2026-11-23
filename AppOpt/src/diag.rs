@@ -37,8 +37,8 @@ const JANK_WARN_MS: f64 = 4.0;
 const JANK_LOG_GAP: Duration = Duration::from_secs(30);
 /// 线程表最多保留的条目，避免 Web 一次拉太多
 const THREAD_CAP: usize = 160;
-/// 每个摘要周期最多保留的漂移样例，够看清模式即可
-const DRIFT_CAP: usize = 4;
+/// 改写明细里每种「期望→实际」最多列几行，其余合并成「另 N 种」
+const COMBO_SHOW: usize = 3;
 /// cpuset 失败后打印完整上下文的间隔
 const CPUSET_DETAIL_GAP: Duration = Duration::from_secs(300);
 
@@ -147,14 +147,16 @@ struct Sink {
     last_fail_log: Option<(i32, Instant)>,
     /// 每条线程各自的最近一次失败播报，避免持续失败刷屏
     fail_tid: HashMap<(i32, i32), Instant>,
-    last_summary: Instant,
     last_jank_log: Instant,
     /// 本轮摘要周期内新增的失败数，用于决定要不要打摘要
     fail_since_summary: u64,
     rewrite_since_summary: u64,
     cpuset_since_summary: u64,
-    /// 本周期内的漂移样例（期望、实际、线程所在 cpuset）
-    drift: Vec<Drift>,
+    /// 本周期「期望→实际」组合的精确计数：(是否超集, "a→b") → 次数
+    ///
+    /// 不能用样例去凑：真机上 7 次改写只留了 4 条样例，明细写成
+    /// 「多核写入 7（4-6→4-7 ×4）」，另外 3 次凭空消失，读者只能怀疑统计错了
+    drift_combo: HashMap<(bool, String), u32>,
     /// 本周期漂移的分类计数：裁剪 / 重置 / 挪簇
     drift_kind: [u64; 3],
     /// 本周期「读回恰好等于线程所在组的生效集合」的次数。
@@ -199,6 +201,12 @@ struct Sink {
     /// 上一轮校验结束时各状态的线程数。用户最想知道的是「此刻绑上没有」，
     /// 只报「本周期重绑 17 个」会让人以为一直没绑上
     tally: Option<SyncTally>,
+    /// 最近一轮被组限制的线程集中在哪个组、该组可用哪几个核。
+    ///
+    /// 「被组限制 180（确实没绑）」只说了结果，没说为什么。180 个线程全部
+    /// 落在后台组（可用 0-3）和散落在多个组，是两种完全不同的处境：
+    /// 前者是游戏切后台、respect 下不动它，后者才是配置需要调
+    blocked_note: Option<(SysGroup, String)>,
     /// tid → (所属包, 是否进程主线程)。线程名常常和包名毫无关系
     /// （`HWC release`、`dns-work-0`），只印线程名时用户无法判断模块有没有
     /// 管到规则外的进程；主线程的 comm 会被内核截到 15 字节，日志里
@@ -245,12 +253,11 @@ fn sink() -> std::sync::MutexGuard<'static, Option<Sink>> {
         events: VecDeque::new(),
         last_fail_log: None,
         fail_tid: HashMap::new(),
-        last_summary: now,
         last_jank_log: now,
         fail_since_summary: 0,
         rewrite_since_summary: 0,
         cpuset_since_summary: 0,
-        drift: Vec::new(),
+        drift_combo: HashMap::new(),
         drift_kind: [0; 3],
         cap_since_summary: 0,
         cap_top: HashMap::new(),
@@ -270,6 +277,7 @@ fn sink() -> std::sync::MutexGuard<'static, Option<Sink>> {
         last_snap: None,
         allow_hint_shown: false,
         tally: None,
+        blocked_note: None,
         thread_pkg: HashMap::new(),
     });
     guard
@@ -695,9 +703,10 @@ pub fn note_drift(tid: i32, comm: &str, expect: &CpuSet, actual: &CpuSet) {
         actual: actual.to_range_string(),
         cpuset: read_thread_cpuset(tid),
     };
-    if s.drift.len() < DRIFT_CAP {
-        s.drift.push(sample.clone());
-    }
+    let key = format!("{}→{}", sample.expect, sample.actual);
+    *s.drift_combo
+        .entry((kind == DriftKind::Reset, key))
+        .or_insert(0) += 1;
     // 裁剪的第一条现场必须回答「少的那几个核去哪了」。这台设备的 cpuset 连
     // effective_cpus 都没导出、父链交集又是全集，唯一能解释的实际是内核把
     // sched_setaffinity 的掩码与在线集合求交——不写清这一点，182 次裁剪
@@ -774,7 +783,12 @@ fn delta_desc(expect: &str, actual: &str) -> String {
 fn sample_tag(d: &Drift) -> String {
     // 主线程的 comm 是被内核截过的包名残段（`cent.tmgp.sgame`），
     // 不标注会被误读成「还有一个叫这个名字的进程」
-    let name = if d.is_main {
+    // 主线程的 comm 只是包名残段，后面已经跟着完整包名，再念一遍是噪音：
+    // `主线程 ent.tmgp.osgame(13732)[com.tencent.tmgp.osgame]` 里那个残段
+    // 只会让人去找「谁叫 ent.tmgp.osgame」。没有包名时才退回 comm
+    let name = if d.is_main && !d.pkg.is_empty() {
+        "主线程".to_string()
+    } else if d.is_main {
         format!("主线程 {}", d.comm)
     } else {
         d.comm.clone()
@@ -1022,18 +1036,25 @@ pub fn note_sysgroup_skip(tid: i32, comm: &str, group: SysGroup, want: &CpuSet, 
 
 /// 校验轮里整批因系统分组被跳过。逐线程播报会把日志刷满，
 /// 这里只累加计数，并在首次给出一次结论
-pub fn note_sysgroup_batch(n: u64) {
+pub fn note_sysgroup_batch(n: u64, hint: Option<(SysGroup, String)>) {
     let mut guard = sink();
     let Some(s) = guard.as_mut() else { return };
     s.stats.sysgroup_skip += n;
     s.sysgroup_since_summary += n;
-    if !s.sysgroup_announced.insert(SysGroup::Background) {
+    // 归因留给总账：这一批线程在哪个组、该组可用哪几个核，
+    // 是「游戏切后台」与「规则写错核」的唯一分界
+    let (group, eff) = hint.unwrap_or((SysGroup::Unknown, "未知".to_string()));
+    let eff = eff.as_str();
+    s.blocked_note = Some((group, eff.to_string()));
+    if !s.sysgroup_announced.insert(group) {
         return;
     }
     let line = format!(
-        "本轮 {} 个线程被系统放在后台组，规则要求的核不在该组可用集合内，内核必然拒绝绑定 \
+        "本轮 {} 个线程在 {}（可用 {}），规则要求的核不在该组可用集合内，内核必然拒绝绑定 \
          ｜ 来源：周期校验 ｜ 切前台自动恢复；要强制接管写 @sysgroup=takeover",
-        n
+        n,
+        group.label(),
+        eff
     );
     tag("跳过", &line);
     push_event(s, line);
@@ -1143,7 +1164,7 @@ fn errno_hint(errno: i32) -> String {
 
 /// 「此刻」与「近 60 秒」必须在一行里说清：只报后者，读者会把它当成当前状态。
 /// 这条被误读过两次（「日志说没绑上，Scene 里却是对的」），所以抽成纯函数可回归
-fn tally_line(t: SyncTally, rewrites: u64) -> String {
+fn tally_line(t: SyncTally, rewrites: u64, blocked_note: Option<&(SysGroup, String)>) -> String {
     // 主数字必须是「一致」，不能只给「符合」。真机上出现过
     // `受管 1 个线程 —— 符合 0、本轮重绑 1`，用户盯着那个 0 问「是不是没绑上」，
     // 而实际状态是重绑后已经一致。ok 与 rebound 只是「这次有没有动手」的区别
@@ -1160,7 +1181,13 @@ fn tally_line(t: SyncTally, rewrites: u64) -> String {
     if t.blocked > 0 {
         // 这一档是真的没绑，不能和「一致」混在一行里说得含糊。
         // 用户拿 Scene 对照时，缺的正是「哪些确实没绑」这句话
-        parts.push(format!("被组限制 {}（确实没绑）", t.blocked));
+        // 再补一句它们在哪个组：180 个全在后台组是「切后台了」，
+        // 散在多个组才是「规则要的核拼不出来」，两者处理方式相反
+        let where_ = match blocked_note {
+            Some((g, eff)) => format!("，{}可用 {}", g.label(), eff),
+            None => String::new(),
+        };
+        parts.push(format!("被组限制 {}（确实没绑{}）", t.blocked, where_));
     }
     if rewrites > 0 {
         parts.push(format!("本周期改写 {}", rewrites));
@@ -1195,10 +1222,6 @@ fn empty_state_hint(tally: Option<SyncTally>) -> &'static str {
 pub fn periodic_summary(current: &SchedSnapshot) {
     let mut guard = sink();
     let Some(s) = guard.as_mut() else { return };
-    if s.last_summary.elapsed() < SUMMARY_GAP {
-        return;
-    }
-    s.last_summary = Instant::now();
     let fails = std::mem::take(&mut s.fail_since_summary);
     let rewrites = std::mem::take(&mut s.rewrite_since_summary);
     let cpuset = std::mem::take(&mut s.cpuset_since_summary);
@@ -1206,7 +1229,7 @@ pub fn periodic_summary(current: &SchedSnapshot) {
     let unreach = std::mem::take(&mut s.unreachable_since_summary);
     let unreach_sample = s.unreachable_sample.take();
     let kinds = std::mem::take(&mut s.drift_kind);
-    let drift = std::mem::take(&mut s.drift);
+    let combo = std::mem::take(&mut s.drift_combo);
     let caps = std::mem::take(&mut s.cap_since_summary);
     let cap_top = std::mem::take(&mut s.cap_top);
     let mut cap_groups: Vec<(String, u32)> =
@@ -1267,7 +1290,7 @@ pub fn periodic_summary(current: &SchedSnapshot) {
 
     // ── 总账 ──────────────────────────────────────────────────
     match tally.filter(|t| t.total > 0) {
-        Some(t) => tag("周期", &tally_line(t, rewrites)),
+        Some(t) => tag("周期", &tally_line(t, rewrites, s.blocked_note.as_ref())),
         None => tag("周期", empty_state_hint(tally)),
     }
 
@@ -1278,20 +1301,20 @@ pub fn periodic_summary(current: &SchedSnapshot) {
             segs.push(format!(
                 "多核写入 {}（{}）",
                 kinds[1],
-                combo_list(&drift, true)
+                combo_list(&combo, true)
             ));
         }
         if kinds[0] > 0 {
             segs.push(format!(
                 "被裁小 {}（{}）",
                 kinds[0],
-                combo_list(&drift, false)
+                combo_list(&combo, false)
             ));
         }
         if kinds[2] > 0 {
             segs.push(format!("挪折 {}", kinds[2]));
         }
-        tag("周期", &format!("改写明细  {}", segs.join(" ｜ ")));
+        tag("周期", &format!("改写明细 {}", segs.join(" ｜ ")));
     }
     if caps > 0 {
         // 组上限是系统组的稳态，不是失败：给组名、次数、天花板，一句结论
@@ -1372,31 +1395,39 @@ pub fn periodic_summary(current: &SchedSnapshot) {
     }
 }
 
-/// 本周期样例里的「期望→实际」组合，去重后按出现次数给前三条。
-/// `resets` 为真取超集（被外部改大），否则取子集（被裁小）
-fn combo_list(drift: &[Drift], resets: bool) -> String {
-    let mut m: Vec<(String, u32)> = Vec::new();
-    for d in drift {
-        let want = crate::cpuset::parse_cpu_ranges(&d.expect, None);
-        let got = crate::cpuset::parse_cpu_ranges(&d.actual, None);
-        let is_reset = want.subset_of(&got) && want != got;
-        if is_reset != resets {
-            continue;
-        }
-        let key = format!("{}→{}", d.expect, d.actual);
-        match m.iter_mut().find(|(k, _)| *k == key) {
-            Some(e) => e.1 += 1,
-            None => m.push((key, 1)),
-        }
-    }
-    if m.is_empty() {
+/// 本周期「期望→实际」组合，按次数排序后给前三种。
+/// `resets` 为真取超集（被外部改大），否则取子集（被裁小）。
+///
+/// 计数在 `note_drift` 里逐次累加，不依赖样例数组：真机上 7 次改写
+/// 只留了 4 条样例，明细写成「7（4-6→4-7 ×4）」，另外 3 次凭空消失，
+/// 读者最先怀疑的就是统计本身。种类多于三种时把剩下的合并成「另 N 种 ×M」，
+/// 保证「列出来的次数之和 = 总数」
+fn combo_list(combo: &HashMap<(bool, String), u32>, resets: bool) -> String {
+    let mut v: Vec<(&String, u32)> = combo
+        .iter()
+        .filter(|((is_reset, _), _)| *is_reset == resets)
+        .map(|((_, k), n)| (k, *n))
+        .collect();
+    if v.is_empty() {
         return "样例已略".to_string();
     }
-    m.truncate(3);
-    m.iter()
+    // 次数多的在前；同次数按组合字典序，输出稳定，便于逐次对比日志
+    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    let head: Vec<String> = v
+        .iter()
+        .take(COMBO_SHOW)
         .map(|(k, n)| format!("{} ×{}", k, n))
-        .collect::<Vec<_>>()
-        .join("、")
+        .collect();
+    if v.len() <= COMBO_SHOW {
+        return head.join("、");
+    }
+    let rest: u32 = v.iter().skip(COMBO_SHOW).map(|(_, n)| *n).sum();
+    format!(
+        "{}，另 {} 种 ×{}",
+        head.join("、"),
+        v.len() - COMBO_SHOW,
+        rest
+    )
 }
 
 /// S7 周期说明。开着的策略必须能自证「在看、在判、为什么不动」，
@@ -1825,7 +1856,7 @@ mod tests {
             failed: 0,
             blocked: 0,
         };
-        let line = tally_line(t, 171);
+        let line = tally_line(t, 171, None);
         assert!(line.contains("受管 173"), "{}", line);
         assert!(line.contains("一致 173"), "{}", line);
         let state = line.find("一致 173").unwrap();
@@ -1834,7 +1865,7 @@ mod tests {
         assert!(!line.contains("组上限"), "明细不该挤进总账：{}", line);
 
         // 一次都没被改过时不要提「本周期改写 0」
-        let quiet = tally_line(t, 0);
+        let quiet = tally_line(t, 0, None);
         assert!(!quiet.contains("改写"), "{}", quiet);
 
         // 全部线程都是本轮重绑的：主数字仍必须是「一致 1」。
@@ -1848,6 +1879,7 @@ mod tests {
                 blocked: 0,
             },
             1,
+            None,
         );
         assert!(rebound.contains("一致 1"), "{}", rebound);
         assert!(rebound.contains("重绑 1"), "{}", rebound);
@@ -1863,8 +1895,75 @@ mod tests {
                 blocked: 170,
             },
             0,
+            None,
         );
         assert!(blocked.contains("被组限制 170（确实没绑）"), "{}", blocked);
+
+        // 被挡的线程集中在后台组：总账要把「在哪个组、可用哪几个核」带上，
+        // 否则「一致 0」只能靠翻下一行才知道是切了后台
+        let hint = (SysGroup::Background, "0-3".to_string());
+        let blocked = tally_line(
+            SyncTally {
+                total: 170,
+                ok: 0,
+                rebound: 0,
+                failed: 0,
+                blocked: 170,
+            },
+            0,
+            Some(&hint),
+        );
+        assert!(blocked.contains("后台组可用 0-3"), "{}", blocked);
+    }
+
+    /// 明细必须与总数对得上。真机 7 次改写只列了「4-6→4-7 ×4」，
+    /// 另 3 次凭空消失——那 3 次是 4-6→0-7 ×2 与 7→4-7 ×1，样例数组放不下
+    #[test]
+    fn combo_totals_add_up_to_the_kind_count() {
+        let mut m: HashMap<(bool, String), u32> = HashMap::new();
+        for (k, n) in [("4-6→4-7", 4), ("4-6→0-7", 2), ("7→4-7", 1)] {
+            *m.entry((true, k.to_string())).or_insert(0) += n;
+        }
+        let line = combo_list(&m, true);
+        assert!(line.contains("4-6→4-7 ×4"), "{}", line);
+        assert!(line.contains("4-6→0-7 ×2"), "{}", line);
+        assert!(line.contains("7→4-7 ×1"), "{}", line);
+
+        // 种类超过上限时合并成「另 N 种 ×M」，不能丢
+        for i in 0..4 {
+            *m.entry((true, format!("1-{}→0-7", i))).or_insert(0) += 1;
+        }
+        let line = combo_list(&m, true);
+        assert!(line.contains("另 4 种 ×4"), "{}", line);
+
+        // 子集（被裁小）不能混进超集（被改大）的明细
+        *m.entry((false, "1-7→0-3".to_string())).or_insert(0) += 5;
+        assert!(combo_list(&m, true).contains("4-6→4-7 ×4"));
+        let clip = combo_list(&m, false);
+        assert!(clip.contains("1-7→0-3 ×5"), "{}", clip);
+        assert!(!clip.contains("4-6→4-7"), "{}", clip);
+    }
+
+    /// 主线程的 comm 是包名残段，后面已有完整包名时不该再念一遍
+    #[test]
+    fn main_thread_sample_does_not_repeat_the_truncated_comm() {
+        let d = Drift {
+            tid: 13732,
+            comm: "ent.tmgp.osgame".to_string(),
+            pkg: "com.tencent.tmgp.osgame".to_string(),
+            expect: "4-6".to_string(),
+            actual: "4-7".to_string(),
+            cpuset: "/top-app".to_string(),
+            is_main: true,
+        };
+        let s = sample_tag(&d);
+        assert_eq!(s, "主线程(13732)[com.tencent.tmgp.osgame]");
+        // 没登记到包名时仍要留 comm，否则只剩一个 tid 无从核对
+        let orphan = Drift {
+            pkg: String::new(),
+            ..d
+        };
+        assert!(sample_tag(&orphan).contains("ent.tmgp.osgame"));
     }
 
     /// S7 开着却不动时，摘要必须说清「跑了几轮、为什么跳过」

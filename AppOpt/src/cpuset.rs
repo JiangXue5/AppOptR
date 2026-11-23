@@ -920,7 +920,7 @@ pub fn init_cpu_topo() -> CpuTopology {
             crate::diag::tag(
                 "环境",
                 &format!(
-                    "cpuset 就绪 {}（受管线程可迁入，规则集合不再被系统组裁剪）",
+                    "cpuset 可用 {} ｜ 自检通过（tasks 可写）｜ respect 下只迁「组内能凑出规则核」的线程，后台组不硬抢",
                     base_cpuset()
                 ),
             );

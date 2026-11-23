@@ -346,6 +346,8 @@ impl ProcCache {
     pub fn affinity_sync(&mut self, topo: &CpuTopology, respect: bool) -> Vec<i32> {
         let mut dead_tids: Vec<i32> = Vec::new();
         let mut blocked_now = 0usize;
+        // 被挡线程集中在哪个组、该组可用哪几个核：交给总账解释「为什么一致 0」
+        let mut blocked_hint: Option<(SysGroup, String)> = None;
         // 本轮结束时的状态分布，摘要要直接回答「此刻绑上没有」。
         // `ok` 是读回就一致、一次都没写的线程，`rebound` 是写过且内核接受的
         let total = self.tasks.len();
@@ -395,6 +397,9 @@ impl ProcCache {
             e.blocked = target.blocked;
             if e.blocked {
                 blocked_now += 1;
+                if blocked_hint.is_none() {
+                    blocked_hint = Some((group, eff.clone().unwrap_or_default()));
+                }
                 continue;
             }
             // 还没绑上过的线程走首次绑定语义，只有绑定过的才做「被改写」判定
@@ -430,7 +435,7 @@ impl ProcCache {
             self.task_del(*tid);
         }
         if blocked_now > 0 {
-            crate::diag::note_sysgroup_batch(blocked_now as u64);
+            crate::diag::note_sysgroup_batch(blocked_now as u64, blocked_hint);
         }
         crate::diag::note_sync_tally(total, ok_now, rebind_now, fail_now, blocked_now);
         dead_tids
