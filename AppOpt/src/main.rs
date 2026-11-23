@@ -336,7 +336,14 @@ fn main() {
     let mut diag_deadline = Instant::now();
     let mut summary_deadline = Instant::now();
 
-    diag::emit(&format!("启动AppOpt服务 v{}", env!("CARGO_PKG_VERSION")));
+    // 日志是追加写的，模块升级/重启会在同一个文件里留下多段 `[+0.0s]`。
+    // 只印版本号时两段无法区分，用户会把上一次启动的行当成本次的现场
+    diag::emit(&format!(
+        "启动AppOpt服务 v{}（pid {}，{}）",
+        env!("CARGO_PKG_VERSION"),
+        std::process::id(),
+        wall_clock()
+    ));
     diag::announce();
 
     // 恢复的强制 proc 模式无需 eBPF 初始化
@@ -644,5 +651,31 @@ fn apply_move_proc(ps: &mut ProcScanState, cfg: &AppConfig, m: &sched::Move) -> 
             AffinityOutcome::Gone
         }
         AffinityOutcome::Failed => AffinityOutcome::Failed,
+    }
+}
+
+/// 墙钟时间，只用在启动行。日志按追加写，同一文件里会有多段 `[+0.0s]`，
+/// 没有一个绝对时间就无法判断哪一段是本次开机
+fn wall_clock() -> String {
+    // SAFETY: `time` 与 `localtime_r` 都只写调用方提供的结构体；
+    // 返回的空指针在下面判掉，不会解引用
+    unsafe {
+        let mut t: libc::time_t = 0;
+        if libc::time(&mut t) == -1 {
+            return "时间未知".to_string();
+        }
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&t, &mut tm).is_null() {
+            return "时间未知".to_string();
+        }
+        format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+            tm.tm_year + 1900,
+            tm.tm_mon + 1,
+            tm.tm_mday,
+            tm.tm_hour,
+            tm.tm_min,
+            tm.tm_sec
+        )
     }
 }

@@ -136,6 +136,17 @@ struct Sink {
     drift: Vec<Drift>,
     /// 本周期漂移的分类计数：裁剪 / 重置 / 挪簇
     drift_kind: [u64; 3],
+    /// 本周期「读回恰好等于线程所在组的生效集合」的次数。
+    ///
+    /// 这类不是异常：系统把线程放进 /foreground，该组 cpus 只到 0-5，
+    /// 规则要 4-6 就只能拿到 4-5。AppOpt 每轮都把它改回去，日志却把它
+    /// 算成「裁剪 167 次」，用户对着 Scene 的 4-6 怎么看都对不上
+    cap_since_summary: u64,
+    /// 被系统改动最多的线程名（本周期），只给前三个，不带 tid：
+    /// 用户要判断的是「是哪个组件在捣乱」，不是哪一号线程
+    cap_top: HashMap<String, u32>,
+    /// 组上限来自哪个组：path → 次数
+    cap_groups: HashMap<String, u32>,
     /// 本周期因系统后台组跳过的次数
     sysgroup_since_summary: u64,
     /// 本周期「目标与所在组无交集」的次数与首个样例
@@ -208,6 +219,9 @@ fn sink() -> std::sync::MutexGuard<'static, Option<Sink>> {
         cpuset_since_summary: 0,
         drift: Vec::new(),
         drift_kind: [0; 3],
+        cap_since_summary: 0,
+        cap_top: HashMap::new(),
+        cap_groups: HashMap::new(),
         sysgroup_since_summary: 0,
         unreachable_since_summary: 0,
         unreachable_sample: None,
@@ -528,6 +542,23 @@ fn unreachable_group(tid: i32, want: &CpuSet) -> bool {
     inter.count() == 0
 }
 
+/// 线程所在组的天花板恰好等于读回的集合时，返回该组路径。
+///
+/// 这不是「被裁」：系统把线程放进 /foreground，该组 `cpus` 只到 0-5，
+/// 规则要 4-6 就只能拿到 4-5。每组读一次 `cpuset.effective_cpus`（有缓存），
+/// 判定「这已经是该组能给的全部」，比反复播报「又被裁了」有用得多
+fn cap_group(tid: i32, actual: &CpuSet) -> Option<String> {
+    let path = crate::cpuset::thread_cgroup(tid)?;
+    let eff = crate::cpuset::group_effective_cached(&path)?;
+    is_group_cap(actual, &eff).then_some(path)
+}
+
+/// 纯判定：读回是不是正好等于所在组的天花板。抽出来能脱离 /dev/cpuset 单测
+fn is_group_cap(actual: &CpuSet, eff: &str) -> bool {
+    let eff_set = crate::cpuset::parse_cpu_ranges(eff, None);
+    eff_set.count() > 0 && eff_set == *actual
+}
+
 /// 校验时读回与期望不一致：记录分类与现场样本。
 /// 分类比数字有用——「实际是期望的子集」和「实际变回全核」是两种完全不同的故障
 pub fn note_drift(tid: i32, comm: &str, expect: &CpuSet, actual: &CpuSet) {
@@ -541,6 +572,13 @@ pub fn note_drift(tid: i32, comm: &str, expect: &CpuSet, actual: &CpuSet) {
     // 判定要读 /proc 与 cgroup，放在持锁之前。只有「互不包含」才可能
     // 是「目标与所在组无交集」，另外两类本身就在同一个组里，不可能不可达
     let unreachable = kind == DriftKind::Shifted && unreachable_group(tid, expect);
+    // 读回正好是所在组的天花板：这是系统组的稳态，不是这一轮的异常。
+    // 单独成一类，否则每分钟几百条「裁剪」会把真正被改写的线程埋掉
+    let capped = if kind == DriftKind::Clip {
+        cap_group(tid, actual)
+    } else {
+        None
+    };
     let mut guard = sink();
     let Some(s) = guard.as_mut() else { return };
     if unreachable {
@@ -554,6 +592,12 @@ pub fn note_drift(tid: i32, comm: &str, expect: &CpuSet, actual: &CpuSet) {
                 read_thread_cpuset(tid),
             ));
         }
+        return;
+    }
+    if let Some(path) = capped {
+        s.cap_since_summary += 1;
+        *s.cap_top.entry(comm.to_string()).or_insert(0) += 1;
+        *s.cap_groups.entry(path).or_insert(0) += 1;
         return;
     }
     match kind {
@@ -945,6 +989,34 @@ fn errno_hint(errno: i32) -> String {
     }
 }
 
+/// 「此刻」与「近 60 秒」必须在一行里说清：只报后者，读者会把它当成当前状态。
+/// 这条被误读过两次（「日志说没绑上，Scene 里却是对的」），所以抽成纯函数可回归
+fn tally_line(t: SyncTally, rewrites: u64, caps: u64, kinds: [u64; 3]) -> String {
+    let mut parts = vec![format!("符合 {}", t.ok)];
+    if t.rebound > 0 {
+        parts.push(format!("本轮重绑 {}", t.rebound));
+    }
+    if t.failed > 0 {
+        parts.push(format!("写失败 {}", t.failed));
+    }
+    if t.blocked > 0 {
+        parts.push(format!("被系统组限制 {}", t.blocked));
+    }
+    let mut line = format!("校验: 此刻受管 {} 个线程 —— {}", t.total, parts.join("、"));
+    if rewrites > 0 {
+        line.push_str(&format!(
+            "；近 {} 秒被系统改了 {} 次（组上限 {}、裁剪 {}、重置 {}、挪簇 {}），每次都已改回",
+            SUMMARY_GAP.as_secs(),
+            rewrites,
+            caps,
+            kinds[0],
+            kinds[1],
+            kinds[2]
+        ));
+    }
+    line
+}
+
 /// 主循环低频调用：只在有事发生时打行摘要，无事保持安静。
 /// `current` 是 S7 的最新快照，用来回答「开关开着，为什么一个线程都没动」
 pub fn periodic_summary(current: &SchedSnapshot) {
@@ -962,6 +1034,9 @@ pub fn periodic_summary(current: &SchedSnapshot) {
     let unreach_sample = s.unreachable_sample.take();
     let kinds = std::mem::take(&mut s.drift_kind);
     let drift = std::mem::take(&mut s.drift);
+    let caps = std::mem::take(&mut s.cap_since_summary);
+    let cap_top = std::mem::take(&mut s.cap_top);
+    let cap_groups = std::mem::take(&mut s.cap_groups);
     let ineff_n = std::mem::take(&mut s.ineffective_n);
     let ineff = std::mem::take(&mut s.ineffective);
     let stuck = std::mem::take(&mut s.stuck_skip);
@@ -981,16 +1056,13 @@ pub fn periodic_summary(current: &SchedSnapshot) {
             st.other
         ));
     }
-    if rewrites > 0 {
-        emit(&format!(
-            "校验: 近 {} 秒重绑 {} 个线程（裁剪 {}、重置 {}、挪簇 {}）",
-            SUMMARY_GAP.as_secs(),
-            rewrites,
-            kinds[0],
-            kinds[1],
-            kinds[2]
-        ));
-        // 样例比计数更能说明问题：期望/实际的组合直接指向是哪一类故障
+    // 顺序很重要：先答「此刻绑上没有」，再答「这段时间被改了多少次」。
+    // 反过来写，一句「近 60 秒重绑 171 个线程」摆在「当前符合 171」前面，
+    // 读的人先入为主以为一分钟里 171 个线程全都没绑上
+    if let Some(t) = tally.filter(|t| t.total > 0) {
+        emit(&tally_line(t, rewrites, caps, kinds));
+        // 样例只给真正异常的那几类。组上限是系统组的稳态（线程被放进
+        // /foreground，该组只到 0-5），把它当样例列出来等于每分钟报一次「没绑上」
         if rewrites >= 8 {
             for d in drift {
                 emit(&format!(
@@ -999,20 +1071,25 @@ pub fn periodic_summary(current: &SchedSnapshot) {
                 ));
             }
         }
-    }
-    // 「本周期重绑了多少」与「此刻绑上没有」是两件事。用户拿日志对照
-    // Scene 时对不上账，缺的就是这一行
-    if let Some(t) = tally
-        && t.total > 0
-    {
-        let tail = if t.blocked > 0 {
-            format!("、被系统组限制 {}（这些此刻绑不了）", t.blocked)
-        } else {
-            String::new()
-        };
+        if !cap_top.is_empty() {
+            let mut v: Vec<(String, u32)> = cap_top.into_iter().collect();
+            v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+            v.truncate(3);
+            let list: Vec<String> = v.iter().map(|(c, n)| format!("{} {} 次", c, n)).collect();
+            emit(&format!(
+                "校验样例: 被系统改得最勤的线程 —— {}（都在所在组的天花板上，不是绑定失败）",
+                list.join("、")
+            ));
+        }
+    } else if rewrites > 0 {
         emit(&format!(
-            "校验: 受管 {} 个线程，当前符合 {}、本轮重绑 {}、写失败 {}{}",
-            t.total, t.ok, t.rebound, t.failed, tail
+            "校验: 近 {} 秒被系统改了 {} 次（组上限 {}、裁剪 {}、重置 {}、挪簇 {}）",
+            SUMMARY_GAP.as_secs(),
+            rewrites,
+            caps,
+            kinds[0],
+            kinds[1],
+            kinds[2]
         ));
     }
     if ineff_n > 0 {
@@ -1055,14 +1132,23 @@ pub fn periodic_summary(current: &SchedSnapshot) {
         // 一轮里被挡住多少线程、一分钟跑了几轮，是两个数。
         // 曾经把累计判定次数写成「N 个线程」，用户按这个数去数线程永远对不上
         let now_blocked = tally.map(|t| t.blocked).unwrap_or(0);
-        emit(&format!(
-            "系统分组: 当前 {} 个线程被系统组限制（近 {} 秒 {} 次判定、累计 {} 次）；\
-             这些线程此刻在小核上，切回前台会自动恢复，要强制绑写 @sysgroup=takeover",
-            now_blocked,
-            SUMMARY_GAP.as_secs(),
-            sysgroup,
-            st.sysgroup_skip
-        ));
+        if now_blocked > 0 {
+            emit(&format!(
+                "系统分组: 最近一轮 {} 个线程被系统放在不含规则核的组，已跳过（respect 下不硬抢）；\
+                 近 {} 秒累计判定 {} 次。切回前台会自动恢复，要强制接管写 @sysgroup=takeover",
+                now_blocked,
+                SUMMARY_GAP.as_secs(),
+                sysgroup
+            ));
+        } else {
+            emit(&format!(
+                "系统分组: 近 {} 秒累计判定 {} 次因线程所在组不含规则核而跳过（累计 {} 次）；\
+                 最近一轮没有这类线程。切回前台会自动恢复，要强制接管写 @sysgroup=takeover",
+                SUMMARY_GAP.as_secs(),
+                sysgroup,
+                st.sysgroup_skip
+            ));
+        }
     }
     if cpuset > 0 {
         let tail = if crate::apply_affinity::cpuset_paused() {
@@ -1077,6 +1163,26 @@ pub fn periodic_summary(current: &SchedSnapshot) {
             st.cpuset_fail,
             tail
         ));
+    }
+    // 「组上限」是最容易被读成「没绑上」的一类：线程确实只有 0-5 可用，
+    // 规则却要 4-6。这里给出组名、天花板和一句结论，省得用户自己去翻目录。
+    // 放在最后，是因为它要读 /dev/cpuset，不该挡在状态行前面
+    for (path, n) in cap_groups {
+        let eff =
+            crate::cpuset::group_effective_cached(&path).unwrap_or_else(|| "读不到".to_string());
+        let line = format!(
+            "系统分组: 近 {} 秒 {} 次读到线程被系统放进 {}(组集合 {})，规则集合超出该组，\
+             只有 {} 可用；AppOpt 每轮都已把线程拉回规则集合，日志里的「实际 {}」是拉回前的读数。\
+             系统会持续把它们放回该组，这类来回是系统行为，不是绑定失败",
+            SUMMARY_GAP.as_secs(),
+            n,
+            path,
+            eff,
+            eff,
+            eff
+        );
+        emit(&line);
+        push_event(s, line);
     }
     let mut hint = std::mem::take(&mut s.allow_hint_shown);
     if let Some(line) = sched_period_line(prev.as_ref(), current, &mut hint) {
@@ -1474,6 +1580,59 @@ mod tests {
         assert!(after.clip > before.clip, "子集应计为裁剪");
         assert!(after.reset > before.reset, "超集应计为重置");
         assert!(after.shifted > before.shifted, "互不包含应计为挪簇");
+    }
+
+    /// 读回正好等于所在组的天花板时，不是「被裁」而是「这组只能给这么多」。
+    /// 判定错一次，日志每分钟就会多出上百条「裁剪」，把真正被改写的线程埋掉
+    #[test]
+    fn group_cap_is_ceiling_not_failure() {
+        // 规则 4-6，线程在 /foreground（0-5），读回 4-5：正是该组的天花板
+        assert!(is_group_cap(&set_of(&[4, 5]), "4-5"));
+        // 同组但读回 4 核，说明还少了一个，属于真裁剪
+        assert!(!is_group_cap(&set_of(&[4]), "4-5"));
+        // 读回比组还大，不是组上限能解释的
+        assert!(!is_group_cap(&set_of(&[4, 5, 6]), "4-5"));
+        // 生效集合读不到或为空时不能倒推结论
+        assert!(!is_group_cap(&set_of(&[4, 5]), ""));
+        assert!(!is_group_cap(&set_of(&[4, 5]), "读不到"));
+    }
+
+    /// 「此刻绑上没有」必须排在「近 60 秒被改了多少次」前面。
+    /// 反过来的写法让用户以为一分钟里 173 个线程全都没绑上
+    #[test]
+    fn tally_line_puts_current_state_first() {
+        let t = SyncTally {
+            total: 173,
+            ok: 173,
+            rebound: 0,
+            failed: 0,
+            blocked: 0,
+        };
+        let line = tally_line(t, 171, 167, [3, 1, 0]);
+        assert!(line.contains("此刻受管 173"), "{}", line);
+        assert!(line.contains("符合 173"), "{}", line);
+        let state = line.find("符合 173").unwrap();
+        let history = line.find("近 60 秒").unwrap();
+        assert!(state < history, "状态必须在前：{}", line);
+        assert!(line.contains("组上限 167"), "{}", line);
+        // 一次都没被改过时不要提「被系统改了 0 次」
+        let quiet = tally_line(t, 0, 0, [0, 0, 0]);
+        assert!(!quiet.contains("被系统改了"), "{}", quiet);
+
+        // 被系统组限制的线程要单独说清，否则它们会被读成「符合」
+        let blocked = tally_line(
+            SyncTally {
+                total: 170,
+                ok: 0,
+                rebound: 0,
+                failed: 0,
+                blocked: 170,
+            },
+            0,
+            0,
+            [0, 0, 0],
+        );
+        assert!(blocked.contains("被系统组限制 170"), "{}", blocked);
     }
 
     /// S7 开着却不动时，摘要必须说清「跑了几轮、为什么跳过」
