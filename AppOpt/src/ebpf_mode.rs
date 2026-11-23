@@ -189,7 +189,7 @@ pub fn comm_map_init(bpf: &mut Ebpf, pkgs: &HashSet<String>, comm_capacity: u32)
     }
 
     println!(
-        "eBPF: 白名单已配置，{} 个包名 > {} 条匹配规则",
+        "eBPF: 白名单已配置，{} 个包名，对应 {} 条匹配规则",
         pkgs.len(),
         count
     );

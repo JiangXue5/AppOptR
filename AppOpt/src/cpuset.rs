@@ -190,10 +190,19 @@ pub fn effective_by_walk(root: &str, path: &str) -> Option<String> {
 /// 读不到再按父链交集自己算
 pub fn group_effective(path: &str) -> Option<String> {
     let dir = format!("/dev/cpuset{}", path.trim_end_matches('/'));
-    if let Some(eff) = read_effective(&dir) {
+    effective_at(&dir)
+}
+
+/// 任意 cpuset 目录（挂载点绝对路径）的生效集合。
+///
+/// 现场打印与组判定必须走同一个口子：一边只读导出文件、另一边按父链求交，
+/// 同一个「现场」里就会出现「目标 effective=-，线程组却是 0-7」这种对不上的画面
+pub fn effective_at(dir: &str) -> Option<String> {
+    let d = dir.trim_end_matches('/');
+    if let Some(eff) = read_effective(d) {
         return Some(eff);
     }
-    effective_by_walk("/dev/cpuset", path)
+    effective_by_walk("/dev/cpuset", &cgroup_rel(d)).filter(|s| !s.is_empty())
 }
 
 /// 生效集合的短时缓存。校验一轮要遍历几百个线程，同一组会被反复求交

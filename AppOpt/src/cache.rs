@@ -127,6 +127,15 @@ fn landing_for(rule: &CpuSet, landing: Option<CpuSet>) -> Option<CpuSet> {
     landing.filter(|s| s.subset_of(rule))
 }
 
+/// 组名以本轮读到的 path 为准，读不到才退回缓存。
+/// 反过来会在「系统刚把线程挪到另一个组」的那一轮里播报旧组名，
+/// 与判定用的生效集合并列，读日志的人无法验证结论
+fn resolve_group(path: Option<&str>, prev: Option<&TaskEntry>) -> SysGroup {
+    path.map(crate::cpuset::classify_group)
+        .or_else(|| prev.map(|old| old.group))
+        .unwrap_or(SysGroup::Unknown)
+}
+
 /// 单条线程本轮的目标：能维持 S7 落点就维持，否则回到规则值。
 ///
 /// 返回的第二个值是该落点是否仍然有效，调用方据此决定要不要删除记录。
@@ -247,14 +256,10 @@ impl ProcCache {
         // 之后跟着缓存走，不会变成每轮开销
         let prev = self.tasks.get(&tid);
         let path = crate::cpuset::thread_cgroup(tid);
-        let group = prev.map_or_else(
-            || {
-                path.as_deref()
-                    .map(crate::cpuset::classify_group)
-                    .unwrap_or(SysGroup::Unknown)
-            },
-            |old| old.group,
-        );
+        // 组名必须跟这一轮的 path 走。沿用上一轮的缓存，会在「系统刚把线程
+        // 从前台组挪到后台组」的那一轮里播报「在 top-app 组，4-6 不在该组内」，
+        // 与实际生效集合自相矛盾，用户没法验证这句话
+        let group = resolve_group(path.as_deref(), prev);
         let migrate = cfg.topo.cpuset_enabled && !crate::apply_affinity::cpuset_paused();
         let eff = path
             .as_deref()
@@ -283,7 +288,7 @@ impl ProcCache {
         let recheck = prev.is_some_and(|old| old.applied && old.cpus == target.cpus);
         let prev_applied = prev.is_some_and(|old| old.applied);
         if target.blocked {
-            crate::diag::note_sysgroup_skip(tid, comm, group, &result.cpus);
+            crate::diag::note_sysgroup_skip(tid, comm, group, &result.cpus, eff.as_deref());
             self.tasks.insert(
                 tid,
                 TaskEntry {
@@ -604,5 +609,35 @@ mod tests {
         // 线程退出后不再保留
         cache.task_del(4321);
         assert!(!cache.sched.contains_key(&4321));
+    }
+
+    /// 组名必须跟本轮读到的 path 走。沿用上一轮缓存会在「系统刚把线程从
+    /// 前台挪到后台」的那一轮里报出「在 top-app 组，4-6 不在该组内」，
+    /// 而判定其实用的是后台组的 0-3——日志自相矛盾，用户无从验证
+    #[test]
+    fn group_name_follows_current_path() {
+        let old = TaskEntry {
+            pid: 1,
+            pkg: "com.x".into(),
+            want: set_of("4-6"),
+            cpus: set_of("4-6"),
+            cpuset_dir: "4-6".into(),
+            is_thread_rule: false,
+            comm: "T".into(),
+            applied: true,
+            group: SysGroup::TopApp,
+            blocked: false,
+        };
+        assert_eq!(
+            resolve_group(Some("/background"), Some(&old)),
+            SysGroup::Background
+        );
+        assert_eq!(
+            resolve_group(Some("/top-app"), Some(&old)),
+            SysGroup::TopApp
+        );
+        // 读不到 path 才退回缓存
+        assert_eq!(resolve_group(None, Some(&old)), SysGroup::TopApp);
+        assert_eq!(resolve_group(None, None), SysGroup::Unknown);
     }
 }

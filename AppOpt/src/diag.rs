@@ -75,6 +75,9 @@ pub struct AffinityStats {
     pub other: u64,
     /// cpuset 目录写入失败次数（此时仅靠 sched_setaffinity）
     pub cpuset_fail: u64,
+    /// 写 cpuset 时线程已退出（ESRCH）。这是竞态不是故障，单独计数，
+    /// 不能混进 cpuset_fail 的摘要里
+    pub cpuset_gone: u64,
     /// 校验时读回是期望的子集：被 cpuset 的 effective_cpus 裁掉
     pub clip: u64,
     /// 校验时读回是期望的超集：被整体重置（热插拔、别的组件写回了全核）
@@ -135,9 +138,6 @@ struct Sink {
     drift_kind: [u64; 3],
     /// 本周期因系统后台组跳过的次数
     sysgroup_since_summary: u64,
-    /// 最近一轮被系统组拦下的线程数。累计次数会被轮次放大（172 个线程 × 5 轮
-    /// = 860 次），只有「当前多少个线程」才是能对照的实数
-    sysgroup_last: u64,
     /// 本周期「目标与所在组无交集」的次数与首个样例
     unreachable_since_summary: u64,
     unreachable_sample: Option<(String, i32, String, String)>,
@@ -192,7 +192,6 @@ fn sink() -> std::sync::MutexGuard<'static, Option<Sink>> {
         drift: Vec::new(),
         drift_kind: [0; 3],
         sysgroup_since_summary: 0,
-        sysgroup_last: 0,
         unreachable_since_summary: 0,
         unreachable_sample: None,
         sysgroup_announced: HashSet::new(),
@@ -346,6 +345,12 @@ fn unreachable_note(tid: i32, want: &CpuSet) -> Option<String> {
 pub fn note_cpuset_failure(tid: i32, dir: &str, fail: crate::apply_affinity::CpusetFail) {
     let mut guard = sink();
     let Some(s) = guard.as_mut() else { return };
+    // 线程在两次写之间退出是竞态，不是 cpuset 故障。计进失败会让每分钟的摘要
+    // 冒出一批「仍在重试」，把真正的失败盖掉，现场也可能抓在一个已死线程上
+    if fail.errno() == Some(libc::ESRCH) {
+        s.stats.cpuset_gone += 1;
+        return;
+    }
     s.stats.cpuset_fail += 1;
     s.cpuset_since_summary += 1;
     let line = match fail.errno() {
@@ -394,10 +399,39 @@ fn cpuset_detail(dir: &str, tid: i32) -> Vec<String> {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "-".to_string())
     };
-    // v1 与 v2 的生效集合文件名不同，只读一种会让这一格永远是 `-`，
-    // 而它恰好是判断「内核为什么不接受」的唯一依据
-    let eff = |p: &str| crate::cpuset::read_effective(p).unwrap_or_else(|| "-".to_string());
-    let group_path = crate::cpuset::thread_cgroup(tid).unwrap_or_else(|| "-".to_string());
+    // 与组判定共用 effective_at：读不到导出值时按父链求交自算。
+    // 只读导出文件会让这一格在部分内核上恒为 `-`，而它恰好是判断
+    // 「内核为什么不接受」的唯一依据
+    let eff = |p: &str| crate::cpuset::effective_at(p).unwrap_or_else(|| "-".to_string());
+    let root = format!(
+        "根[/dev/cpuset] cpus={} mems={}",
+        read("/dev/cpuset/cpus"),
+        read("/dev/cpuset/mems")
+    );
+    // 线程已退出时 /proc/<tid>/cgroup 读不到。此时不能再拿 `-` 当路径去求父链交集：
+    // 那会取到根组的 0-7，端出一份「与目标有交集」的假现场
+    let Some(group_path) = crate::cpuset::thread_cgroup(tid) else {
+        return vec![
+            format!(
+                "cpuset 现场: 目标[{}] cpus={} mems={} effective={}",
+                target,
+                read(&format!("{}/cpus", target)),
+                read(&format!("{}/mems", target)),
+                eff(&target),
+            ),
+            format!(
+                "cpuset 现场: 父[{}] cpus={} mems={} effective={}",
+                base,
+                read(&format!("{}/cpus", base)),
+                read(&format!("{}/mems", base)),
+                eff(&base),
+            ),
+            format!(
+                "cpuset 现场: 线程 {} 已退出（读不到 /proc/{}/cgroup），无可达性可判；{}",
+                tid, tid, root
+            ),
+        ];
+    };
     let group_eff = crate::cpuset::group_effective(&group_path).unwrap_or_else(|| "-".to_string());
     let group = crate::cpuset::classify_group(&group_path);
     let target_cpus = read(&format!("{}/cpus", target));
@@ -428,14 +462,13 @@ fn cpuset_detail(dir: &str, tid: i32) -> Vec<String> {
             eff(&base),
         ),
         format!(
-            "cpuset 现场: 线程 {} 所在组 {}({}，{}组) {}；根[/dev/cpuset] cpus={} mems={}",
+            "cpuset 现场: 线程 {} 所在组 {}({}，{}) {}；{}",
             tid,
             group_path,
             group_eff,
             group.label(),
             reachable,
-            read("/dev/cpuset/cpus"),
-            read("/dev/cpuset/mems"),
+            root,
         ),
     ]
 }
@@ -586,8 +619,10 @@ pub fn note_stuck() {
 
 /// 线程被系统放在后台组、规则目标又不在该组生效集合内。
 /// 这不是失败：内核对 cgroup 迁移和 sched_setaffinity 都会返回 EINVAL，
-/// 硬试只会把线程在簇之间来回踢。同类组只说明一次，其余进 60 秒摘要
-pub fn note_sysgroup_skip(tid: i32, comm: &str, group: SysGroup, want: &CpuSet) {
+/// 硬试只会把线程在簇之间来回踢。同类组只说明一次，其余进 60 秒摘要。
+/// `eff` 是判定所依据的生效集合，必须一起打出来——否则「4-6 不在该组内」
+/// 只是一句无法验证的结论
+pub fn note_sysgroup_skip(tid: i32, comm: &str, group: SysGroup, want: &CpuSet, eff: Option<&str>) {
     let mut guard = sink();
     let Some(s) = guard.as_mut() else { return };
     s.stats.sysgroup_skip += 1;
@@ -600,10 +635,12 @@ pub fn note_sysgroup_skip(tid: i32, comm: &str, group: SysGroup, want: &CpuSet) 
     } else {
         format!("{}({})", comm, tid)
     };
+    let eff = eff.filter(|s| !s.is_empty()).unwrap_or("未知");
     let line = format!(
-        "系统分组: {} 在 {} 组，规则要求 {} 不在该组内，内核会拒绝绑定；已跳过（不计失败）。要强制接管写 @sysgroup=takeover",
+        "系统分组: {} 在 {} 组（生效集合 {}），规则要求 {} 不在该组内，内核会拒绝绑定；已跳过（不计失败）。要强制接管写 @sysgroup=takeover",
         name,
         group.label(),
+        eff,
         want.to_range_string()
     );
     emit(&line);
@@ -617,7 +654,6 @@ pub fn note_sysgroup_batch(n: u64) {
     let Some(s) = guard.as_mut() else { return };
     s.stats.sysgroup_skip += n;
     s.sysgroup_since_summary += n;
-    s.sysgroup_last = n;
     if !s.sysgroup_announced.insert(SysGroup::Background) {
         return;
     }
@@ -805,9 +841,10 @@ pub fn periodic_summary(current: &SchedSnapshot) {
         }
     }
     if sysgroup > 0 {
+        // 两个数字必须同源：曾经用「最近一批的线程数」配「本周期跳过次数」，
+        // 会打出「当前 0 个线程被限定在小核（近 60 秒跳过 2 次）」
         emit(&format!(
-            "系统分组: 当前 {} 个线程被系统限定在小核（近 {} 秒跳过 {} 次，累计 {}）；不改规则就绑不上，切回前台会自动恢复",
-            s.sysgroup_last,
+            "系统分组: 近 {} 秒 {} 次因所在组不含目标集合被跳过（累计 {}）；不改规则就绑不上，切回前台会自动恢复",
             SUMMARY_GAP.as_secs(),
             sysgroup,
             st.sysgroup_skip
@@ -868,7 +905,12 @@ fn sched_period_line(
         ),
     };
     if ticks == 0 {
-        // 一轮都没跑：状态本身就是要看的答案（off/不适用/等待进程）
+        // 一轮都没跑：状态本身就是要看的答案（不适用/等待进程）。
+        // 状态没变就不再重复——「规则无跨簇」是静态结论，启动行已经说明过一次，
+        // 实测 5 分钟里刷了同样 5 行，只会把真正有用的行挤出去
+        if prev.is_some_and(|p| p.state == cur.state) {
+            return None;
+        }
         return Some(format!(
             "S7: 近 {} 秒未推进判定（状态：{}）",
             gap, cur.state
@@ -1290,5 +1332,85 @@ mod tests {
         let mut s = JankSampler::new();
         // 第一次只建基准
         assert!(s.sample(&c).is_empty() || s.sample(&c).is_empty());
+    }
+
+    /// ESRCH 是线程退出竞态，一次组都没写过。沿用「已抬到 base 组」的说明
+    /// 会让人去查 cpuset 配置，而真正发生的事只是线程没了
+    #[test]
+    fn cpuset_target_label_matches_actual_path() {
+        use crate::apply_affinity::CpusetFail;
+        let gone = CpusetFail::Target(libc::ESRCH).label();
+        let rejected = CpusetFail::Target(libc::EINVAL).label();
+        assert!(gone.contains("线程已退出"), "{}", gone);
+        assert!(!gone.contains("base"), "{}", gone);
+        assert!(rejected.contains("base"), "{}", rejected);
+    }
+
+    /// 线程退出不能算成「cpuset 目录写入失败」：否则每 60 秒摘要里都会
+    /// 冒出一批「仍在重试」，把真正的失败盖掉
+    #[test]
+    fn esrch_does_not_pollute_cpuset_failure_stats() {
+        use crate::apply_affinity::CpusetFail;
+        let before = snapshot().aff;
+        note_cpuset_failure(2_000_000_000, "4-6", CpusetFail::Target(libc::ESRCH));
+        let gone = snapshot().aff;
+        assert_eq!(gone.cpuset_fail, before.cpuset_fail);
+        assert_eq!(gone.cpuset_gone - before.cpuset_gone, 1);
+
+        note_cpuset_failure(2_000_000_000, "4-6", CpusetFail::Target(libc::EINVAL));
+        assert_eq!(snapshot().aff.cpuset_fail - before.cpuset_fail, 1);
+    }
+
+    /// 线程已退出时不能再拿 `-` 当路径求父链交集，否则会取到根组的 0-7，
+    /// 端出一份「与目标有交集」的假现场
+    #[test]
+    fn cpuset_detail_marks_dead_thread_without_fake_reachability() {
+        let lines = cpuset_detail("4-6", 2_000_000_000);
+        assert_eq!(lines.len(), 3);
+        assert!(lines[2].contains("已退出"), "{:?}", lines);
+        assert!(!lines[2].contains("与目标有交集"), "{:?}", lines);
+        // 曾是「-(0-7，其他组组)」：label 已含「组」，格式串又加了一次
+        assert!(!lines[2].contains("组组"), "{:?}", lines);
+    }
+
+    /// 系统分组播报必须带上判定依据，否则「4-6 不在该组内」无法验证
+    #[test]
+    fn sysgroup_skip_reports_effective_set() {
+        note_sysgroup_skip(
+            2_000_000_001,
+            "dns-work",
+            SysGroup::Other,
+            &set_of(&[4, 5, 6]),
+            Some("0-3"),
+        );
+        let ev = snapshot().events;
+        let line = ev
+            .iter()
+            .rev()
+            .find(|l| l.contains("dns-work"))
+            .expect("应有系统分组播报");
+        assert!(line.contains("0-3"), "{}", line);
+        assert!(line.contains("4-6"), "{}", line);
+    }
+
+    /// 状态没变时不重复刷同一行（实测 5 分钟刷了 5 遍「规则无跨簇」），
+    /// 状态变了必须重新说明
+    #[test]
+    fn idle_sched_state_repeats_only_when_it_changes() {
+        let mut prev = SchedSnapshot {
+            mode: 2,
+            state: "规则无跨簇",
+            ticks: 0,
+            ..Default::default()
+        };
+        let cur = prev.clone();
+        let mut hint = false;
+        assert!(sched_period_line(Some(&prev), &cur, &mut hint).is_none());
+
+        prev.state = "等待被管理进程";
+        assert!(sched_period_line(Some(&prev), &cur, &mut hint).is_some());
+
+        // 首次没有上一轮，仍要说明一次
+        assert!(sched_period_line(None, &cur, &mut hint).is_some());
     }
 }

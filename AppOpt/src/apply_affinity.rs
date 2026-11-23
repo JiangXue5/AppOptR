@@ -385,6 +385,9 @@ impl CpusetFail {
         match self {
             CpusetFail::NoDir => "目录未建成（权限或只读挂载）",
             CpusetFail::Base(_) => "连 base 全核都写不进去（挂载或权限）",
+            // 只有 EINVAL 才会先写 base 再写目标。ESRCH 是线程在两次写之间退出了，
+            // 一次组都没写过，沿用「已抬到 base」会把人引去查 cpuset 配置
+            CpusetFail::Target(e) if e == libc::ESRCH => "线程已退出，cpuset 未做任何迁移",
             CpusetFail::Target(_) => "已抬到 base 组，目标组仍拒绝（生效集合为空或与原组无交集）",
         }
     }
