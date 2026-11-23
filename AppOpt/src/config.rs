@@ -660,42 +660,74 @@ fn parse_rt_app(arg: &str, default_max: u8) -> Option<(String, AppRt)> {
 /// 日志后面每一句「期望 4-6」都是从这张表推出来的。不打印它，用户拿着
 /// 自己写的配置去核对时只能靠记忆——真机上出现过「我写的是 4-7」与
 /// 「日志说期望 4-6」对不上的争执，实际是规则里另有更窄的一条线程规则
-fn report_rule_list(rules: &[AffinityRule]) {
+fn report_rule_list(rules: &[AffinityRule], topo: &CpuTopology) {
     const CAP: usize = 12;
     for r in rules.iter().take(CAP) {
-        let mut line = format!("规则: {}", r.pkg);
-        if !r.thread.is_empty() {
-            line.push_str(&format!(" 线程 {}", r.thread));
-        }
-        line.push_str(&format!(" → {}", r.cpus.to_range_string()));
+        // 包名与线程名都是 ASCII，定宽填充能对齐成表格；核集合后面跟一档
+        // 语义名（p-core 大核），不必每次回看「环境」那行去查数字
+        let thread = if r.thread.is_empty() {
+            "all"
+        } else {
+            r.thread.as_str()
+        };
+        let mut line = format!(
+            "{:<26} {:<14} → {:<5}",
+            r.pkg,
+            thread,
+            r.cpus.to_range_string()
+        );
         if !r.cpuset_dir.is_empty() {
-            line.push_str(&format!("（组 {}）", r.cpuset_dir));
+            line.push_str(&format!(" 组 {}", r.cpuset_dir));
         }
-        crate::diag::emit(&line);
+        let kind = core_class(&r.cpus, topo);
+        if !kind.is_empty() {
+            line.push_str(&format!("  {}", kind));
+        }
+        crate::diag::tag("规则", line.trim_end());
         // 包名只能由字母、数字、下划线、点组成。含冒号几乎一定是想写
         // `pkg:thread=cpus`——这种写法会被整串当成包名，规则永远匹配不到进程，
         // 而且日志里看起来「规则已加载」，不警告就只能靠用户自己发现绑没上
         if r.thread.is_empty() && r.pkg.contains(':') {
-            crate::diag::emit(&format!(
-                "规则警告: 「{}」不是合法包名，线程规则请写成 pkg{{thread}}=cpus；\
-                 按现在这条写，它会被当成一个叫这个名字的包，永远匹配不到任何进程",
-                r.pkg
-            ));
+            crate::diag::tag(
+                "警告",
+                &format!(
+                    "「{}」不是合法包名，线程规则请写成 pkg{{thread}}=cpus；\
+                     按现在这条写，它会被当成一个叫这个名字的包，永远匹配不到任何进程",
+                    r.pkg
+                ),
+            );
         }
     }
     if rules.len() > CAP {
-        crate::diag::emit(&format!("规则: 另有 {} 条未列出", rules.len() - CAP));
+        crate::diag::tag("规则", &format!("另有 {} 条未列出", rules.len() - CAP));
     }
-    // 只处理规则内的包，这一点要能自证：后面每条线程日志都带 [包名]，
-    // 出现别的包就说明匹配出了问题，而不是「看起来像」
-    let pkgs: std::collections::BTreeSet<&str> = rules.iter().map(|r| r.pkg.as_str()).collect();
-    let list: Vec<&str> = pkgs.into_iter().collect();
-    crate::diag::emit(&format!(
-        "匹配范围: 只处理 {} 这 {} 个包的线程（按 cmdline + 属主双重校验）；\
-         其余进程不绑核、不改 cpuset。日志里每条线程都会带 [包名]，可据此核对",
-        list.join("、"),
-        list.len()
-    ));
+}
+
+/// 规则集合落在哪一档核心上。启动块已给出 e/p/hp 各是哪几个核，
+/// 这里只负责回答「4-6 到底是大核还是小核」——这是读规则表时第一个问题
+fn core_class(cpus: &CpuSet, topo: &CpuTopology) -> &'static str {
+    if cpus.count() == 0 {
+        return "空集合";
+    }
+    // 没分层时三档是同一个集合，任何「p-core/大核」的标注都是编的
+    if topo.topo_degraded {
+        return "";
+    }
+    if topo.hp_core.count() > 0 && *cpus == topo.hp_core {
+        return "hp-core 超大核";
+    }
+    if topo.p_core.count() > 0 && *cpus == topo.p_core {
+        return "p-core 大核";
+    }
+    if topo.e_core.count() > 0 && *cpus == topo.e_core {
+        return "e-core 小核";
+    }
+    if cpus.subset_of(&topo.hp_core) || cpus.subset_of(&topo.p_core) || cpus.subset_of(&topo.e_core)
+    {
+        // 只取了某一档的一部分：贴档名但标明「部分」，避免被当成整档
+        return "某档部分核";
+    }
+    "跨簇"
 }
 
 fn report_offline_rules(rules: &[AffinityRule], topo: &CpuTopology) {
@@ -713,13 +745,16 @@ fn report_offline_rules(rules: &[AffinityRule], topo: &CpuTopology) {
             continue;
         }
         reported.push(want.clone());
-        crate::diag::emit(&format!(
-            "规则集合: 规则要的 {} 里 CPU {} 当前不在线（在线 [{}]）；这些核会被内核静默扣掉、回读变小，\
+        crate::diag::tag(
+            "警告",
+            &format!(
+                "规则要的 {} 里 CPU {} 当前不在线（在线 {}）；这些核会被内核静默扣掉、回读变小，\
              日志随后记成「裁剪」。核上线后下一轮自动恢复，不是规则写错",
-            want,
-            off.to_range_string(),
-            online.to_range_string()
-        ));
+                want,
+                off.to_range_string(),
+                online.to_range_string()
+            ),
+        );
     }
 }
 
@@ -942,73 +977,96 @@ pub fn load_config(
     if !multi.is_empty() {
         multi.sort_unstable();
         let sample = multi.iter().take(3).copied().collect::<Vec<_>>().join(", ");
-        eprintln!(
-            "提示: {} 个应用存在多条包级规则，CPU 集合按并集生效（与书写顺序无关）：{}{}",
-            multi.len(),
-            sample,
-            if multi.len() > 3 { " 等" } else { "" }
+        crate::diag::tag(
+            "警告",
+            &format!(
+                "{} 个应用存在多条包级规则，CPU 集合按并集生效（与书写顺序无关）：{}{}",
+                multi.len(),
+                sample,
+                if multi.len() > 3 { " 等" } else { "" }
+            ),
         );
     }
 
-    crate::diag::emit(&format!("配置文件解析完成，共加载 {} 条规则", num_rules));
-    report_rule_list(&rules);
+    // 启动块第一行就是「读的是哪个文件」。真机上「改了没生效」十次有九次
+    // 是改的不是这个路径，日志里不给路径就只能靠猜
+    let mut pkg_list: Vec<&str> = pkgs.iter().map(|s| s.as_str()).collect();
+    pkg_list.sort_unstable();
+    let shown = if pkg_list.len() > 6 {
+        format!("{} 等", pkg_list[..6].join("、"))
+    } else {
+        pkg_list.join("、")
+    };
+    crate::diag::tag(
+        "配置",
+        &format!(
+            "{} ｜ {} 条规则 ｜ {} 个包：{} ｜ 只处理这些包的线程（cmdline+属主双校验），其余进程不读不写",
+            config_file,
+            num_rules,
+            pkg_list.len(),
+            shown
+        ),
+    );
+    report_rule_list(&rules, topo);
     report_offline_rules(&rules, topo);
     if fail_cnt > 0 {
-        eprintln!("警告: {} 条规则因格式无效被跳过", fail_cnt);
+        crate::diag::tag("警告", &format!("{} 条规则因格式无效被跳过", fail_cnt));
     }
-    if unmatched_all {
-        crate::diag::emit("未匹配线程: all（沿用旧行为，设为全部核心）");
-    } else {
-        crate::diag::emit("未匹配线程: keep（保持原有亲和性）");
-    }
-    crate::diag::emit(&format!(
-        "系统分组: {}（线程在系统后台组时{}）",
-        if sysgroup_respect {
-            "尊重"
-        } else {
-            "强行接管"
-        },
-        if sysgroup_respect {
-            "留在小核，不硬绑大核"
-        } else {
-            "会被拉进 AppOpt 组，可能增加耗电"
-        }
-    ));
     let (scope, sched_pkgs) = sched_scope(&rules, topo);
-    if scope.levels < 2 {
-        crate::diag::emit(&format!(
-            "跨簇规则: 不适用（当前识别为 {} 个核心层）",
-            scope.levels
-        ));
+    // 策略压成一行：这几项都是静态开关，逐项一行会把启动块拉长到看不清
+    // 主线。哪一项与默认值不同，就多给一句为什么
+    // 未分层时三档是同一个集合，「跨簇 0/4」会被读成「规则都没跨簇」，
+    // 实际是根本没有簇可分——两种结论指向的下一步完全不同
+    let scope_desc = if topo.topo_degraded {
+        "跨簇 不适用（未分层）".to_string()
+    } else if scope.levels < 2 {
+        format!("跨簇 0（只识别到 {} 个核心层）", scope.levels)
     } else {
-        crate::diag::emit(&format!(
-            "跨簇规则: {} / {} 条，涉及 {} 个包（核心层级 {}）",
-            scope.rules, num_rules, scope.pkgs, scope.levels
-        ));
-    }
-    match sched {
-        SchedMode::Off => crate::diag::emit("S7 动态分配: off（不采样，行为与静态规则一致）"),
-        SchedMode::Shadow => crate::diag::emit("S7 动态分配: shadow（采样与记录，不修改亲和性）"),
-        // 拓扑不满足时照常记录意图，但明确不会生效，避免误以为已经在优化
-        SchedMode::On if scope.levels < 2 => crate::diag::emit(&format!(
-            "S7 动态分配: on（核心层仅 {} 个，不会生效）",
-            scope.levels
-        )),
-        // 规则全在单簇内：S7 没有可让位的目标，运行期直接不采样
+        format!(
+            "跨簇 {}/{} 条（{} 个包）",
+            scope.rules, num_rules, scope.pkgs
+        )
+    };
+    let sched_desc = match sched {
+        SchedMode::Off => "S7 off（不采样）".to_string(),
+        SchedMode::Shadow => "S7 shadow（只采样不改）".to_string(),
+        SchedMode::On if topo.topo_degraded => "S7 on 但未分层，不会生效".to_string(),
+        SchedMode::On if scope.levels < 2 => {
+            format!("S7 on 但只有 {} 个核心层，不会生效", scope.levels)
+        }
         SchedMode::On if scope.rules == 0 => {
-            crate::diag::emit("S7 动态分配: on（规则无跨簇，没有可让位的目标，不会采样）")
+            "S7 on 但规则无跨簇，没有可让位目标，不会采样".to_string()
         }
-        SchedMode::On => {
-            crate::diag::emit("S7 动态分配: on（仅 Worker/Background 让位，每秒最多迁移 1 个线程）")
-        }
-    }
+        SchedMode::On => "S7 on（Worker/Background 让位，每秒最多迁 1 个）".to_string(),
+    };
+    crate::diag::tag(
+        "策略",
+        &format!(
+            "未匹配={} ｜ 系统分组={} ｜ {} ｜ {}",
+            if unmatched_all {
+                "all（设为全核）"
+            } else {
+                "keep（保持原样）"
+            },
+            if sysgroup_respect {
+                "respect（后台组不硬抢）"
+            } else {
+                "takeover（拉进 AppOpt 组，费电）"
+            },
+            scope_desc,
+            sched_desc
+        ),
+    );
     if !rt.is_off() {
-        crate::diag::emit(&format!(
-            "RT 调度: {}，每应用上限 {}，RR 时间片 {} ms",
-            rt.label(),
-            rt.max_per_app,
-            rt.timeslice_ms
-        ));
+        crate::diag::tag(
+            "策略",
+            &format!(
+                "RT {} ｜ 每应用上限 {} ｜ RR 时间片 {} ms",
+                rt.label(),
+                rt.max_per_app,
+                rt.timeslice_ms
+            ),
+        );
         // per_app 里配了但没有任何亲和性规则的包不会进入决策路径，提前说明比事后排查省事
         if rt.scope == RtScope::PerApp {
             let mut orphan: Vec<&str> = rt
@@ -1025,11 +1083,14 @@ pub fn load_config(
                     .copied()
                     .collect::<Vec<_>>()
                     .join(", ");
-                eprintln!(
-                    "提示: {} 个应用配置了 RT 但没有亲和性规则，不会生效：{}{}",
-                    orphan.len(),
-                    sample,
-                    if orphan.len() > 3 { " 等" } else { "" }
+                crate::diag::tag(
+                    "警告",
+                    &format!(
+                        "{} 个应用配置了 RT 但没有亲和性规则，不会生效：{}{}",
+                        orphan.len(),
+                        sample,
+                        if orphan.len() > 3 { " 等" } else { "" }
+                    ),
                 );
             }
         }
@@ -1083,13 +1144,13 @@ pub fn config_loader() {
 pub fn init_inotify(config_file: &str) {
     let inotify_fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
     if inotify_fd < 0 {
-        println!("inotify初始化失败，使用轮询模式");
+        crate::diag::tag("组件", "inotify 初始化失败，改用轮询监听配置");
         return;
     }
     let cfg_cstr = match CString::new(config_file) {
         Ok(c) => c,
         Err(_) => {
-            eprintln!("错误: 配置文件路径包含非法字符，使用轮询模式");
+            crate::diag::tag("警告", "配置文件路径含非法字符，inotify 不可用，改用轮询");
             unsafe {
                 libc::close(inotify_fd);
             }
@@ -1107,12 +1168,12 @@ pub fn init_inotify(config_file: &str) {
         INOTIFY_SUPPORTED.store(true, Ordering::Release);
         INOTIFY_FD.store(inotify_fd, Ordering::Release);
         INOTIFY_WD.store(wd, Ordering::Release);
-        println!("启用inotify监控配置文件变更");
+        crate::diag::tag("组件", "inotify 监听配置文件变更");
     } else {
         unsafe {
             libc::close(inotify_fd);
         }
-        println!("inotify初始化失败，使用轮询模式");
+        crate::diag::tag("组件", "inotify 初始化失败，改用轮询监听配置");
     }
 }
 
@@ -1274,7 +1335,7 @@ fn inotify_rewatch(inotify_fd: i32) -> bool {
     let cfg_cstr = match CString::new(lock_ignore_poison(&CONFIG_FILE).clone()) {
         Ok(c) => c,
         Err(_) => {
-            eprintln!("错误: 配置文件路径包含非法字符，降级为轮询模式");
+            crate::diag::tag("警告", "配置文件路径含非法字符，降级为轮询");
             disable_inotify(inotify_fd);
             return false;
         }

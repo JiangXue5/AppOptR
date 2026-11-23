@@ -114,7 +114,7 @@ impl RtState {
         }
         let n = self.drop_threads(&drop);
         if n > 0 {
-            println!("RT: 配置变更后回滚 {} 个线程到 SCHED_OTHER", n);
+            crate::diag_say!("RT 配置变更后回滚 {} 个线程到 SCHED_OTHER", n);
         }
     }
 
@@ -216,7 +216,7 @@ impl RtState {
         }
         let n = self.drop_threads(&demote);
         if n > 0 {
-            println!("RT: 全量重扫后回滚 {} 个不再符合条件的线程", n);
+            crate::diag_say!("RT 全量重扫后回滚 {} 个不再符合条件的线程", n);
         }
     }
 
@@ -228,7 +228,7 @@ impl RtState {
         let tids: Vec<i32> = self.own.keys().copied().collect();
         let n = self.drop_threads(&tids);
         if n > 0 {
-            println!("RT: 回滚 {} 个线程到 SCHED_OTHER", n);
+            crate::diag_say!("RT 回滚 {} 个线程到 SCHED_OTHER", n);
         }
     }
 
@@ -242,7 +242,7 @@ impl RtState {
     /// 再按所有权检查恢复时间片，最后关闸门。只关闸门不清理会留下
     /// 「功能已停用、线程还是 RR、整机时间片还是 3 ms」的残留
     fn fuse(&mut self, why: &str) {
-        eprintln!("RT: {}，RT 已全局关闭", why);
+        crate::diag_warn!("RT {}，RT 已全局关闭", why);
         self.enabled = false;
         self.demote_all();
         self.restore_timeslice();
@@ -289,7 +289,7 @@ impl RtState {
                 // 其余（EINVAL 等）多半是单个线程的参数或状态问题，
                 // 不能据此认定整个环境不可用：记录 errno，跳过该线程
                 _ => {
-                    eprintln!("RT: sched_setscheduler({}) 失败（{}），跳过该线程", tid, e);
+                    crate::diag_warn!("RT sched_setscheduler({}) 失败（{}），跳过该线程", tid, e);
                 }
             }
             return false;
@@ -323,7 +323,7 @@ impl RtState {
                     let _ = fs::write(&p, format!("{}\n", cur));
                 }
                 self.pending_restore = Some(cur);
-                println!("RT: 时间片被外部改为 {} ms，作为新的原值记录", c);
+                crate::diag_say!("时间片被外部改为 {} ms，作为新的原值记录", c);
             }
             // 原值只在第一次保存，这里只改当前值；失败则放弃后续尝试
             if fs::write(RR_TIMESLICE_PATH, format!("{}\n", ms)).is_err() {
@@ -331,8 +331,8 @@ impl RtState {
                 return;
             }
             self.applied_ms = Some(ms);
-            println!(
-                "RT: 时间片调整为 {} ms（原值 {} ms 保持不变）",
+            crate::diag_say!(
+                "时间片调整为 {} ms（原值 {} ms 保持不变）",
                 ms,
                 self.pending_restore.as_deref().unwrap_or(&old)
             );
@@ -362,8 +362,8 @@ impl RtState {
         }
         self.pending_restore = Some(old.clone());
         self.applied_ms = Some(ms);
-        println!(
-            "RT: 时间片 {} ms → {} ms（原值已备份，退出或关闭时恢复）",
+        crate::diag_say!(
+            "时间片 {} ms → {} ms（原值已备份，退出或关闭时恢复）",
             old.trim(),
             ms
         );
@@ -378,10 +378,10 @@ impl RtState {
         // 只清理记录与备份，避免「卸载模块顺手改掉别人的配置」
         if owns_current(self.applied_ms) {
             let _ = fs::write(RR_TIMESLICE_PATH, format!("{}\n", old));
-            println!("RT: 时间片已恢复为 {} ms", old.trim());
+            crate::diag_say!("时间片已恢复为 {} ms", old.trim());
         } else {
-            eprintln!(
-                "RT: 时间片已被外部修改，保留现值不覆盖（原值 {} ms）",
+            crate::diag_warn!(
+                "时间片已被外部修改，保留现值不覆盖（原值 {} ms）",
                 old.trim()
             );
         }
@@ -546,7 +546,7 @@ fn restore_stale() {
         return;
     }
     if fs::write(RR_TIMESLICE_PATH, format!("{}\n", old)).is_ok() {
-        eprintln!("RT: 检测到上次异常退出的残留，时间片已恢复为 {} ms", old);
+        crate::diag_warn!("RT 检测到上次异常退出的残留，时间片已恢复为 {} ms", old);
     }
     let _ = fs::remove_file(&path);
 }

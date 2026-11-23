@@ -57,6 +57,10 @@ pub static WEB_ENABLED: AtomicBool = AtomicBool::new(false);
 
 pub static WEB_STATS: Mutex<Option<WebStats>> = Mutex::new(None);
 
+/// 本次启动是首次运行（设置文件不存在、刚写入默认值）。由 main 在启动行
+/// 之后打一行说明——放在 settings_load 里会跑到启动行前面
+pub static SETTINGS_FRESH: AtomicBool = AtomicBool::new(false);
+
 #[derive(Clone)]
 pub struct WebStats {
     pub rules: usize,
@@ -164,7 +168,7 @@ fn token_load_or_create() -> String {
     }
     let tok = random_token();
     if !token_shape_ok(&tok) {
-        eprintln!("Web: 无法生成随机令牌");
+        crate::diag::tag("失败", "Web 无法生成随机令牌，拒绝启动");
         return String::new();
     }
     let name = match std::ffi::CString::new(path.as_os_str().to_string_lossy().as_bytes()) {
@@ -180,10 +184,13 @@ fn token_load_or_create() -> String {
         )
     };
     if fd < 0 {
-        eprintln!(
-            "Web: 创建令牌文件 {} 失败 ({})",
-            path.display(),
-            std::io::Error::last_os_error()
+        crate::diag::tag(
+            "失败",
+            &format!(
+                "Web 创建令牌文件 {} 失败（{}）",
+                path.display(),
+                std::io::Error::last_os_error()
+            ),
         );
         return String::new();
     }
@@ -194,10 +201,13 @@ fn token_load_or_create() -> String {
         libc::fchmod(f.as_raw_fd(), 0o600);
     }
     if !ok {
-        eprintln!("Web: 写入令牌文件失败");
+        crate::diag::tag("失败", "Web 写入令牌文件失败");
         return String::new();
     }
-    println!("Web: 访问令牌已写入 {}", path.display());
+    crate::diag::tag(
+        "组件",
+        &format!("Web 令牌已写入 {}（0600）", path.display()),
+    );
     tok
 }
 
@@ -224,22 +234,37 @@ pub fn web_start() -> bool {
     let listener = match TcpListener::bind(("127.0.0.1", WEB_PORT)) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("Web: 监听 127.0.0.1:{} 失败 ({})", WEB_PORT, e);
+            crate::diag::tag(
+                "失败",
+                &format!(
+                    "Web 监听 127.0.0.1:{} 失败（{}），端口可能被占用",
+                    WEB_PORT, e
+                ),
+            );
             return false;
         }
     };
     let tok = token_load_or_create();
     if tok.is_empty() {
-        eprintln!("Web: 没有可用令牌，拒绝启动（避免无认证的 root 接口）");
+        crate::diag::tag(
+            "失败",
+            "Web 没有可用令牌，拒绝启动（避免出现无认证的 root 接口）",
+        );
         return false;
     }
     publish_webroot_token(&tok);
     *lock_ignore_poison(&WEB_TOKEN) = tok;
     WEB_ENABLED.store(true, Ordering::Release);
-    println!(
-        "Web: 前端已启用 http://127.0.0.1:{}/#t={}",
-        WEB_PORT,
-        lock_ignore_poison(&WEB_TOKEN).as_str()
+    // 令牌绝不进日志。日志会被整段贴出去求助，一次泄露就等于把 root 接口的
+    // 永久通行证公开（令牌只有删掉 web.token 才会更换）。前端本来就能从
+    // 同源 token.js 与 KSU 的 ksu.exec 自动取到，不需要用户手抄
+    crate::diag::tag(
+        "组件",
+        &format!(
+            "Web 就绪 http://127.0.0.1:{}/ ｜ 令牌文件 {}（0600，前端自动读取；日志不打印令牌）",
+            WEB_PORT,
+            token_path().display()
+        ),
     );
     thread::spawn(move || {
         for stream in listener.incoming().flatten() {
@@ -1389,7 +1414,7 @@ fn config_set_api(req: &Request) -> (u16, String) {
         if std::fs::metadata(p).is_err()
             && let Err(e) = create_config_file(p)
         {
-            eprintln!("Web: 创建配置文件 {} 失败: {}", p, e);
+            crate::diag::tag("失败", &format!("Web 创建配置文件 {} 失败：{}", p, e));
             return err_json(400, "配置文件无法创建");
         }
         *lock_ignore_poison(&CONFIG_FILE) = p.to_string();
@@ -1595,7 +1620,7 @@ impl Settings {
             })
             .and_then(|_| fs::rename(&tmp, path));
         if let Err(e) = res {
-            eprintln!("警告: 设置写入 {} 失败: {}", path, e);
+            crate::diag::tag("警告", &format!("设置写入 {} 失败：{}", path, e));
         }
     }
 }
@@ -1605,18 +1630,22 @@ pub fn settings_load(path: &str) -> Settings {
         Ok(text) => match serde_json::from_str::<Value>(&text) {
             Ok(v) => Settings::from_json(&v),
             Err(e) => {
-                eprintln!("警告: {} 已损坏({})，使用默认设置", path, e);
+                crate::diag::tag("警告", &format!("{} 已损坏（{}），使用默认设置", path, e));
                 Settings::default()
             }
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let d = Settings::default();
             d.save(path);
-            println!("设置文件不存在，已写入默认设置: {}", path);
+            // 首次运行的提示要排在「启动」行之后，否则启动块的第一行就不是启动行
+            SETTINGS_FRESH.store(true, Ordering::Release);
             d
         }
         Err(e) => {
-            eprintln!("警告: 读取 {} 失败({})，使用默认设置", path, e);
+            crate::diag::tag(
+                "警告",
+                &format!("读取 {} 失败（{}），使用默认设置", path, e),
+            );
             Settings::default()
         }
     }

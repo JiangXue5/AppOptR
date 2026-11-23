@@ -862,19 +862,38 @@ pub fn init_cpu_topo() -> CpuTopology {
         topo_degraded,
     };
 
-    crate::diag::emit(&format!(
-        "CPU 拓扑: 在线[{}] e-core[{}] p-core[{}] hp-core[{}] 依据={}{}",
-        topo.present_str,
-        topo.e_core.to_range_string(),
-        topo.p_core.to_range_string(),
-        topo.hp_core.to_range_string(),
-        topo.topo_source,
-        if topo.topo_degraded {
-            "（簇数不足，语义核心已降级映射）"
-        } else {
-            ""
+    // 分层结果直接给「哪几个核是哪一档」+ 依据，规则行随后引用这些档名
+    // 三档取不同集合的个数。降级映射时三档是同一个集合，按「非空集合数」
+    // 会算成 3 层——这正是把「本机没分层」写成「核心层 3」的原因
+    let mut uniq: Vec<String> = Vec::new();
+    for c in [topo.e_core, topo.p_core, topo.hp_core] {
+        if c.count() > 0 {
+            let s = c.to_range_string();
+            if !uniq.contains(&s) {
+                uniq.push(s);
+            }
         }
-    ));
+    }
+    let layers = uniq.len();
+    let cores = if topo.topo_degraded {
+        format!(
+            "未能分层（{}，三档同为 {}，语义核心名不生效）",
+            topo.topo_source, topo.present_str
+        )
+    } else {
+        format!(
+            "e-core {} ｜ p-core {} ｜ hp-core {} ｜ 分层依据 {} ｜ 核心层 {}",
+            topo.e_core.to_range_string(),
+            topo.p_core.to_range_string(),
+            topo.hp_core.to_range_string(),
+            topo.topo_source,
+            layers
+        )
+    };
+    crate::diag::tag(
+        "环境",
+        &format!("CPU 在线 {} ｜ {}", topo.present_str, cores),
+    );
 
     let cpuset_path = CString::new("/dev/cpuset").expect("常量字符串无 NUL");
     if unsafe { libc::access(cpuset_path.as_ptr(), libc::F_OK) } != 0 {
@@ -898,18 +917,25 @@ pub fn init_cpu_topo() -> CpuTopology {
             topo.cpuset_enabled = true;
             // 成功也要留一行：真机上「有没有接管成功」直接决定后面所有
             // 绑核行为的解释，不打印就只能靠猜
-            crate::diag::emit(&format!(
-                "cpuset: 自检通过，受管线程可迁入 {}，规则集合不再被系统组裁剪",
-                base_cpuset()
-            ));
+            crate::diag::tag(
+                "环境",
+                &format!(
+                    "cpuset 就绪 {}（受管线程可迁入，规则集合不再被系统组裁剪）",
+                    base_cpuset()
+                ),
+            );
         }
         Err(e) => {
             // 目录建得出、文件写得进，但内核不接受任务：这台设备上
             // cgroup 接管这条路是死的，早说清楚好过每分钟失败一次
-            crate::diag::emit(&format!(
-                "cpuset: 自检失败，{}，本机不接受 cgroup 接管线程；绑核只靠 sched_setaffinity，系统改动组配置时会被重置",
-                e
-            ));
+            crate::diag::tag(
+                "警告",
+                &format!(
+                    "cpuset 自检失败：{}。本机不接受 cgroup 接管线程，绑核只靠 sched_setaffinity，\
+                     系统改动组配置时会被重置",
+                    e
+                ),
+            );
         }
     }
 

@@ -94,25 +94,25 @@ pub fn ebpf_probe() -> bool {
 fn attach_tracepoint(bpf: &mut Ebpf, category: &str, name: &str, required: bool) -> bool {
     let Some(prog) = bpf.program_mut(name) else {
         if required {
-            eprintln!("eBPF: 未找到 {} 程序", name);
+            crate::diag_warn!("eBPF 未找到 {} 程序", name);
         }
         return false;
     };
     let Ok(tp): Result<&mut AyaTracePoint, _> = prog.try_into() else {
         if required {
-            eprintln!("eBPF: {} 类型转换失败", name);
+            crate::diag_warn!("eBPF {} 类型转换失败", name);
         }
         return false;
     };
     if let Err(e) = tp.load() {
         if required {
-            eprintln!("eBPF: {} 加载失败 ({})", name, e);
+            crate::diag_warn!("eBPF {} 加载失败 ({})", name, e);
         }
         return false;
     }
     if let Err(e) = tp.attach(category, name) {
         if required {
-            eprintln!("eBPF: {} 附加失败 ({})", name, e);
+            crate::diag_warn!("eBPF {} 附加失败 ({})", name, e);
         }
         return false;
     }
@@ -147,8 +147,8 @@ pub fn comm_map_init(bpf: &mut Ebpf, pkgs: &HashSet<String>, comm_capacity: u32)
     let entries = comm_keys_build(pkgs.iter());
 
     if entries.len() > comm_capacity as usize {
-        eprintln!(
-            "eBPF: 白名单容量不足（需 {} > 现 {}），触发内核端重载",
+        crate::diag_warn!(
+            "eBPF 白名单容量不足（需 {} > 现 {}），触发内核端重载",
             entries.len(),
             comm_capacity
         );
@@ -156,13 +156,13 @@ pub fn comm_map_init(bpf: &mut Ebpf, pkgs: &HashSet<String>, comm_capacity: u32)
     }
 
     let Some(map) = bpf.map_mut("TARGET_COMM_MAP") else {
-        eprintln!("eBPF: 未找到 TARGET_COMM_MAP");
+        crate::diag_warn!("eBPF 未找到 TARGET_COMM_MAP");
         return false;
     };
     let mut target_map = match AyaHashMap::<_, [u8; 15], u32>::try_from(map) {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("eBPF: TARGET_COMM_MAP 类型转换失败 ({})", e);
+            crate::diag_warn!("eBPF TARGET_COMM_MAP 类型转换失败 ({})", e);
             return false;
         }
     };
@@ -180,16 +180,16 @@ pub fn comm_map_init(bpf: &mut Ebpf, pkgs: &HashSet<String>, comm_capacity: u32)
     }
 
     if count < entries.len() {
-        eprintln!(
-            "eBPF: 白名单插入部分失败（{}/{}），触发重载",
+        crate::diag_warn!(
+            "eBPF 白名单插入部分失败（{}/{}），触发重载",
             count,
             entries.len()
         );
         return true;
     }
 
-    println!(
-        "eBPF: 白名单已配置，{} 个包名，对应 {} 条匹配规则",
+    crate::diag_say!(
+        "eBPF 白名单已配置，{} 个包名，对应 {} 条匹配规则",
         pkgs.len(),
         count
     );
@@ -245,7 +245,7 @@ fn tracepoint_parse(root: &str, category: &str, name: &str) -> Option<HashMap<St
 /// 解析本机 format 文件并注入 OFFSETS_MAP 索引 0，失败返回 false 由调用方回退 /proc
 fn offsets_inject(bpf: &mut Ebpf) -> bool {
     let Some(root) = tracefs_root() else {
-        eprintln!("eBPF: tracefs 不可用，回退到 /proc 轮询");
+        crate::diag_warn!("eBPF tracefs 不可用，回退到 /proc 轮询");
         return false;
     };
 
@@ -259,31 +259,34 @@ fn offsets_inject(bpf: &mut Ebpf) -> bool {
         })
     })();
     let Some(offsets) = offsets else {
-        eprintln!(
-            "eBPF: tracepoint format 解析失败 [{}]，回退到 /proc 轮询",
+        crate::diag_warn!(
+            "eBPF tracepoint format 解析失败 [{}]，回退到 /proc 轮询",
             root
         );
         return false;
     };
 
     let Some(map) = bpf.map_mut("OFFSETS_MAP") else {
-        eprintln!("eBPF: 未找到 OFFSETS_MAP，回退到 /proc 轮询");
+        crate::diag_warn!("eBPF 未找到 OFFSETS_MAP，回退到 /proc 轮询");
         return false;
     };
     let Ok(mut offsets_map) = AyaArray::<_, EbpfOffsets>::try_from(map) else {
-        eprintln!("eBPF: OFFSETS_MAP 类型转换失败，回退到 /proc 轮询");
+        crate::diag_warn!("eBPF OFFSETS_MAP 类型转换失败，回退到 /proc 轮询");
         return false;
     };
     if offsets_map.set(0, offsets, 0).is_err() {
-        eprintln!("eBPF: OFFSETS_MAP 注入失败，回退到 /proc 轮询");
+        crate::diag_warn!("eBPF OFFSETS_MAP 注入失败，回退到 /proc 轮询");
         return false;
     }
 
     // 这三个数都是结构体字节偏移，不是字段值。写成 `child_comm=28` 会被
     // 读成「comm 是 28」，真机上已经有人问过这是不是异常
-    println!(
-        "eBPF: tracepoint 字段偏移注入 [{}] fork(child_pid@{}B, child_comm@{}B) rename(newcomm@{}B)",
-        root, offsets.fork_child_pid, offsets.fork_child_comm, offsets.rename_newcomm
+    crate::diag_say!(
+        "eBPF tracepoint 字段偏移注入 [{}] fork(child_pid@{}B, child_comm@{}B) rename(newcomm@{}B)",
+        root,
+        offsets.fork_child_pid,
+        offsets.fork_child_comm,
+        offsets.rename_newcomm
     );
     true
 }
@@ -291,7 +294,7 @@ fn offsets_inject(bpf: &mut Ebpf) -> bool {
 /// 初始化 eBPF，加载程序 attach tracepoint 创建 RingBuf 线程，失败回退 /proc
 pub fn ebpf_init() -> Option<EbpfState> {
     if !ebpf_probe() {
-        eprintln!("eBPF: 内核不支持（缺少 BTF），回退到 /proc 轮询");
+        crate::diag_warn!("eBPF 内核不支持（缺少 BTF），回退到 /proc 轮询");
         return None;
     }
 
@@ -300,7 +303,7 @@ pub fn ebpf_init() -> Option<EbpfState> {
         .and_then(|p| p.parent().map(|p| p.join("AppOpt-ebpf")))?;
 
     if !ebpf_path.exists() {
-        eprintln!("eBPF: 未找到 {}，回退到 /proc 轮询", ebpf_path.display());
+        crate::diag_warn!("eBPF 未找到 {}，回退到 /proc 轮询", ebpf_path.display());
         return None;
     }
 
@@ -313,8 +316,8 @@ pub fn ebpf_init() -> Option<EbpfState> {
         let md = match fs::symlink_metadata(&ebpf_path) {
             Ok(m) => m,
             Err(e) => {
-                eprintln!(
-                    "eBPF: 无法检查 {} ({})，回退到 /proc 轮询",
+                crate::diag_warn!(
+                    "eBPF 无法检查 {} ({})，回退到 /proc 轮询",
                     ebpf_path.display(),
                     e
                 );
@@ -323,8 +326,8 @@ pub fn ebpf_init() -> Option<EbpfState> {
         };
         let mode = md.mode() & 0o777;
         if !md.file_type().is_file() || md.uid() != 0 || mode & 0o022 != 0 {
-            eprintln!(
-                "eBPF: {} 不安全（需 root 所有、组与其他不可写，当前 uid={} mode={:o}），拒绝加载",
+            crate::diag_warn!(
+                "eBPF {} 不安全（需 root 所有、组与其他不可写，当前 uid={} mode={:o}），拒绝加载",
                 ebpf_path.display(),
                 md.uid(),
                 mode
@@ -336,8 +339,8 @@ pub fn ebpf_init() -> Option<EbpfState> {
     let ebpf_data = match fs::read(&ebpf_path) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!(
-                "eBPF: 读取 {} 失败 ({})，回退到 /proc 轮询",
+            crate::diag_warn!(
+                "eBPF 读取 {} 失败 ({})，回退到 /proc 轮询",
                 ebpf_path.display(),
                 e
             );
@@ -346,20 +349,20 @@ pub fn ebpf_init() -> Option<EbpfState> {
     };
 
     if ebpf_data.is_empty() {
-        eprintln!("eBPF: {} 文件为空，回退到 /proc 轮询", ebpf_path.display());
+        crate::diag_warn!("eBPF {} 文件为空，回退到 /proc 轮询", ebpf_path.display());
         return None;
     }
     // 加载器只认 ELF，这里先挡掉明显不是字节码的内容
     if !ebpf_data.starts_with(b"\x7fELF") {
-        eprintln!(
-            "eBPF: {} 不是 ELF 文件，回退到 /proc 轮询",
+        crate::diag_warn!(
+            "eBPF {} 不是 ELF 文件，回退到 /proc 轮询",
             ebpf_path.display()
         );
         return None;
     }
 
-    println!(
-        "eBPF: 从 {} 加载程序 ({} bytes)",
+    crate::diag_say!(
+        "eBPF 从 {} 加载程序 ({} bytes)",
         ebpf_path.display(),
         ebpf_data.len()
     );
@@ -375,7 +378,7 @@ pub fn ebpf_init() -> Option<EbpfState> {
     let mut bpf = match loader.load(&ebpf_data) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("eBPF: 加载失败 ({})，回退到 /proc 轮询", e);
+            crate::diag_warn!("eBPF 加载失败 ({})，回退到 /proc 轮询", e);
             return None;
         }
     };
@@ -402,12 +405,12 @@ pub fn ebpf_init() -> Option<EbpfState> {
         Some(map) => match aya::maps::RingBuf::try_from(map) {
             Ok(rb) => rb,
             Err(e) => {
-                eprintln!("eBPF: EVENTS map 类型转换失败 ({})，回退到 /proc 轮询", e);
+                crate::diag_warn!("eBPF EVENTS map 类型转换失败 ({})，回退到 /proc 轮询", e);
                 return None;
             }
         },
         None => {
-            eprintln!("eBPF: 未找到 EVENTS map，回退到 /proc 轮询");
+            crate::diag_warn!("eBPF 未找到 EVENTS map，回退到 /proc 轮询");
             return None;
         }
     };
@@ -415,14 +418,14 @@ pub fn ebpf_init() -> Option<EbpfState> {
     let (tx, rx) = mpsc::channel::<EbpfProcEvent>();
     let wakeup_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
     if wakeup_fd < 0 {
-        eprintln!("eBPF: eventfd 创建失败，回退到 /proc 轮询");
+        crate::diag_warn!("eBPF eventfd 创建失败，回退到 /proc 轮询");
         return None;
     }
     let reader_thread = thread::spawn(move || {
         ebpf_reader(ring_buf, tx, wakeup_fd);
     });
 
-    println!("eBPF: 初始化成功");
+    crate::diag_say!("eBPF 初始化成功");
 
     Some(EbpfState {
         event_rx: rx,
@@ -450,7 +453,7 @@ fn ebpf_reader(
 
     let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
     if epfd < 0 {
-        eprintln!("eBPF: epoll_create1 失败");
+        crate::diag_warn!("eBPF epoll_create1 失败");
         return;
     }
 
@@ -459,7 +462,7 @@ fn ebpf_reader(
     ring_ev.events = libc::EPOLLIN as u32;
     ring_ev.u64 = 0;
     if unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, ring_fd, &mut ring_ev) } < 0 {
-        eprintln!("eBPF: epoll_ctl ADD ring_fd 失败");
+        crate::diag_warn!("eBPF epoll_ctl ADD ring_fd 失败");
         unsafe { libc::close(epfd) };
         return;
     }
@@ -468,7 +471,7 @@ fn ebpf_reader(
     wake_ev.events = libc::EPOLLIN as u32;
     wake_ev.u64 = 1;
     if unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, wakeup_fd, &mut wake_ev) } < 0 {
-        eprintln!("eBPF: epoll_ctl ADD wakeup_fd 失败");
+        crate::diag_warn!("eBPF epoll_ctl ADD wakeup_fd 失败");
         unsafe { libc::close(epfd) };
         return;
     }
@@ -512,9 +515,10 @@ fn applied_set(bpf: &mut Ebpf, tid: i32, cpus: &CpuSet) {
         return;
     };
     if let Err(e) = applied.insert(tid as u32, cpus.bits[0], 0) {
-        eprintln!(
-            "eBPF: APPLIED_MAP 插入失败 tid={} ({})，map 可能已满",
-            tid, e
+        crate::diag_warn!(
+            "eBPF APPLIED_MAP 插入失败 tid={} ({})，map 可能已满",
+            tid,
+            e
         );
     }
 }
@@ -575,7 +579,7 @@ pub fn reconcile(state: &mut EbpfState, cfg: &AppConfig) {
         return;
     }
     DROPPED_TOTAL.fetch_add(delta, Ordering::Relaxed);
-    eprintln!("eBPF: RingBuf 丢弃 {} 条事件，执行全量对账扫描", delta);
+    crate::diag_warn!("eBPF RingBuf 丢弃 {} 条事件，执行全量对账扫描", delta);
     full_scan(cfg, state);
 }
 
@@ -806,8 +810,8 @@ pub fn config_rescan(new: &AppConfig, state: &mut EbpfState) {
     state.cfg_sig = new.pkg_sig.clone();
     // 被移除的包已从缓存清掉，这里收回它们的 RT 记录
     rt::reconcile(new, &state.cache);
-    println!(
-        "eBPF: 规则增量重建 {} 个应用，移除 {} 个应用的绑定记录",
+    crate::diag_say!(
+        "eBPF 规则增量重建 {} 个应用，移除 {} 个应用的绑定记录",
         targets.len(),
         removed.len()
     );

@@ -132,10 +132,9 @@ fn instance_lock(cpuset_name: &str) -> Option<InstanceLock> {
     let file = match fs::OpenOptions::new().create(true).append(true).open(&path) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!(
-                "警告: 无法创建锁文件 {} ({})，跳过单实例检查",
-                path.display(),
-                e
+            crate::diag::tag(
+                "警告",
+                &format!("无法创建锁文件 {}（{}），跳过单实例检查", path.display(), e),
             );
             return None;
         }
@@ -146,23 +145,29 @@ fn instance_lock(cpuset_name: &str) -> Option<InstanceLock> {
             let holder = fs::read_to_string(&path).unwrap_or_default();
             let holder = holder.trim();
             if holder.is_empty() {
-                eprintln!(
-                    "错误: 已有实例在管理 cpuset 目录 {}，本进程退出",
-                    cpuset_name
+                crate::diag::tag(
+                    "失败",
+                    &format!("已有实例在管理 cpuset 目录 {}，本进程退出", cpuset_name),
                 );
             } else {
-                eprintln!(
-                    "错误: 已有实例(PID {})在管理 cpuset 目录 {}，本进程退出",
-                    holder, cpuset_name
+                crate::diag::tag(
+                    "失败",
+                    &format!(
+                        "已有实例（pid {}）在管理 cpuset 目录 {}，本进程退出",
+                        holder, cpuset_name
+                    ),
                 );
             }
-            eprintln!("提示: 如需并行请用 -b 指定不同的 cpuset 目录名");
+            crate::diag::tag("警告", "如需并行，请用 -b 指定不同的 cpuset 目录名");
             process::exit(0);
         }
-        eprintln!(
-            "警告: 锁文件 {} 加锁失败 ({})，跳过单实例检查",
-            path.display(),
-            err
+        crate::diag::tag(
+            "警告",
+            &format!(
+                "锁文件 {} 加锁失败（{}），跳过单实例检查",
+                path.display(),
+                err
+            ),
         );
         return None;
     }
@@ -185,7 +190,6 @@ fn main() {
                 i += 1;
                 if i < args.len() {
                     cli_cfg = Some(args[i].clone());
-                    println!("配置文件: {}", args[i]);
                 } else {
                     eprintln!("错误: -c 需要指定配置文件路径");
                     process::exit(1);
@@ -203,7 +207,6 @@ fn main() {
                         }
                     };
                     cli_interval = Some(val);
-                    println!("检查间隔: {} 秒", val);
                 } else {
                     eprintln!("错误: -s 需要指定时间间隔");
                     process::exit(1);
@@ -221,7 +224,6 @@ fn main() {
                         eprintln!("目录名不能为空或包含路径分隔符");
                         process::exit(1);
                     }
-                    println!("cpuset 目录名: {}", args[i]);
                 } else {
                     eprintln!("错误: -b 需要指定 cpuset 目录名");
                     process::exit(1);
@@ -258,6 +260,24 @@ fn main() {
     // 单实例锁贯穿整个运行生命周期，先于 cpuset 初始化，避免重复建目录与双份绑核
     let _instance = instance_lock(&cpuset_name);
 
+    // 启动块第一行：版本 + pid + 墙钟 + 本次真正生效的参数。
+    // 日志是追加写的，模块重启后同一文件里会有多段 [+0.0s]，只有这行能划出
+    // 「这段属于哪一次启动、用的是哪套参数」
+    crate::diag::tag(
+        "启动",
+        &format!(
+            "AppOpt v{} ｜ pid {} ｜ {} ｜ 检查间隔 {}s ｜ cpuset 组 {}",
+            env!("CARGO_PKG_VERSION"),
+            std::process::id(),
+            wall_clock(),
+            sleep_interval,
+            cpuset_name
+        ),
+    );
+    if crate::web::SETTINGS_FRESH.load(Ordering::Relaxed) {
+        crate::diag::tag("配置", "首次运行，已写入默认设置 AppOpt.json");
+    }
+
     // 锁内先恢复上次异常退出留下的 RT 时间片，避免多实例互相覆盖备份
     rt::init();
     // 正常退出（SIGTERM/SIGINT）也要还原时间片，否则只能等下次启动兜底
@@ -270,7 +290,10 @@ fn main() {
     if fs::metadata(&config_file).is_err() {
         let initial_content = "# 规则编写与使用说明请参考 http://AppOpt.suto.top\n\n";
         if fs::write(&config_file, initial_content).is_ok() {
-            println!("配置文件不存在，重建一个空的配置文件: {}", config_file);
+            crate::diag::tag(
+                "警告",
+                &format!("配置文件不存在，已重建空文件：{}", config_file),
+            );
         }
     }
 
@@ -285,7 +308,7 @@ fn main() {
     let initial_config = match load_config(&config_file, &topo, &mut tmp_mtime) {
         Some(cfg) => cfg,
         None => {
-            eprintln!("初始配置加载失败");
+            crate::diag::tag("失败", "初始配置加载失败，退出");
             process::exit(1);
         }
     };
@@ -309,7 +332,7 @@ fn main() {
             // -w 或设置恢复启用后落盘，重启保持开启
             settings_save();
         } else {
-            eprintln!("Web: 启动失败，保留原有 web_enable 设置");
+            crate::diag::tag("失败", "Web 启动失败，保留原有 web_enable 设置");
         }
     }
 
@@ -336,22 +359,15 @@ fn main() {
     let mut diag_deadline = Instant::now();
     let mut summary_deadline = Instant::now();
 
-    // 日志是追加写的，模块升级/重启会在同一个文件里留下多段 `[+0.0s]`。
-    // 只印版本号时两段无法区分，用户会把上一次启动的行当成本次的现场
-    diag::emit(&format!(
-        "启动AppOpt服务 v{}（pid {}，{}）",
-        env!("CARGO_PKG_VERSION"),
-        std::process::id(),
-        wall_clock()
-    ));
-    diag::announce();
-
     // 恢复的强制 proc 模式无需 eBPF 初始化
     let mut ebpf_state: Option<EbpfState> = if MODE_FORCE.load(Ordering::Relaxed) == 2 {
         None
     } else {
         ebpf_init()
     };
+    // 启动块收尾：所有组件就绪后才说「开始运行」，否则这条会排在 eBPF/Web
+    // 之前，读者以为它们没起来
+    diag::announce();
     // 仅自动模式失败一次即放弃；强制 eBPF 需持续重试，强制 proc 无需 eBPF
     if ebpf_state.is_none() && MODE_FORCE.load(Ordering::Relaxed) == 0 {
         EBPF_GAVE_UP.store(true, Ordering::Relaxed);
@@ -359,7 +375,7 @@ fn main() {
 
     loop {
         if SHUTDOWN.load(Ordering::Acquire) {
-            println!("收到退出信号，正在还原 RT 状态");
+            crate::diag::tag("事件", "收到退出信号，正在还原 RT 状态");
             rt::shutdown();
             break;
         }
@@ -400,13 +416,13 @@ fn main() {
 
         // 配置加载线程 panic 恢复
         if config_handle.is_finished() {
-            eprintln!("警告: 配置加载线程异常退出，尝试重启...");
+            crate::diag::tag("警告", "配置加载线程异常退出，尝试重启");
             config_handle = thread::spawn(config_loader);
         }
 
         // 强制 /proc 时卸载 eBPF 并触发全量扫描
         if mode == 2 && ebpf_state.is_some() {
-            println!("工作模式切换: /proc 轮询");
+            crate::diag::tag("事件", "工作模式切换：/proc 轮询");
             ebpf_state = None;
             let cache = proc_state.get_or_insert_with(ProcScanState::new);
             cache.request_full_scan();
@@ -422,12 +438,12 @@ fn main() {
             ebpf_retry_at = Instant::now();
             if let Some(mut new_es) = ebpf_init() {
                 if comm_map_init(&mut new_es.bpf, &cfg.pkgs, new_es.comm_capacity) {
-                    eprintln!("eBPF: 白名单容量不足，保持 /proc 轮询");
+                    crate::diag::tag("警告", "eBPF 白名单容量不足，保持 /proc 轮询");
                     if mode == 0 {
                         EBPF_GAVE_UP.store(true, Ordering::Relaxed);
                     }
                 } else {
-                    println!("工作模式切换: eBPF 事件驱动");
+                    crate::diag::tag("事件", "工作模式切换：eBPF 事件驱动");
                     full_scan(&cfg, &mut new_es);
                     ebpf_state = Some(new_es);
                     affinity_deadline = Instant::now();
@@ -458,7 +474,7 @@ fn main() {
             ebpf_state = None;
             if let Some(mut new_es) = ebpf_init() {
                 if comm_map_init(&mut new_es.bpf, &cfg.pkgs, new_es.comm_capacity) {
-                    eprintln!("eBPF: 重载后白名单容量仍不足，回退到 /proc 轮询");
+                    crate::diag::tag("警告", "eBPF 重载后白名单容量仍不足，回退到 /proc 轮询");
                     continue;
                 }
                 full_scan(&cfg, &mut new_es);
@@ -511,7 +527,7 @@ fn main() {
         }
 
         if ebpf_dead {
-            eprintln!("eBPF: 事件通道断开，回退到 /proc 轮询");
+            crate::diag::tag("警告", "eBPF 事件通道断开，回退到 /proc 轮询");
             ebpf_state = None;
             let cache = proc_state.get_or_insert_with(ProcScanState::new);
             cache.request_full_scan();
