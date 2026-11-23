@@ -1051,11 +1051,14 @@ pub fn periodic_summary(current: &SchedSnapshot) {
         }
     }
     if sysgroup > 0 {
-        // 两个数字必须同源：曾经用「最近一批的线程数」配「本周期跳过次数」，
-        // 会打出「当前 0 个线程被限定在小核（近 60 秒跳过 2 次）」
+        // 「次」指的是判定次数，不是线程数：校验每 3~5 个检查间隔跑一轮，
+        // 一轮里被挡住多少线程、一分钟跑了几轮，是两个数。
+        // 曾经把累计判定次数写成「N 个线程」，用户按这个数去数线程永远对不上
+        let now_blocked = tally.map(|t| t.blocked).unwrap_or(0);
         emit(&format!(
-            "系统分组: 近 {} 秒 {} 个线程因所在组不含目标集合被跳过（累计 {} 次判定）；\
+            "系统分组: 当前 {} 个线程被系统组限制（近 {} 秒 {} 次判定、累计 {} 次）；\
              这些线程此刻在小核上，切回前台会自动恢复，要强制绑写 @sysgroup=takeover",
+            now_blocked,
             SUMMARY_GAP.as_secs(),
             sysgroup,
             st.sysgroup_skip
