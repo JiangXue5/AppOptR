@@ -26,10 +26,58 @@ pub static CONFIG_FILE: Mutex<String> = Mutex::new(String::new());
 static RELOAD_SIG: AtomicU64 = AtomicU64::new(0);
 static RELOAD_SIG_SET: AtomicBool = AtomicBool::new(false);
 
+/// 线程规则的匹配具体度。只由 pattern 形态决定、与线程名无关，
+/// 因此可以在解析阶段预计算一次，匹配时不必比较字符串。
+///
+/// 顺序即优先级：精确 > 区间/字符类 > `?` 通配 > `*` 通配 > 包级兜底。
+/// 同档仍按原有 OR 合并——档内多条规则写的是同一类线程，取并集是用户
+/// 已经依赖的语义；跨档则只取最高档，否则「精确规则 + 通配规则」会被
+/// 并成一个谁都没写的集合
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
+pub enum MatchSpecificity {
+    /// 包级规则（无线程名），永远最后一档
+    #[default]
+    PackageFallback = 0,
+    StarWildcard = 1,
+    QuestionWildcard = 2,
+    /// 含 `[`：`Thread-[0-9]?` 的意图是「Thread- 加两位数字」，
+    /// 比 `Thread-?` 更具体，所以 `[` 优先于 `?`
+    Range = 3,
+    Exact = 4,
+}
+
+impl MatchSpecificity {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Exact => "精确",
+            Self::Range => "区间",
+            Self::QuestionWildcard => "? 通配",
+            Self::StarWildcard => "* 通配",
+            Self::PackageFallback => "包级兜底",
+        }
+    }
+}
+
+/// 按 pattern 形态定档。判定顺序有讲究：先看 `[`，再看 `*`，最后 `?`。
+/// `[0-9]*` 只算 `*` 通配（`*` 可以吞掉任意长度，具体度不再由字符类决定）
+pub fn spec_of_pattern(pattern: &str) -> MatchSpecificity {
+    if pattern.contains('*') {
+        MatchSpecificity::StarWildcard
+    } else if pattern.contains('[') {
+        MatchSpecificity::Range
+    } else if pattern.contains('?') {
+        MatchSpecificity::QuestionWildcard
+    } else {
+        MatchSpecificity::Exact
+    }
+}
+
 pub struct AffinityRule {
     pub pkg: String,
     pub thread: String,
     pub thread_pattern: CString,
+    /// 解析期算好的匹配档位，匹配时只做枚举比较
+    pub spec: MatchSpecificity,
     pub cpuset_dir: String,
     pub cpus: CpuSet,
 }
@@ -638,6 +686,7 @@ fn add_rule(
         pkg: pkg.to_string(),
         thread: thread.to_string(),
         thread_pattern: CString::new(thread).unwrap_or_default(),
+        spec: spec_of_pattern(thread),
         cpuset_dir,
         cpus: set,
     });

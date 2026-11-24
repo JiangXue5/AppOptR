@@ -312,6 +312,17 @@ impl ProcCache {
         let Some(result) = thread_affinity(pkg, thread_name, cfg) else {
             return false;
         };
+        // 只在新线程登记时说明「按哪条规则绑的」：稳态每轮都打等于刷屏
+        if !self.tasks.contains_key(&tid) {
+            crate::diag::note_rule_hit(
+                pkg,
+                thread_name,
+                result.spec,
+                result.hits,
+                &result.cpus,
+                result.hit_pattern,
+            );
+        }
 
         if !result.is_thread_rule && self.tasks.get(&tid).is_some_and(|old| old.is_thread_rule) {
             return true;

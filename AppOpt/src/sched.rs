@@ -1572,6 +1572,9 @@ mod tests {
             cpus: allowed,
             cpuset_dir: String::new(),
             is_thread_rule: true,
+            spec: crate::config::MatchSpecificity::Exact,
+            hits: 1,
+            hit_pattern: None,
         };
         let allow = [false, true, true];
         let placed = [0u16; 3];

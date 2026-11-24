@@ -167,6 +167,8 @@ struct Counters {
     /// 组归属」——某轮受管 200、回读 3，说明短路生效；回读 200 才说明
     /// PID 级缓存可能有价值。只统计不改变行为
     group_read: u64,
+    /// 本窗口打印过几条规则命中明细，仅用于限流
+    rule_hits: u64,
     /// 漂移分类计数：裁剪 / 重置 / 挪簇
     kinds: [u64; 3],
 }
@@ -190,6 +192,11 @@ struct Seen {
     /// 本窗口是否已经打过「同批线程不再逐条列出」的省略提示。
     /// 跟着 `counters.group_fix` 一起按窗口清零，否则一局之后永远不再提示
     group_fix_capped: bool,
+    /// 已经说明过「按哪条规则绑的」的 `包:线程名`。一场游戏里同名线程会成批
+    /// 出现（Thread-1…Thread-40），按名字去重才能既说清规则又不刷屏
+    rule_hit: HashSet<String>,
+    /// 本窗口是否已打过「其余规则命中不再列出」
+    rule_hit_capped: bool,
 }
 
 /// 本周期样本：给摘要的明细行用，用完即清零。
@@ -287,7 +294,8 @@ pub fn announce() {
     tag(
         "就绪",
         "运行中。格式 [+秒] 标签 内容；运行期标签：改写(外部改了亲和性) \
-         裁剪(被组裁小) 跳过(规则与所在组无交集) 失败(写不进去) 周期(每 60 秒一行汇总) 事件(S7)",
+         裁剪(被组裁小) 跳过(规则与所在组无交集) 失败(写不进去) 命中(按哪条规则绑的) \
+         周期(每 60 秒一行汇总) 事件(S7)",
     );
 }
 
@@ -1058,6 +1066,63 @@ pub fn note_group_read() {
     s.counters.group_read += 1;
 }
 
+/// 一条线程按哪条规则绑上的：档位、命中的原 pattern、是否发生同档并集、最终集合。
+///
+/// 只在「本线程第一次被登记」时调用：同一条通配规则会命中一整批线程，
+/// 按 `包:线程名` 去重 + 每窗口 8 条，既能让用户核对「为什么是这几个核」，
+/// 又不会把真正异常的行冲出屏幕。
+///
+/// 跨窗口保留去重集合：一局游戏里同名线程会重建，重新说一遍没有信息量
+pub fn note_rule_hit(
+    pkg: &str,
+    comm: &str,
+    spec: crate::config::MatchSpecificity,
+    hits: usize,
+    cpus: &CpuSet,
+    pattern: Option<&str>,
+) {
+    let mut guard = sink();
+    let Some(s) = guard.as_mut() else { return };
+    let name = if comm.is_empty() { "<包级>" } else { comm };
+    if !s.seen.rule_hit.insert(format!("{}:{}", pkg, name)) {
+        return;
+    }
+    s.counters.rule_hits += 1;
+    const DETAIL: u64 = 8;
+    if s.counters.rule_hits > DETAIL {
+        if !s.seen.rule_hit_capped {
+            s.seen.rule_hit_capped = true;
+            tag(
+                "命中",
+                "本窗口其余线程的规则命中不再逐条列出（绑定结果不受影响）",
+            );
+        }
+        return;
+    }
+    // 档位与原 pattern 分开放：`区间「Thread-[0-9]?」` 能让人一眼看出
+    // 这条线程为什么落在这个集合上，而不是只看到一个「已绑定」
+    let by = match pattern {
+        Some(p) => format!("{}「{}」", spec.label(), p),
+        None => spec.label().to_string(),
+    };
+    let merge = if hits > 1 {
+        format!("同档 {} 条取并集", hits)
+    } else {
+        "无并集".to_string()
+    };
+    tag(
+        "命中",
+        &format!(
+            "{}:{} ← {} ｜ {} ｜ 目标 {}",
+            pkg,
+            name,
+            by,
+            merge,
+            cpus.to_range_string()
+        ),
+    );
+}
+
 /// 掩码已经正确、但线程不在 `AppOpt/<目标集合>` 组里。
 ///
 /// 这是接管语义的缺口：只写 `sched_setaffinity` 不写 cpuset 时，系统在进程
@@ -1187,6 +1252,9 @@ pub fn periodic_summary(current: &SchedSnapshot) {
     let stuck = std::mem::take(&mut s.counters.stuck);
     let group_fix = std::mem::take(&mut s.counters.group_fix);
     let group_read = std::mem::take(&mut s.counters.group_read);
+    // 规则命中明细每窗口重新给 8 条：新开一局、换了应用要能看到新的依据
+    std::mem::take(&mut s.counters.rule_hits);
+    s.seen.rule_hit_capped = false;
     // 省略提示跟着窗口走：下一窗口前 3 条又能逐条打出来
     s.seen.group_fix_capped = false;
     let tally = s.tally.take();
