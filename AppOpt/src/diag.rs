@@ -1103,13 +1103,20 @@ pub fn note_render_guard(pkg: &str, comm: &str, target: &CpuSet, reason: &str) {
     if !s.seen.guard.insert(pkg.to_string()) {
         return;
     }
+    // 两种命中原因的处理方向完全不同：缺性能核要去查规则写错没有，
+    // 被裁成单核要去查线程所在组。给同一句建议会把用户带偏
+    let hint = if reason == "目标集合不含性能核" {
+        "规则没给关键线程留性能核，确认规则写的不是小核集合"
+    } else {
+        "规则本身有多个核，被线程所在的系统组裁成一个；要接管写 @sysgroup=takeover"
+    };
     let line = format!(
-        "{} 的 {} 落在 {}：{}｜护栏只观察不拦截，规则仍按此目标绑定；\
-         要放宽就改成两个核以上（如 6-7），或写 @render_guard=off",
+        "{} 的 {} 落在 {}：{}｜护栏只观察不拦截，绑定照常执行；{}",
         pkg,
         comm,
         target.to_range_string(),
-        reason
+        reason,
+        hint
     );
     tag("警告", &line);
 }
