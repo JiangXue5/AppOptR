@@ -58,8 +58,9 @@ pub struct ManagedTask {
     /// 最后一次成功写入的组目录名（空表示 base），只用于日志里说清
     /// 「从哪个集合回到哪个组」
     pub last_applied_cpuset: String,
-    /// 最后一次成功写入的亲和性。释放前拿它和当前值比对：不一致说明
-    /// 有外部力量改过，此时不动才是对的
+    /// 最后一次成功写入的亲和性。释放前拿它和当前值比对，只用于判断
+    /// 「我们在这条线程上还有没有痕迹」；不一致不代表要放手——
+    /// 系统改写亲和性是常态，该还原的仍然还原
     pub last_applied_affinity: CpuSet,
     pub owner_pkg: String,
     pub state: ManagedState,
@@ -213,7 +214,7 @@ enum Verdict {
     /// 可以释放。参数表示线程此刻是否还在我们自己的组里：
     /// 在，才需要迁回原组；不在，只恢复亲和性
     Release(bool),
-    /// 只删记录：线程没了、号被复用、已被外部接管，再动就是覆盖别人
+    /// 只删记录：线程没了、号被复用、组与亲和性都不在我们手里
     Drop(&'static str),
     /// 仍受管，不释放
     Keep,
@@ -243,31 +244,27 @@ fn judge(
         return Verdict::Drop("读不到 cgroup");
     };
     let in_own = classify_group(path) == SysGroup::Own;
-    // 亲和性是否还是我们最后写下的那个值。cpuset 不可用、或熔断期间只走了
-    // sched_setaffinity，线程根本不在我们组里——这类线程同样要能释放，
-    // 否则「只写了亲和性」就成了没人收尾的一笔账
+    // `ours` 只用来判断「我们有没有在这条线程上留下痕迹」，不再作为
+    // 「别人接管了、我们别动」的理由：本模块是唯一的绑核方，系统改写
+    // 亲和性是常态（切后台收敛、热插拔、厂商 HAL）。留下的限制一律撤销
     let ours = affinity.is_none_or(|cur| cur == rec.last_applied_affinity);
-    // 亲和性被改过就是别人在这条线程上做了决定：组在我们这里也不能硬恢复，
-    // 那会把别人的结果覆盖掉
-    if !ours {
-        return Verdict::Drop(if in_own {
-            "亲和性已被外部改写"
-        } else {
-            "组与亲和性都已被外部接管"
-        });
+    // 组与亲和性都不在我们手里：没留下任何限制，连记录一起清掉
+    if !in_own && !ours {
+        return Verdict::Drop("组与亲和性都不在我们手里");
     }
-    if !in_own {
-        // 不在我们组里，组从没被我们动过，只恢复亲和性
-        return if rec.original_affinity.count() > 0 {
-            Verdict::Release(false)
-        } else {
-            Verdict::Drop("接管前的亲和性未知")
-        };
+    if in_own {
+        // 组是我们的，规则一撤就得还。迁组时内核会按原组允许集合重算
+        // 亲和性，被系统改写过的掩码也就跟着覆盖掉了
+        if rec.original_cpuset.is_none() {
+            return Verdict::Hold("接管前的组未知");
+        }
+        return Verdict::Release(true);
     }
-    if rec.original_cpuset.is_none() {
-        return Verdict::Hold("接管前的组未知");
+    // 不在我们组里，组从没被我们动过：只把亲和性还原
+    if rec.original_affinity.count() == 0 {
+        return Verdict::Drop("接管前的亲和性未知");
     }
-    Verdict::Release(true)
+    Verdict::Release(false)
 }
 
 /// 释放结果。用计数而不是逐行日志：删掉一条包级规则可能同时放开上百个线程
@@ -314,7 +311,9 @@ fn restore(rec: &ManagedTask, in_own: bool) -> Result<(), (i32, &'static str)> {
             }
         })?;
     }
-    // 原亲和性读不到（空集合）就交给系统按组重新给，不猜一个集合写进去
+    // 原亲和性读不到（空集合）就交给系统按组重新给，不猜一个集合写进去。
+    // 读到就写：不管当前值是不是我们留下的，都按原值覆盖——系统改写过的
+    // 掩码同样要还原，这是「删除规则即解除限制」的一部分
     if rec.original_affinity.count() > 0 {
         let _ = rec.original_affinity.set_affinity(rec.identity.tid);
     }
@@ -324,7 +323,8 @@ fn restore(rec: &ManagedTask, in_own: bool) -> Result<(), (i32, &'static str)> {
 /// 释放所有「已经不受任何规则管理」的受管线程。
 ///
 /// `force` 为真时跳过规则检查（退出前调用）：规则还在，但模块要走，
-/// 线程不该留在我们的组里。身份、组归属、外部改写三项检查照做。
+/// 线程不该留在我们的组里。身份与组归属两项检查照做——这两项判断的是
+/// 「这个号还是不是那条线程」，不是「别人有没有动过它」。
 pub fn release_unmanaged(cfg: &AppConfig, force: bool) -> ReleaseReport {
     let list: Vec<ManagedTask> = with_ledger(|l| l.values().cloned().collect());
     let mut rep = ReleaseReport::default();
@@ -711,11 +711,17 @@ mod tests {
         ));
     }
 
-    /// 亲和性被外部改过（组还在）：不覆盖别人的决定
+    /// 亲和性被外部改过（组还在）：照常释放，不因「有人动过」而保留限制。
+    ///
+    /// 这里曾经返回 Drop，理由是「别覆盖别人的决定」。但系统自己也会改写
+    /// 亲和性（切后台收敛、热插拔、厂商 HAL），与第三方调度模块的写入在
+    /// 代码里无法区分；按 Drop 处理的代价是线程永久留在已经没有规则对应的
+    /// 组里——规则删了限制还在，正是 M0 要修的那个洞。
+    /// 本模块是唯一的绑核方，留下的痕迹一律撤销
     #[test]
-    fn externally_changed_affinity_blocks_release() {
+    fn rewritten_affinity_still_returns_group() {
         let r = rec(Some("/top-app"), "4-6", &set("4-6"));
-        assert!(matches!(
+        assert_eq!(
             judge(
                 &r,
                 Some(r.identity),
@@ -724,8 +730,20 @@ mod tests {
                 false,
                 false
             ),
-            Verdict::Drop(_)
-        ));
+            Verdict::Release(true)
+        );
+        // 退出时同理：模块要走，线程不能留在我们建的组里
+        assert_eq!(
+            judge(
+                &r,
+                Some(r.identity),
+                Some("/AppOpt/4-6"),
+                Some(set("0-7")),
+                true,
+                true
+            ),
+            Verdict::Release(true)
+        );
     }
 
     /// 仍匹配其他规则：不释放，交给正常流程重算目标

@@ -399,7 +399,7 @@ fn main() {
         if SHUTDOWN.load(Ordering::Acquire) {
             crate::diag::tag("事件", "收到退出信号：先释放接管，再还原 RT 状态");
             // 规则还在，但模块要走：线程不该继续留在 AppOpt/<集合> 里被限制。
-            // 身份、组归属、外部改写三项检查照做，拿不准的一律不动
+            // 身份与组归属两项检查照做，拿不准的一律不动
             if let Some(cfg) = lock_ignore_poison(&CURRENT_CONFIG).clone() {
                 crate::lifecycle::release_unmanaged(&cfg, true);
             }
