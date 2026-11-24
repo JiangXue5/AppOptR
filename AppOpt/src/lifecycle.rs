@@ -15,7 +15,7 @@ use crate::apply_affinity::{read_cmdline, tid_comm};
 use crate::config::AppConfig;
 use crate::cpuset::{CpuSet, SysGroup, attach_task, base_cpuset, classify_group, thread_cgroup};
 use crate::lock_ignore_poison;
-use crate::rule_match::thread_affinity;
+use crate::rule_match::{comm_to_pkg, thread_affinity};
 
 /// 线程身份。内核会复用 tid，只有 starttime 能把「同一个号」区分成
 /// 「同一个线程」。少了它，游戏重启后的新主线程会被当成旧线程去释放，
@@ -540,19 +540,16 @@ pub fn sweep_orphans(cfg: &AppConfig) -> OrphanReport {
             };
             // 内核在任务退出时会把 tid 从 tasks 里摘掉，读到不存在的号说明
             // 是两次读之间的窗口，跳过即可
-            if identity_of(tid).is_none() {
+            let Some(id) = identity_of(tid) else {
                 continue;
-            }
+            };
             rep.found += 1;
             let comm = tid_comm(tid).unwrap_or_default();
-            let pkg = read_cmdline(tid)
+            // 主线程的 comm 会被内核截到 15 字节，直接和包名比会漏掉长包名；
+            // `comm_to_pkg` 带截断键与属主校验，是现成的正确判据
+            let pkg = read_cmdline(id.pid)
                 .filter(|p| cfg.pkgs.contains(p))
-                .or_else(|| {
-                    cfg.pkgs
-                        .iter()
-                        .find(|p| p.as_str() == comm)
-                        .map(|p| p.to_string())
-                });
+                .or_else(|| comm_to_pkg(id.pid, &comm, cfg));
             let still = pkg
                 .as_ref()
                 .is_some_and(|p| thread_affinity(p, &comm, cfg).is_some());
