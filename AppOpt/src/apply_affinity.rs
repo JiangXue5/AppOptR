@@ -393,6 +393,48 @@ impl CpusetFail {
     }
 }
 
+/// 失败原因的分类。日志里给 `errno 22` 没有意义，读者要的是「哪一类失败」：
+/// 线程没了、组目录不在、权限不够、集合非法、还是写了但没生效
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ApplyErrorKind {
+    /// 线程已经不在。`affinity_apply` 里 ESRCH 直接转成 `Gone`（要清缓存），
+    /// 这个分类留给读回或上层判定的「线程消失」，两者处理方向不同
+    ThreadGone,
+    /// ENOENT：目标组目录不存在（组被删或挂载丢失）
+    PathMissing,
+    /// EPERM / EACCES：没有写权限
+    PermissionDenied,
+    /// EINVAL：掩码非法，或与当前有效集无交集（热插拔、组刚收紧）
+    InvalidCpuSet,
+    /// 内核返回成功但读回不一致：被 cgroup 裁掉或写进了不可调度的核
+    ReadbackMismatch,
+    /// 其余
+    Other,
+}
+
+impl ApplyErrorKind {
+    fn from_errno(errno: i32) -> Self {
+        match errno {
+            libc::ESRCH => Self::ThreadGone,
+            libc::ENOENT => Self::PathMissing,
+            libc::EPERM | libc::EACCES => Self::PermissionDenied,
+            libc::EINVAL => Self::InvalidCpuSet,
+            _ => Self::Other,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ThreadGone => "线程已退出",
+            Self::PathMissing => "组目录不存在",
+            Self::PermissionDenied => "没有写权限",
+            Self::InvalidCpuSet => "集合非法或与有效集无交集",
+            Self::ReadbackMismatch => "写入成功但未生效",
+            Self::Other => "其他错误",
+        }
+    }
+}
+
 /// 亲和性写入结果。必须把「线程已退出」和「设置失败」分开：
 /// 前者要清理状态，后者必须保留旧状态，绝不能当成迁移成功
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -401,8 +443,8 @@ pub enum AffinityOutcome {
     Set,
     /// ESRCH：线程已退出，调用方应清理缓存与调度状态
     Gone,
-    /// EPERM、EINVAL 等：亲和性未改变，调用方不得提交新状态
-    Failed,
+    /// 写入失败，附带分类。调用方按分类决定是退避、清缓存还是留给下一轮
+    Failed(ApplyErrorKind),
 }
 
 /// 写入原因。诊断需要把「规则重扫」「定期校验」「S7 迁移」分开计数，
@@ -505,14 +547,20 @@ pub fn affinity_apply(
         }
         Err(e) => {
             let errno = e.raw_os_error().unwrap_or(0);
-            if errno == libc::ESRCH {
+            let kind = ApplyErrorKind::from_errno(errno);
+            if kind == ApplyErrorKind::ThreadGone {
                 diag::note(reason, &AffinityOutcome::Gone, false);
-                (AffinityOutcome::Gone, false)
-            } else {
-                diag::note(reason, &AffinityOutcome::Failed, false);
-                diag::note_failure(tid, comm, cpus, errno);
-                (AffinityOutcome::Failed, false)
+                return (AffinityOutcome::Gone, false);
             }
+            // EINVAL 多半是热插拔或组刚收紧，而生效集合缓存还是 5 秒前的旧值。
+            // 当场作废缓存，下一轮按新值重算——不作废就要等 TTL 过期再等一个
+            // 校验周期，恢复窗口接近 11 秒
+            if kind == ApplyErrorKind::InvalidCpuSet {
+                crate::cpuset::invalidate_effective_of(tid);
+            }
+            diag::note(reason, &AffinityOutcome::Failed(kind), false);
+            diag::note_failure(tid, comm, cpus, errno);
+            (AffinityOutcome::Failed(kind), false)
         }
     }
 }
@@ -595,6 +643,8 @@ mod tests {
         let topo = CpuTopology::empty();
         let tid = self_tid();
         // 空集合对内核是非法参数（EINVAL），不会改变当前亲和性
+        // 空集合对内核是非法参数，分类必须是 InvalidCpuSet：
+        // 这一类会作废生效集合缓存，下一轮重算，不能被归到「其他」
         assert_eq!(
             affinity_apply(
                 tid,
@@ -606,7 +656,7 @@ mod tests {
                 false
             )
             .0,
-            AffinityOutcome::Failed
+            AffinityOutcome::Failed(ApplyErrorKind::InvalidCpuSet)
         );
     }
 

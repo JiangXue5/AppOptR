@@ -610,7 +610,7 @@ impl ProcCache {
                         ok_now += 1;
                     }
                 }
-                AffinityOutcome::Failed => fail_now += 1,
+                AffinityOutcome::Failed(_) => fail_now += 1,
                 // Gone 的线程本轮退出，不计入任何一档，总数里也已经被移除
                 AffinityOutcome::Gone => {}
             }

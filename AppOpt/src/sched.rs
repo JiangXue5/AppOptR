@@ -604,16 +604,17 @@ impl SchedState {
                 // 线程已退出：连状态一起清掉，避免 tid 复用时继承旧落点
                 self.threads.remove(&m.tid);
             }
-            AffinityOutcome::Failed => {
+            AffinityOutcome::Failed(kind) => {
                 self.failed += 1;
                 if let Some(st) = self.threads.get_mut(&m.tid) {
                     st.last_move = Some(Instant::now());
                 }
                 let line = format!(
-                    "S7: {}({}) 迁移到 {} 失败，保持原亲和性（详见同一时刻的绑核失败行）",
+                    "S7: {}({}) 迁移到 {} 失败（{}），保持原亲和性（详见同一时刻的绑核失败行）",
                     m.comm,
                     m.tid,
-                    cluster_label(m.target)
+                    cluster_label(m.target),
+                    kind.label()
                 );
                 diag::note_sched_failure(line);
             }
@@ -1376,7 +1377,10 @@ mod tests {
         let mv = st.tick_at(&cfg, &cache, [-1, 600, 200], now);
         assert_eq!(mv.len(), 1);
 
-        st.settle(&mv[0], AffinityOutcome::Failed);
+        st.settle(
+            &mv[0],
+            AffinityOutcome::Failed(crate::apply_affinity::ApplyErrorKind::Other),
+        );
         assert_eq!(st.moved, 0, "失败不能计入 moved");
         assert_eq!(st.failed, 1);
         let th = &st.threads[&1001];

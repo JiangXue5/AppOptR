@@ -109,18 +109,79 @@ pub fn classify_group(path: &str) -> SysGroup {
     }
 }
 
-/// 生效集合的文件名：v1 是 `cpuset.effective_cpus`，v2 是 `cpuset.cpus.effective`。
-/// 只读其中一个会让现场信息永远是 `-`，而这一格恰好是判断「不可达」的关键
-pub fn read_effective(dir: &str) -> Option<String> {
-    for name in ["cpuset.effective_cpus", "cpuset.cpus.effective"] {
+/// 生效集合是从哪种途径拿到的。
+///
+/// 「读不到导出值」和「导出值为空」是两件事：前者靠父链求交兜底，后者是
+/// 内核明确说「这组没有可运行核」。把来源写进启动行，排查时不用再猜这台
+/// 机器走的是哪条路——真机上两种布局的差异会让同一份配置表现完全不同
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EffectiveCpuSource {
+    /// cgroup v1 导出：`cpuset.effective_cpus`
+    CpusetEffectiveCpus,
+    /// cgroup v2 导出：`cpuset.cpus.effective`
+    CpusetCpusEffective,
+    /// 少数厂商内核只导出不带前缀的 `effective_cpus`
+    EffectiveCpus,
+    /// 没有任何导出值，按父链 `cpus` 求交算出来
+    FallbackCpus,
+    /// 导出值读不到、父链也求不出来
+    Unavailable,
+}
+
+impl EffectiveCpuSource {
+    /// 日志里显示的名字。写成文件名而不是枚举名，读者能直接去目录里核对
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::CpusetEffectiveCpus => "cpuset.effective_cpus",
+            Self::CpusetCpusEffective => "cpuset.cpus.effective",
+            Self::EffectiveCpus => "effective_cpus",
+            Self::FallbackCpus => "父链 cpus 求交",
+            Self::Unavailable => "不可用",
+        }
+    }
+
+    /// 是否来自内核导出。父链求交在「子组 cpus 超出父组」时结果一致，
+    /// 但父组文件缺失或只读时可能算偏，日志里要能区分
+    pub fn exported(self) -> bool {
+        matches!(
+            self,
+            Self::CpusetEffectiveCpus | Self::CpusetCpusEffective | Self::EffectiveCpus
+        )
+    }
+}
+
+/// 探测顺序。`effective_cpus` 放最后：v2 没有这个文件，v1 也不会同时导出
+/// 两个，放在后面只是多一次失败的 open，不会读错
+const EFFECTIVE_FILES: [(&str, EffectiveCpuSource); 3] = [
+    (
+        "cpuset.effective_cpus",
+        EffectiveCpuSource::CpusetEffectiveCpus,
+    ),
+    (
+        "cpuset.cpus.effective",
+        EffectiveCpuSource::CpusetCpusEffective,
+    ),
+    ("effective_cpus", EffectiveCpuSource::EffectiveCpus),
+];
+
+/// 读导出值并说明来源。空文件按「没导出」处理：v1 的空 effective 表示
+/// 该组没有可运行核，让父链求交去给出同样的空结果，归因更准
+pub fn read_effective_with_source(dir: &str) -> Option<(String, EffectiveCpuSource)> {
+    for (name, src) in EFFECTIVE_FILES {
         if let Ok(s) = fs::read_to_string(format!("{}/{}", dir, name)) {
             let t = s.trim();
             if !t.is_empty() {
-                return Some(t.to_string());
+                return Some((t.to_string(), src));
             }
         }
     }
     None
+}
+
+/// 生效集合的文件名：v1 是 `cpuset.effective_cpus`，v2 是 `cpuset.cpus.effective`。
+/// 只读其中一个会让现场信息永远是 `-`，而这一格恰好是判断「不可达」的关键
+pub fn read_effective(dir: &str) -> Option<String> {
+    read_effective_with_source(dir).map(|(v, _)| v)
 }
 
 /// 读一层的 CPU 集合，返回（内容，是否 v2 布局）。
@@ -198,11 +259,19 @@ pub fn group_effective(path: &str) -> Option<String> {
 /// 现场打印与组判定必须走同一个口子：一边只读导出文件、另一边按父链求交，
 /// 同一个「现场」里就会出现「目标 effective=-，线程组却是 0-7」这种对不上的画面
 pub fn effective_at(dir: &str) -> Option<String> {
+    effective_at_with_source(dir).map(|(v, _)| v)
+}
+
+/// 同 `effective_at`，额外带回来源。父链求交成功但导出值缺失时，
+/// 调用方需要知道这个结果不是内核给的，诊断里要写清
+pub fn effective_at_with_source(dir: &str) -> Option<(String, EffectiveCpuSource)> {
     let d = dir.trim_end_matches('/');
-    if let Some(eff) = read_effective(d) {
-        return Some(eff);
+    if let Some(v) = read_effective_with_source(d) {
+        return Some(v);
     }
-    effective_by_walk("/dev/cpuset", &cgroup_rel(d)).filter(|s| !s.is_empty())
+    effective_by_walk("/dev/cpuset", &cgroup_rel(d))
+        .filter(|s| !s.is_empty())
+        .map(|s| (s, EffectiveCpuSource::FallbackCpus))
 }
 
 /// 组目录自己的 `cpus` 原文，不做父链求交。
@@ -272,6 +341,24 @@ pub fn group_effective_cached(path: &str) -> Option<String> {
         m.insert(path.to_string(), (now, v.clone()));
     }
     v
+}
+
+/// 作废某个组的生效集合缓存。热插拔、组收紧、EINVAL 之后必须重读：
+/// 缓存里的旧值会让同一轮判定反复落在「规则可达」上，写入却一直被拒
+pub fn invalidate_effective(path: &str) {
+    if let Ok(mut g) = EFF_CACHE.write()
+        && let Some(m) = g.as_mut()
+    {
+        m.remove(path);
+    }
+}
+
+/// 作废某线程**所在组**的缓存。写入失败时连组路径都要重读：
+/// 线程可能刚被系统搬进另一个组，缓存的还是搬家前那个组的生效集合
+pub fn invalidate_effective_of(tid: i32) {
+    if let Some(path) = thread_cgroup(tid) {
+        invalidate_effective(&path);
+    }
 }
 
 const _: () = assert!(std::mem::size_of::<CpuSet>() == std::mem::size_of::<libc::cpu_set_t>());
@@ -974,13 +1061,28 @@ pub fn init_cpu_topo() -> CpuTopology {
     match probe_cpuset(&base_cpuset()) {
         Ok(()) => {
             topo.cpuset_enabled = true;
+            // 生效集合来自导出文件还是父链求交，决定了后面所有「组上限」
+            // 判断的可信度。真机上两种布局的解释完全不同，启动时就说清
+            let eff_src = ["/dev/cpuset/top-app", "/dev/cpuset"]
+                .iter()
+                .find_map(|d| effective_at_with_source(d).map(|(_, s)| s))
+                .unwrap_or(EffectiveCpuSource::Unavailable);
+            // 来源决定「组上限」判断的可信度：导出值是内核当面给的，
+            // 父链求交是我们按定义算的，读不到就只能退化直写
+            let eff_note = match eff_src {
+                EffectiveCpuSource::Unavailable => "（读不到，组可达性判定退化为直写）",
+                s if !s.exported() => "（按父链求交，非内核导出）",
+                _ => "",
+            };
             // 成功也要留一行：真机上「有没有接管成功」直接决定后面所有
             // 绑核行为的解释，不打印就只能靠猜
             crate::diag::tag(
                 "环境",
                 &format!(
-                    "cpuset 可用 {} ｜ 自检通过（tasks 可写）｜ respect 下只迁「组内能凑出规则核」的线程，后台组不硬抢",
-                    base_cpuset()
+                    "cpuset 可用 {} ｜ 自检通过（tasks 可写）｜ 生效集合来源 {}{} ｜ respect 下只迁「组内能凑出规则核」的线程，后台组不硬抢",
+                    base_cpuset(),
+                    eff_src.label(),
+                    eff_note
                 ),
             );
         }
@@ -1350,6 +1452,69 @@ mod tests {
         fs::remove_file(dir.join("cpuset.cpus.effective")).unwrap();
         assert_eq!(read_effective(dir.to_str().unwrap()), None);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 三种布局各自能被认出来，且顺序是 v1 → v2 → 裸名。
+    ///
+    /// 顺序不是随便定的：同一个目录里同时存在两种文件只可能是内核在过渡期
+    /// 双写，此时 v1 的值才是内核真正用来计算的那个。裸名 `effective_cpus`
+    /// 放最后，避免某些 ROM 的无关文件被当成效生集合
+    #[test]
+    fn effective_source_names_three_layouts_in_order() {
+        let dir = std::env::temp_dir().join(format!("ao_effsrc_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_str().unwrap();
+
+        // 只有 v1
+        fs::write(dir.join("cpuset.effective_cpus"), "0-3\n").unwrap();
+        assert_eq!(
+            read_effective_with_source(d),
+            Some(("0-3".to_string(), EffectiveCpuSource::CpusetEffectiveCpus))
+        );
+
+        // v1 + v2 同时存在：v1 优先
+        fs::write(dir.join("cpuset.cpus.effective"), "4-7\n").unwrap();
+        assert_eq!(
+            read_effective_with_source(d).map(|(_, s)| s),
+            Some(EffectiveCpuSource::CpusetEffectiveCpus)
+        );
+
+        // 只剩 v2
+        fs::remove_file(dir.join("cpuset.effective_cpus")).unwrap();
+        assert_eq!(
+            read_effective_with_source(d),
+            Some(("4-7".to_string(), EffectiveCpuSource::CpusetCpusEffective))
+        );
+
+        // 只剩裸名
+        fs::remove_file(dir.join("cpuset.cpus.effective")).unwrap();
+        fs::write(dir.join("effective_cpus"), "6-7\n").unwrap();
+        assert_eq!(
+            read_effective_with_source(d),
+            Some(("6-7".to_string(), EffectiveCpuSource::EffectiveCpus))
+        );
+
+        // 空文件算「没导出」，不能返回空串——空串会被当成「该组无核」，
+        // 与「读不到」的处理方向相反
+        fs::write(dir.join("effective_cpus"), "  \n").unwrap();
+        assert_eq!(read_effective_with_source(d), None);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 来源的可读名与「是否内核导出」两件事都要对：父链求交的结果
+    /// 与导出值在子组越界时可能不同，日志里必须能区分
+    #[test]
+    fn effective_source_labels_are_distinguishable() {
+        assert_eq!(
+            EffectiveCpuSource::CpusetEffectiveCpus.label(),
+            "cpuset.effective_cpus"
+        );
+        assert!(EffectiveCpuSource::CpusetCpusEffective.exported());
+        assert!(EffectiveCpuSource::EffectiveCpus.exported());
+        assert!(!EffectiveCpuSource::FallbackCpus.exported());
+        assert!(!EffectiveCpuSource::Unavailable.exported());
     }
 
     /// 回收判定只放行「无引用 + tasks 为空」的目录：有线程驻留的目录一旦被删，

@@ -336,7 +336,7 @@ pub fn note(reason: ApplyReason, outcome: &crate::apply_affinity::AffinityOutcom
             }
         }
         crate::apply_affinity::AffinityOutcome::Gone => s.stats.gone += 1,
-        crate::apply_affinity::AffinityOutcome::Failed => {}
+        crate::apply_affinity::AffinityOutcome::Failed(_) => {}
     }
 }
 
@@ -344,6 +344,13 @@ pub fn note(reason: ApplyReason, outcome: &crate::apply_affinity::AffinityOutcom
 /// errno 不同则各打一次，能看到「一会儿 EINVAL 一会儿 EPERM」这种混合原因
 pub fn note_failure(tid: i32, comm: &str, want: &CpuSet, errno: i32) {
     let hint = errno_hint(errno);
+    // EINVAL 时调用方已经作废了该组的生效集合缓存。这句话必须出现在日志里：
+    // 否则读者以为要手动改规则，实际下一轮就会按新值重算
+    let hint = if errno == libc::EINVAL {
+        format!("{hint}（已作废该组生效集合缓存，下一轮重算后再试）")
+    } else {
+        hint
+    };
     let line = if comm.is_empty() {
         format!(
             "绑核失败: tid {} → {}（{}）",

@@ -3,7 +3,7 @@ use std::fs;
 use std::time::{Duration, Instant};
 
 use crate::apply_affinity::{
-    AffinityOutcome, pkg_owned, proc_walk, read_cmdline, task_tids, tid_comm,
+    AffinityOutcome, ApplyErrorKind, pkg_owned, proc_walk, read_cmdline, task_tids, tid_comm,
 };
 use crate::cache::ProcCache;
 use crate::config::AppConfig;
@@ -145,7 +145,7 @@ fn recheck_names(cfg: &AppConfig, state: &mut ProcScanState) {
         if state
             .cache
             .task_apply(tid, pid, &pkg, &comm, cfg, |_, _, _, _, _| {
-                AffinityOutcome::Failed
+                AffinityOutcome::Failed(ApplyErrorKind::Other)
             })
         {
             changed += 1;
@@ -233,7 +233,7 @@ fn proc_tasks(
         let ok = state
             .cache
             .task_apply(tid, pid, pkg, &thread_name, cfg, |_, _, _, _, _| {
-                AffinityOutcome::Failed
+                AffinityOutcome::Failed(ApplyErrorKind::Other)
             });
         if ok {
             if let Some(e) = state.cache.tasks.get(&tid) {

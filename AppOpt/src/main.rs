@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::apply_affinity::{AffinityOutcome, ApplyReason, affinity_apply};
+use crate::apply_affinity::{AffinityOutcome, ApplyErrorKind, ApplyReason, affinity_apply};
 use crate::config::{
     AppConfig, CHECK_INTERVAL, CONFIG_FILE, CURRENT_CONFIG, SchedMode, config_loader, init_inotify,
     load_config,
@@ -669,7 +669,7 @@ fn main() {
                     let outcome = match (&mut ebpf_state, &mut proc_state) {
                         (Some(es), _) => apply_move_ebpf(es, &cfg, m),
                         (None, Some(ps)) => apply_move_proc(ps, &cfg, m),
-                        _ => AffinityOutcome::Failed,
+                        _ => AffinityOutcome::Failed(ApplyErrorKind::Other),
                     };
                     // 只有内核确认写入成功，settle 才会提交落点与 moved
                     sched_state.settle(m, outcome);
@@ -751,7 +751,7 @@ fn apply_move_ebpf(es: &mut EbpfState, cfg: &AppConfig, m: &sched::Move) -> Affi
             // 读回不一致就不能记落点——定期校验会按一个内核根本不接受的集合维持，
             // S7 又把「回读不一致」当成被规则拉回，每轮重置状态再迁一次
             if CpuSet::get_affinity(m.tid).is_some_and(|a| a != m.cpus) {
-                return AffinityOutcome::Failed;
+                return AffinityOutcome::Failed(ApplyErrorKind::ReadbackMismatch);
             }
             // 同步缓存：affinity_sync 每 3*interval 秒会按 entry.cpus 重设，
             // 不改这里，迁移结果几秒后就被拉回规则值
@@ -769,7 +769,7 @@ fn apply_move_ebpf(es: &mut EbpfState, cfg: &AppConfig, m: &sched::Move) -> Affi
             es.cache.task_gone(m.tid);
             AffinityOutcome::Gone
         }
-        AffinityOutcome::Failed => AffinityOutcome::Failed,
+        AffinityOutcome::Failed(kind) => AffinityOutcome::Failed(kind),
     }
 }
 
@@ -787,7 +787,7 @@ fn apply_move_proc(ps: &mut ProcScanState, cfg: &AppConfig, m: &sched::Move) -> 
     {
         AffinityOutcome::Set => {
             if CpuSet::get_affinity(m.tid).is_some_and(|a| a != m.cpus) {
-                return AffinityOutcome::Failed;
+                return AffinityOutcome::Failed(ApplyErrorKind::ReadbackMismatch);
             }
             if let Some(e) = ps.cache.tasks.get_mut(&m.tid) {
                 e.cpus = m.cpus;
@@ -800,7 +800,7 @@ fn apply_move_proc(ps: &mut ProcScanState, cfg: &AppConfig, m: &sched::Move) -> 
             ps.cache.task_gone(m.tid);
             AffinityOutcome::Gone
         }
-        AffinityOutcome::Failed => AffinityOutcome::Failed,
+        AffinityOutcome::Failed(kind) => AffinityOutcome::Failed(kind),
     }
 }
 
