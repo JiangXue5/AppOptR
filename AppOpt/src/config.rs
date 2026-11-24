@@ -187,9 +187,6 @@ pub struct AppConfig {
     /// 息屏时放松周期复核：`@screen=relax` 打开。只降低「复查频率」，
     /// 不影响新线程的首次绑定；息屏判定本身不依赖该开关
     pub screen_relax: bool,
-    /// 渲染护栏（观察模式）：关键线程被绑到没有性能核的集合时只记数，
-    /// 不改绑定。用于先拿真机数据，再决定是否值得拦截
-    pub render_guard_observe: bool,
     /// 接管组归属：掩码已正确、但线程还在系统组里时补写一次 cpuset。
     /// `@group=mask` 可退回 2.6.1 的行为（只写 sched_setaffinity）。
     ///
@@ -245,7 +242,6 @@ impl AppConfig {
             sched_pkgs: HashSet::new(),
             sched: SchedMode::Off,
             screen_relax: false,
-            render_guard_observe: false,
             group_own: true,
             rt: RtConfig::default(),
             topo: CpuTopology::empty(),
@@ -301,7 +297,6 @@ fn build_policy_sig(
     sysgroup_respect: bool,
     sched: SchedMode,
     screen_relax: bool,
-    render_guard_observe: bool,
     group_own: bool,
     rt: &RtConfig,
 ) -> u64 {
@@ -312,8 +307,6 @@ fn build_policy_sig(
     // 息屏放松只影响复查节奏，但切换时要让主循环立即按新策略排下一次复查，
     // 所以也进指纹；否则改了这一行要等下一次规则变化才生效
     screen_relax.hash(&mut h);
-    // 护栏开关只影响诊断，但开关本身要让规则重扫一次，否则改了不生效
-    render_guard_observe.hash(&mut h);
     // 接管开关决定要不要补组，切换时必须整轮重扫，否则已绑的线程还留在
     // 系统组里，用户看不到任何变化
     group_own.hash(&mut h);
@@ -837,11 +830,13 @@ pub fn load_config(
     let mut sched = SchedMode::Off;
     // 息屏放松默认关：默认行为必须与 2.6.1 完全一致
     let mut screen_relax = false;
-    // 渲染护栏默认关：打开也只观察，不改变任何绑定
-    let mut render_guard_observe = false;
     // 补组默认开：这是修接管语义的缺口，不是可选增强。出问题时用
     // `@group=mask` 退回「只写掩码」的 2.6.1 行为
     let mut group_own = true;
+    // `@render_guard` 在 2.7.0-beta5 移除（判据长期无有效命中）。用户是通过
+    // WebUI 打开的，配置文件里还留着这一行；直接判「格式无效」等于把一个
+    // 官方功能的下线变成他的错误，所以这里只吞掉并提示一次
+    let mut legacy_render_guard = false;
     let mut rt = RtConfig::default();
     // 分应用条目先收集原文，等 @rt.max 解析完再统一构造，避免配置行顺序影响缺省上限
     let mut rt_apps: Vec<String> = Vec::new();
@@ -875,8 +870,8 @@ pub fn load_config(
                 ("sched", "on") => sched = SchedMode::On,
                 ("screen", "off") => screen_relax = false,
                 ("screen", "relax") => screen_relax = true,
-                ("render_guard", "off") => render_guard_observe = false,
-                ("render_guard", "observe") => render_guard_observe = true,
+                // 已下线的开关：不报格式错误，只置位等构建完统一提示
+                ("render_guard", _) => legacy_render_guard = true,
                 ("group", "own") => group_own = true,
                 ("group", "mask") => group_own = false,
                 ("rt", "off") => rt.scope = RtScope::Off,
@@ -1015,6 +1010,14 @@ pub fn load_config(
     *last_mtime = mtime;
     PARSE_FAILS.store(fail_cnt, Ordering::Relaxed);
 
+    // 不静默吞掉：用户得知道这行已经不起作用，否则会以为护栏还开着
+    if legacy_render_guard {
+        crate::diag::tag(
+            "配置",
+            "@render_guard 已在 2.7.0 移除（判据长期无有效命中），本行忽略，可以从配置里删掉",
+        );
+    }
+
     let pkgs: HashSet<String> = rules.iter().map(|r| r.pkg.clone()).collect();
     let has_thread_rules: HashSet<String> = rules
         .iter()
@@ -1030,7 +1033,6 @@ pub fn load_config(
         sysgroup_respect,
         sched,
         screen_relax,
-        render_guard_observe,
         group_own,
         &rt,
     );
@@ -1121,9 +1123,6 @@ pub fn load_config(
     if screen_relax {
         extra.push("息屏=relax（复核降到 60 秒）".to_string());
     }
-    if render_guard_observe {
-        extra.push("护栏=observe（只计数不改绑定）".to_string());
-    }
     if !group_own {
         extra.push("接管组=mask（只写掩码，退回 2.6.1）".to_string());
     }
@@ -1204,7 +1203,6 @@ pub fn load_config(
         sched_pkgs,
         sched,
         screen_relax,
-        render_guard_observe,
         group_own,
         rt,
         topo: topo.clone(),
@@ -1598,15 +1596,20 @@ mod tests {
         assert_eq!(bad.rules.len(), 1);
     }
 
+    /// `@render_guard` 已下线，但用户的配置里可能还留着（当初是从 WebUI 开的）。
+    /// 必须吞掉而不是判格式错误，否则功能下线会变成用户配置里的红字
     #[test]
-    fn render_guard_directive_is_observe_only() {
-        let base = cfg_of("rg_off", "com.a=0-1\n");
-        assert!(!base.render_guard_observe, "不写 @render_guard 必须保持关");
-        let on = cfg_of("rg_obs", "@render_guard=observe\ncom.a=0-1\n");
-        assert!(on.render_guard_observe);
-        // 打开后规则本身不变，只是多了诊断
-        assert_eq!(on.rules.len(), 1);
-        assert_ne!(base.policy_sig, on.policy_sig, "开关变化要触发重扫");
+    fn removed_render_guard_directive_is_ignored() {
+        let c = cfg_of(
+            "rg_legacy",
+            "@render_guard=observe\ncom.a {\n  UnityMain=7\n}\n",
+        );
+        assert_eq!(c.rules.len(), 1, "块里那条线程规则照常解析");
+        assert_eq!(
+            PARSE_FAILS.load(Ordering::Relaxed),
+            0,
+            "下线的开关不能算格式无效"
+        );
     }
 
     /// 补组默认开（修接管语义），`@group=mask` 是逃生口。

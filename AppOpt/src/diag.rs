@@ -180,9 +180,6 @@ struct Seen {
     /// 已经解释过「多出来的核是谁写的」的读回集合。跨周期保留：
     /// `4-7` 这种超集只会有一两种来源，重复解释等于每 60 秒说一遍同样的话
     reset_why: HashSet<String>,
-    /// 已经提示过渲染护栏的包。按包去重：一个包通常只有一个渲染线程，
-    /// 但线程重建会换 tid，按 tid 去重会反复刷同一句话
-    guard: HashSet<String>,
     /// 已经解释过「补写组归属」的线程名。按线程名去重：同名的游戏主线程
     /// 每局都会重建，按 tid 去重等于每局说一遍
     group_fix: HashSet<String>,
@@ -240,8 +237,6 @@ struct Sink {
     /// 自启动以来是否成功接管过线程。用来区分「游戏还没开」与「进程退出了」，
     /// 两者的处理动作相反
     ever_bound: bool,
-    /// 本周期渲染护栏命中：包 → 次数。护栏只观察，计数是唯一的产出
-    guard_hits: HashMap<String, u32>,
     /// tid → (所属包, 是否进程主线程)。线程名常常和包名毫无关系
     /// （`HWC release`、`dns-work-0`），只印线程名时用户无法判断模块有没有
     /// 管到规则外的进程；主线程的 comm 会被内核截到 15 字节，日志里
@@ -271,7 +266,6 @@ fn sink() -> std::sync::MutexGuard<'static, Option<Sink>> {
         tally: None,
         blocked_note: None,
         ever_bound: false,
-        guard_hits: HashMap::new(),
         thread_pkg: HashMap::new(),
     });
     guard
@@ -1092,35 +1086,6 @@ pub fn note_group_fix(tid: i32, dir: &str, comm: &str) {
     );
 }
 
-/// 渲染护栏命中（观察模式）：关键线程的目标集合里没有性能核，或只剩一个核。
-///
-/// 只记数、每个包提示一次，**不改变任何绑定**。先攒真机数据：把渲染线程
-/// 放到小核是否真的掉帧，要看卡顿采样的前后对比，不能凭直觉直接拦
-pub fn note_render_guard(pkg: &str, comm: &str, target: &CpuSet, reason: &str) {
-    let mut guard = sink();
-    let Some(s) = guard.as_mut() else { return };
-    *s.guard_hits.entry(pkg.to_string()).or_insert(0) += 1;
-    if !s.seen.guard.insert(pkg.to_string()) {
-        return;
-    }
-    // 两种命中原因的处理方向完全不同：缺性能核要去查规则写错没有，
-    // 被裁成单核要去查线程所在组。给同一句建议会把用户带偏
-    let hint = if reason == "目标集合不含性能核" {
-        "规则没给关键线程留性能核，确认规则写的不是小核集合"
-    } else {
-        "规则本身有多个核，被线程所在的系统组裁成一个；要接管写 @sysgroup=takeover"
-    };
-    let line = format!(
-        "{} 的 {} 落在 {}：{}｜护栏只观察不拦截，绑定照常执行；{}",
-        pkg,
-        comm,
-        target.to_range_string(),
-        reason,
-        hint
-    );
-    tag("警告", &line);
-}
-
 /// 比较一次在线 CPU 集合，变化说明发生了热插拔。
 /// cpuset 会在这个时机重算 effective_cpus 并重置组内线程的亲和性，
 /// 这是「刚才绑住了、过一会儿又散了」最常见的成因
@@ -1204,33 +1169,8 @@ pub fn periodic_summary(current: &SchedSnapshot) {
     let group_fix = std::mem::take(&mut s.counters.group_fix);
     // 省略提示跟着窗口走：下一窗口前 3 条又能逐条打出来
     s.seen.group_fix_capped = false;
-    let guards = std::mem::take(&mut s.guard_hits);
     let tally = s.tally.take();
     let prev = s.last_snap.replace(current.clone());
-
-    // 护栏只有计数没有动作，单独一行放最前：它是「你可能想改规则」的提示，
-    // 不是故障，混在失败里会让人以为绑定出错了
-    if !guards.is_empty() {
-        let total: u32 = guards.values().sum();
-        let mut top: Vec<(String, u32)> = guards.into_iter().collect();
-        top.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        let list = top
-            .iter()
-            .take(3)
-            .map(|(p, c)| format!("{} {}", p, c))
-            .collect::<Vec<_>>()
-            .join("、");
-        tag(
-            "警告",
-            &format!(
-                "渲染护栏（观察）近 {} 秒命中 {} 次：{}{}",
-                SUMMARY_GAP.as_secs(),
-                total,
-                list,
-                if top.len() > 3 { " 等" } else { "" }
-            ),
-        );
-    }
 
     // 补组是「第一次接管」的一次性动作，通常在启动或规则变更那一分钟出现，
     // 之后归零。单列一行是为了让用户确认它发生过，而不是被当成故障反复解释

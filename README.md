@@ -52,7 +52,6 @@ http://appopt.suto.top
 | `@unmatched` | `keep` / `all` | `keep` | 包内有线程规则但某线程未命中、且包无包级规则时的行为。`keep` 保持该线程原有亲和性；`all` 沿用 2.2.x 行为设为全部核心。 |
 | `@sched` | `off` / `shadow` / `on` | `off` | S7 负载感知：`shadow` 只判定不迁移，`on` 才真正改亲和性。 |
 | `@screen` | `off` / `relax` | `off` | 息屏时放松周期复核。`relax` 把已绑定线程的复查从每 3/5 个 interval 降到 60 秒，并暂停 S7 与卡顿采样；新线程的首次绑定不受影响。 |
-| `@render_guard` | `off` / `observe` | `off` | 渲染护栏（只观察）。`observe` 下，若 `RenderThread` 等关键线程的目标集合不含性能核、或只剩一个核，按包记一次数并提示一行，**不改变绑定**。 |
 | `@rt` | `off` / `global` / `per_app` | `off` | RT 调度范围。`global` 对全部受管应用生效，`per_app` 只对 `@rt.app` 里显式开启的包生效。 |
 | `@rt.max` | 1–8 | `2` | 每应用最多提升多少个线程。 |
 | `@rt.timeslice` | 1–100 | `3` | RR 时间片（毫秒），全局内核参数，仅在至少一个应用启用时写入。 |

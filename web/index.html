@@ -273,15 +273,6 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div class="hint">在「规则」页点应用右侧的 <b style="color:var(--orange)">RT</b> 按钮即可开启，参数固定为 AsoulOpt 默认：自动挑选 Critical 线程、每应用最多 2 个、RR 时间片 3 ms。全部关闭后内核时间片自动还原。RT 只在该应用的允许核心不超过 2 个时生效。</div>
 </div>
 <div class="card">
-<div class="card-title">渲染护栏</div>
-<div class="seg" id="seg-render">
-<button data-key="render_guard" data-val="off" data-on="0">关闭</button>
-<button data-key="render_guard" data-val="observe" data-on="1">观察</button>
-</div>
-<div class="hint" id="c-render-state">-</div>
-<div class="hint">关键线程（<span class="mono">RenderThread</span>、<span class="mono">UnityMain</span> 等）被绑到不含性能核、或只剩一个核的集合时，在日志里按包记数并提示一次，<b>不改变任何绑定</b>。先用它确认「这条规则是不是把渲染线程关进了小核」，再决定要不要改规则。只有线程级规则能判定，包级规则没有线程名。</div>
-</div>
-<div class="card">
 <div class="card-title">系统分组</div>
 <div class="seg" id="seg-sysgroup">
 <button data-sysgroup="respect">尊重</button>
@@ -928,11 +919,6 @@ async function loadCfg(){
     $('c-screen-state').textContent=sc==='relax'
       ?'当前：开启 · 息屏后复查降到 60 秒，S7 与卡顿采样暂停'
       :'当前：关闭 · 息屏与亮屏按同一节奏复核';
-    const rgd=d.render_guard==='observe'?'observe':'off';
-    setSeg('seg-render',rgd);
-    $('c-render-state').textContent=rgd==='observe'
-      ?'当前：观察中 · 只记数与提示，不改任何绑定'
-      :'当前：关闭 · 不做护栏判定';
     const gp=d.group==='mask'?'mask':'own';
     setSeg('seg-group',gp);
     $('c-group-state').textContent=gp==='own'
@@ -991,7 +977,6 @@ function bindBehavior(id,onText,offText){
   });
 }
 bindBehavior('seg-screen','已开启息屏放松','已关闭息屏放松');
-bindBehavior('seg-render','已开启渲染护栏（仅观察）','已关闭渲染护栏');
 bindBehavior('seg-group','已改为接管组归属','已改为只写掩码（退回 2.6.1）');
 
 async function saveField(body){

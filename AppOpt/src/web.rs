@@ -1000,11 +1000,6 @@ fn config_json() -> String {
     } else {
         "off"
     };
-    let render_guard = if cfg.as_ref().is_some_and(|c| c.render_guard_observe) {
-        "observe"
-    } else {
-        "off"
-    };
     let group = match cfg.as_ref() {
         Some(c) if !c.group_own => "mask",
         _ => "own",
@@ -1038,7 +1033,6 @@ fn config_json() -> String {
         "rt_timeslice": rt_ts,
         "sysgroup": sysgroup,
         "screen": screen,
-        "render_guard": render_guard,
         "group": group,
         "sched_mode": sched_mode,
         "sched_state": s_state,
@@ -1382,7 +1376,7 @@ fn sched_api(req: &Request) -> (u16, String) {
     }
 }
 
-/// 行为开关：`@screen`、`@render_guard`、`@group`。一次只改一个键，
+/// 行为开关：`@screen`、`@group`。一次只改一个键，
 /// 与 `@sched` 走同一条路径（写盘 → 立即重载），改完日志里的策略行会自证
 fn behavior_api(req: &Request) -> (u16, String) {
     let Ok(v) = serde_json::from_slice::<Value>(&req.body) else {
@@ -1390,7 +1384,6 @@ fn behavior_api(req: &Request) -> (u16, String) {
     };
     let key = match v["key"].as_str() {
         Some("screen") => BehaviorKey::Screen,
-        Some("render_guard") => BehaviorKey::RenderGuard,
         Some("group") => BehaviorKey::Group,
         Some(_) => return err_json(400, "未知的开关名"),
         None => return err_json(400, "缺少 key 字段"),

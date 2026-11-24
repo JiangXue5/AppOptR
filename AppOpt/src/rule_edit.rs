@@ -634,8 +634,6 @@ pub fn sched_set(path: &str, mode: &str) -> RuleEdit {
 pub enum BehaviorKey {
     /// 息屏时放松周期复核
     Screen,
-    /// 渲染护栏（观察模式）
-    RenderGuard,
     /// 首次绑定是否接管 cpuset 组
     Group,
 }
@@ -644,7 +642,6 @@ impl BehaviorKey {
     fn name(self) -> &'static str {
         match self {
             BehaviorKey::Screen => "screen",
-            BehaviorKey::RenderGuard => "render_guard",
             BehaviorKey::Group => "group",
         }
     }
@@ -656,8 +653,6 @@ impl BehaviorKey {
         match (self, on) {
             (BehaviorKey::Screen, true) => "relax",
             (BehaviorKey::Screen, false) => "off",
-            (BehaviorKey::RenderGuard, true) => "observe",
-            (BehaviorKey::RenderGuard, false) => "off",
             (BehaviorKey::Group, true) => "own",
             (BehaviorKey::Group, false) => "mask",
         }
@@ -888,9 +883,9 @@ mod tests {
         assert_eq!(out.matches("@screen=").count(), 1, "同键只能留一行: {out}");
         assert!(out.contains("@screen=relax"));
 
-        // 三个键的取值映射
+        // 两个键的取值映射
         assert_eq!(BehaviorKey::Screen.value(true), "relax");
-        assert_eq!(BehaviorKey::RenderGuard.value(true), "observe");
+        assert_eq!(BehaviorKey::Screen.value(false), "off");
         assert_eq!(BehaviorKey::Group.value(true), "own");
         assert_eq!(BehaviorKey::Group.value(false), "mask");
 

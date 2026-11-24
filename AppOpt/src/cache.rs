@@ -186,36 +186,6 @@ fn resolve_group(path: Option<&str>, prev: Option<&TaskEntry>) -> SysGroup {
 /// 返回的第二个值是该落点是否仍然有效，调用方据此决定要不要删除记录。
 /// 「落点有效」的判据有两条：仍在规则集合内，且这次规划没有把它裁小
 /// （迁不进自己的组时，被裁小的落点 S7 自己也维持不住，交回规则更稳定）
-/// 渲染护栏判定：关键线程被绑到「不含性能核」或「只有一个核」的集合。
-/// 返回命中原因，None 表示不命中。只用于观察，不参与目标计算——
-/// 把它接进目标计算就等于替用户改规则，那是另一件事
-///
-/// `rule` 是规则写下的原始集合，`target` 是裁剪后的实际目标，必须分开看。
-/// `UnityMain=7` 这种单核是作者有意独占超大核：私有 L2 不被别的线程冲刷、
-/// 不迁移所以不丢缓存与分支预测。这类配置不该被警告，更不该被「放宽」到
-/// 相邻核——一放宽就引入迁移，正是它想避免的事。
-/// 只有「规则本来多个核、被组集合裁成一个」才是意外，报出来才有意义
-fn guard_reason(rule: &CpuSet, target: &CpuSet, perf: &CpuSet) -> Option<&'static str> {
-    // 空集合通常是 blocked 或拓扑未知，交给现有诊断，不在这里重复报警
-    if target.count() == 0 {
-        return None;
-    }
-    let mut hit = *target;
-    hit.and(perf);
-    if hit.count() == 0 {
-        return Some("目标集合不含性能核");
-    }
-    // 规则自己写死的单核：有意为之。哪怕它落在小核上也不在这里报——
-    // 那是「核选错」的问题，由启动时的规则行和绑定结果体现
-    if rule.count() == 1 {
-        return None;
-    }
-    if target.count() < 2 {
-        return Some("目标只剩一个核");
-    }
-    None
-}
-
 fn plan_entry(
     rule: &CpuSet,
     landing: Option<CpuSet>,
@@ -393,21 +363,6 @@ impl ProcCache {
         }
         if let Some(eff) = &target.clipped {
             crate::diag::note_group_clip(group, &result.cpus, &target.cpus, eff);
-        }
-        // 渲染护栏（观察）：关键线程被绑到没有性能核、或只剩一个核的集合时
-        // 记一次数并首行提示。只诊断不改目标——是否拦截要等真机 A/B 数据。
-        // 只对线程规则包生效：包级规则没有 comm，判定不了角色
-        if cfg.render_guard_observe
-            && result.is_thread_rule
-            && !thread_name.is_empty()
-            && !target.blocked
-            && crate::roles::role_of(thread_name) == crate::roles::Role::Critical
-        {
-            let mut perf = cfg.topo.p_core;
-            perf.or(&cfg.topo.hp_core);
-            if let Some(reason) = guard_reason(&result.cpus, &target.cpus, &perf) {
-                crate::diag::note_render_guard(pkg, thread_name, &target.cpus, reason);
-            }
         }
         // 规则没变、且确实写过：这次不是「首次绑定」而是「复核」。
         // 复核必须走校验语义，才能把「被外部改写」记成漂移而不是正常写入
@@ -729,32 +684,6 @@ mod tests {
         assert!(!in_own_dir("/top-app", "6-7"));
         assert!(in_own_dir("/AppOpt", ""));
         assert!(in_own_dir("AppOpt/6-7", "6-7"));
-    }
-
-    /// 护栏只看「有没有性能核、够不够两个核」，但单核规则是有意为之。
-    /// 四条边界都要明确：误报会让用户去改本来正确的规则，漏报则观察模式白开
-    #[test]
-    fn render_guard_flags_missing_perf_cores() {
-        let perf = set_of("6-7");
-        assert_eq!(
-            guard_reason(&set_of("0-3"), &set_of("0-3"), &perf),
-            Some("目标集合不含性能核")
-        );
-        // 规则 6-7 被组集合裁成 7：意外，该报
-        assert_eq!(
-            guard_reason(&set_of("6-7"), &set_of("7"), &perf),
-            Some("目标只剩一个核")
-        );
-        // 规则自己就写 7：独占超大核，不报
-        assert_eq!(guard_reason(&set_of("7"), &set_of("7"), &perf), None);
-        assert_eq!(guard_reason(&set_of("4-7"), &set_of("4-7"), &perf), None);
-        // 单核写错位置（掉到小核）仍算配置错误
-        assert_eq!(
-            guard_reason(&set_of("7"), &set_of("0"), &perf),
-            Some("目标集合不含性能核")
-        );
-        // 空集合是 blocked / 拓扑未知，交给现有诊断，不在这里重复报
-        assert_eq!(guard_reason(&set_of("7"), &CpuSet::new(), &perf), None);
     }
 
     /// 后台组 + 目标在大核 + 交集为空，是「写多少遍都 EINVAL」的那一类
