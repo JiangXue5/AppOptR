@@ -247,6 +247,16 @@ pub fn effective_by_walk(root: &str, path: &str) -> Option<String> {
     acc.map(|s| s.to_range_string())
 }
 
+/// `thread_cgroup` 的计数版，供绑核主路径使用。
+///
+/// 只为周期总账统计「一轮到底读了几次组归属」——这是判断要不要做 PID 级
+/// 缓存的唯一依据。诊断路径仍走裸函数：那些读取由限流控制，按需触发，
+/// 混进来会让读数失去意义
+pub fn thread_cgroup_counted(tid: i32) -> Option<String> {
+    crate::diag::note_group_read();
+    thread_cgroup(tid)
+}
+
 /// 组路径（`/top-app` 这类）对应的生效集合。优先用内核导出值，
 /// 读不到再按父链交集自己算
 pub fn group_effective(path: &str) -> Option<String> {
@@ -601,6 +611,13 @@ pub fn gc_empty_dirs(referenced: &HashSet<String>) -> usize {
     let removed = gc_empty_dirs_at(&base_cpuset(), referenced);
     if removed > 0 {
         crate::apply_affinity::reset_cpuset_dir_cache();
+        // 生效集合缓存也按组路径存：被删目录的旧值（很可能是「读不到」甚至
+        // 是删除瞬间的 None）会在同名目录重建后继续命中 5 秒。命中 None 会
+        // 让判定退回「组不限制」，按全集写进去又被新目录裁小，随后被判成
+        // 「写了也白写」停 300 秒。整表清空比逐条删便宜，且只在真删了目录时发生
+        if let Ok(mut g) = EFF_CACHE.write() {
+            *g = None;
+        }
     }
     removed
 }

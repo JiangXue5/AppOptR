@@ -338,7 +338,7 @@ impl ProcCache {
         let path = if reuse {
             None
         } else {
-            crate::cpuset::thread_cgroup(tid)
+            crate::cpuset::thread_cgroup_counted(tid)
         };
         // 组名必须跟这一轮的 path 走。沿用上一轮的缓存，会在「系统刚把线程
         // 从前台组挪到后台组」的那一轮里播报「在 top-app 组，4-6 不在该组内」，
@@ -509,7 +509,7 @@ impl ProcCache {
             let path = if reuse {
                 None
             } else {
-                crate::cpuset::thread_cgroup(*tid)
+                crate::cpuset::thread_cgroup_counted(*tid)
             };
             let group = if reuse {
                 SysGroup::Own

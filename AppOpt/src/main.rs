@@ -481,13 +481,10 @@ fn main() {
             rt::prepare(&cfg);
             // 规则删掉后，对应的空 cpuset 目录不会自己消失；留在这里的
             // 空目录会让下一次同集合规则命中时复用旧 cpus 值（如果生效集合变过）。
-            // 只删「无引用 + tasks 为空」的目录，有线程驻留的一律跳过
-            let referenced: std::collections::HashSet<String> = cfg
-                .rules
-                .iter()
-                .filter(|r| !r.cpuset_dir.is_empty())
-                .map(|r| r.cpuset_dir.clone())
-                .collect();
+            // 只删「无引用 + tasks 为空」的目录，有线程驻留的一律跳过。
+            // 引用集必须包含线程规则派生出的目录名——那类目录不在
+            // `rule.cpuset_dir` 里，漏掉会把正在用的目录当成无主
+            let referenced = cfg.referenced_cpuset_dirs();
             let removed = crate::cpuset::gc_empty_dirs(&referenced);
             if removed > 0 {
                 crate::diag::tag("配置", &format!("回收 {} 个空 cpuset 目录", removed));
@@ -808,10 +805,12 @@ fn apply_move_proc(ps: &mut ProcScanState, cfg: &AppConfig, m: &sched::Move) -> 
 /// 没有一个绝对时间就无法判断哪一段是本次开机
 fn wall_clock() -> String {
     // SAFETY: `time` 与 `localtime_r` 都只写调用方提供的结构体；
-    // 返回的空指针在下面判掉，不会解引用
+    // 返回的空指针在下面判掉，不会解引用。
+    // 传空指针让 `time` 自己返回值，避免写 `libc::time_t`（musl 1.2 起该别名
+    // 被标为 deprecated，写出来每次 release 构建都会刷一条警告）
     unsafe {
-        let mut t: libc::time_t = 0;
-        if libc::time(&mut t) == -1 {
+        let t = libc::time(std::ptr::null_mut());
+        if t == -1 {
             return "时间未知".to_string();
         }
         let mut tm: libc::tm = std::mem::zeroed();

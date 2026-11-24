@@ -199,6 +199,40 @@ pub struct AppConfig {
 }
 
 impl AppConfig {
+    /// 配置变更后可以被 GC 复用的「目录引用集」。
+    ///
+    /// 包级规则的目录在解析时就写进 `rule.cpuset_dir`；线程规则的目录是
+    /// 命中时才按合并后的集合派生（见 `thread_affinity`），配置里没有任何
+    /// 字段存它。只收集前者，会把「线程规则正在用、但此刻恰好没有线程
+    /// 驻留」的目录判成无主而回收——下次命中有一次 ENOENT 抖动。
+    ///
+    /// 这里补两类近似：每条线程规则自己的集合（单条命中的结果）与该包
+    /// 全部线程规则的并集（全命中的结果）。中间组合枚举不出来，但漏掉的
+    /// 目录里只要还有线程，`rmdir` 本身就会失败，不会真的删掉
+    pub fn referenced_cpuset_dirs(&self) -> HashSet<String> {
+        let mut out: HashSet<String> = self
+            .rules
+            .iter()
+            .filter(|r| !r.cpuset_dir.is_empty())
+            .map(|r| r.cpuset_dir.clone())
+            .collect();
+        for pr in self.rule_index.values() {
+            if pr.thread_rules.is_empty() {
+                continue;
+            }
+            let mut all = CpuSet::new();
+            for &i in &pr.thread_rules {
+                let r = &self.rules[i];
+                out.insert(r.cpus.to_range_string());
+                all.or(&r.cpus);
+            }
+            if all.count() > 0 {
+                out.insert(all.to_range_string());
+            }
+        }
+        out
+    }
+
     /// 该包是否需要读取线程名。三个消费方：线程规则匹配、S7 角色判定、RT 匹配。
     /// 只在任一成立时才读 `/proc/<tid>/comm`，不给无关应用增加开销；
     /// S7 关闭时跨簇包也不再采集，避免留下无意义的读取
@@ -1518,6 +1552,24 @@ mod tests {
         let topo = topo_of(&[0, 1, 2, 3], &[4, 5], &[6, 7]);
         let s = scope_of("full", "com.a=0-7\n", &topo);
         assert_eq!((s.levels, s.rules, s.pkgs), (3, 0, 0));
+    }
+
+    /// 线程规则的 cpuset 目录是命中时按合并集合派生的，配置里没有字段存它。
+    /// GC 的引用集必须把它算进去，否则「线程规则正在用、此刻恰好空闲」的
+    /// 目录会被当成无主回收，下次命中要重建一次
+    #[test]
+    fn gc_references_cover_thread_rule_dirs() {
+        let topo = topo_of(&[0, 1, 2, 3], &[4, 5, 6], &[7]);
+        let p = "/tmp/appopt_gc_ref.conf";
+        fs::write(p, "com.a {\n  RenderThread=2-5\n  Worker*=4-6\n}\n").unwrap();
+        let mut mtime = -1i64;
+        let cfg = load_config(p, &topo, &mut mtime).expect("配置应能加载");
+        let _ = fs::remove_file(p);
+
+        let r = cfg.referenced_cpuset_dirs();
+        assert!(r.contains("2-5"), "单条命中派生目录：{:?}", r);
+        assert!(r.contains("4-6"), "单条命中派生目录：{:?}", r);
+        assert!(r.contains("2-6"), "两条都命中时的合并目录：{:?}", r);
     }
 
     #[test]

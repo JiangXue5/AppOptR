@@ -163,6 +163,10 @@ struct Counters {
     /// 与 `rewrite` 分开统计：补组不是「被系统改回去」，混在一起会让人以为
     /// 系统在反复冲掉绑定
     group_fix: u64,
+    /// 绑核主路径读 `/proc/<tid>/cgroup` 的次数。用来回答「一轮到底回读几次
+    /// 组归属」——某轮受管 200、回读 3，说明短路生效；回读 200 才说明
+    /// PID 级缓存可能有价值。只统计不改变行为
+    group_read: u64,
     /// 漂移分类计数：裁剪 / 重置 / 挪簇
     kinds: [u64; 3],
 }
@@ -1046,6 +1050,14 @@ pub fn note_group_clip(group: SysGroup, want: &CpuSet, got: &CpuSet, eff: &str) 
     push_event(s, line);
 }
 
+/// 绑核主路径读了一次 `/proc/<tid>/cgroup`。只累加，不打印：
+/// 这个数字唯一的用途是周期总账里的「组归属回读」
+pub fn note_group_read() {
+    let mut guard = sink();
+    let Some(s) = guard.as_mut() else { return };
+    s.counters.group_read += 1;
+}
+
 /// 掩码已经正确、但线程不在 `AppOpt/<目标集合>` 组里。
 ///
 /// 这是接管语义的缺口：只写 `sched_setaffinity` 不写 cpuset 时，系统在进程
@@ -1174,6 +1186,7 @@ pub fn periodic_summary(current: &SchedSnapshot) {
     let ineff = std::mem::take(&mut s.samples.ineffective);
     let stuck = std::mem::take(&mut s.counters.stuck);
     let group_fix = std::mem::take(&mut s.counters.group_fix);
+    let group_read = std::mem::take(&mut s.counters.group_read);
     // 省略提示跟着窗口走：下一窗口前 3 条又能逐条打出来
     s.seen.group_fix_capped = false;
     let tally = s.tally.take();
@@ -1242,7 +1255,16 @@ pub fn periodic_summary(current: &SchedSnapshot) {
 
     // ── 总账 ──────────────────────────────────────────────────
     match tally.filter(|t| t.total > 0) {
-        Some(t) => tag("周期", &tally_line(t, rewrites, s.blocked_note.as_ref())),
+        Some(t) => {
+            let mut line = tally_line(t, rewrites, s.blocked_note.as_ref());
+            // 组归属回读次数跟在总账尾部：它是「短路有没有生效」的直接证据。
+            // 受管 200、回读 3 说明稳态几乎不碰 /proc；回读 200 则说明
+            // 线程每轮都在换组，此时任何「按 PID 缓存」都不解决问题
+            if group_read > 0 {
+                line.push_str(&format!(" ｜ 组归属回读 {}", group_read));
+            }
+            tag("周期", &line);
+        }
         None => tag("周期", empty_state_hint(tally, s.ever_bound)),
     }
 
