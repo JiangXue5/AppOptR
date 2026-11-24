@@ -1,6 +1,6 @@
 [package]
 name = "AppOpt"
-version = "2.7.0-beta11"
+version = "2.7.0-beta12"
 edition = "2024"
 
 [[bin]]

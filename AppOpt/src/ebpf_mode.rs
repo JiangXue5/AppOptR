@@ -593,7 +593,7 @@ pub fn reconcile(state: &mut EbpfState, cfg: &AppConfig) {
 fn affinity_apply_task(
     tid: i32,
     cpus: &CpuSet,
-    cpuset_dir: &str,
+    cpuset_dir: Option<&str>,
     cfg: &AppConfig,
     bpf: &mut Ebpf,
     comm: &str,
@@ -609,7 +609,7 @@ fn affinity_apply_task(
     let outcome = affinity_apply(
         tid,
         cpus,
-        Some(cpuset_dir),
+        cpuset_dir,
         &cfg.topo,
         reason,
         comm,
@@ -681,7 +681,7 @@ fn event_apply(
 pub fn affinity_check(state: &mut EbpfState, cfg: &AppConfig) {
     let dead_tids = state
         .cache
-        .affinity_sync(&cfg.topo, cfg.sysgroup_respect, cfg.group_own);
+        .affinity_sync(cfg);
     for tid in dead_tids {
         applied_del(&mut state.bpf, tid);
         // 这里的 tid 已经 ESRCH。EXIT 事件丢失时这是唯一能收回 RT 记录与配额的路径，

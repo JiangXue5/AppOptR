@@ -721,6 +721,7 @@ mod tests {
             applied: true,
             group: crate::cpuset::SysGroup::Unknown,
             blocked: false,
+            source: crate::policy::PolicySource::UserRule,
         }
     }
 

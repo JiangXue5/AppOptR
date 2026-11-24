@@ -243,10 +243,32 @@ pub struct AppConfig {
     pub group_own: bool,
     /// RT 配置。off 时运行期不查询任何线程的调度策略
     pub rt: RtConfig,
+    /// 黑名单：完全不管理。即使写了规则也不参与匹配，不进 S7、不进 RT。
+    /// 语义是「这个包交给系统的默认策略」，不是「少绑几个核」
+    pub blacklist: HashSet<String>,
+    /// 豁免名单：只写亲和性，不迁组、不补组、不参与 S7。
+    /// 用于与 LKT / Uperf 这类同样管 cpuset 的模块共存——抢组归属只会
+    /// 让两边互相覆盖
+    pub exempt: HashSet<String>,
+    /// 前后台降档：`@foreground_demote=on` 打开，默认关。
+    /// 只作用于没有显式线程规则的线程
+    pub foreground_demote: bool,
+    /// Auto Assign 候选采集：`@auto_assign=on` 打开，默认关。
+    /// 只写 `AppOpt.autocache.conf`，不改主配置
+    pub auto_assign: bool,
     pub topo: CpuTopology,
 }
 
 impl AppConfig {
+    /// 这个包是否完全不归本模块管
+    pub fn is_blacklisted(&self, pkg: &str) -> bool {
+        self.blacklist.contains(pkg)
+    }
+
+    /// 这个包是否只允许写亲和性（不迁组）
+    pub fn is_exempt(&self, pkg: &str) -> bool {
+        self.exempt.contains(pkg)
+    }
     /// 配置变更后可以被 GC 复用的「目录引用集」。
     ///
     /// 包级规则的目录在解析时就写进 `rule.cpuset_dir`；线程规则的目录是
@@ -288,6 +310,8 @@ impl AppConfig {
         self.has_thread_rules.contains(pkg)
             || (self.sched != SchedMode::Off && self.sched_pkgs.contains(pkg))
             || self.rt.policy(pkg).is_some()
+            // Auto Assign 靠线程名判角色；不开这个开关就没有任何额外读取
+            || (self.auto_assign && self.pkgs.contains(pkg))
     }
 
     /// 是否存在真正会被管理的 RT 应用。全局时间片是否改写以此为闸门：
@@ -326,6 +350,10 @@ impl AppConfig {
             screen_relax: false,
             group_own: true,
             rt: RtConfig::default(),
+            blacklist: HashSet::new(),
+            exempt: HashSet::new(),
+            foreground_demote: false,
+            auto_assign: false,
             topo: CpuTopology::empty(),
         }
     }
@@ -374,12 +402,16 @@ fn build_pkg_sig(rules: &[AffinityRule]) -> HashMap<String, u64> {
 /// 影响所有包的开关变化不会体现在 pkg_sig 里，必须单独比对，
 /// 否则已缓存线程不会重新应用，`on → off` 也回滚不了。
 /// RT 的每一项都要进来：分应用开关、匹配方式、上限、时间片变化都要触发全量重扫
+#[allow(clippy::too_many_arguments)]
 fn build_policy_sig(
     unmatched_all: bool,
     sysgroup_respect: bool,
     sched: SchedMode,
     screen_relax: bool,
     group_own: bool,
+    foreground_demote: bool,
+    blacklist: &HashSet<String>,
+    exempt: &HashSet<String>,
     rt: &RtConfig,
 ) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -392,6 +424,16 @@ fn build_policy_sig(
     // 接管开关决定要不要补组，切换时必须整轮重扫，否则已绑的线程还留在
     // 系统组里，用户看不到任何变化
     group_own.hash(&mut h);
+    // 降档开关同理：一开就要重算全部已绑线程，不能等规则变化
+    foreground_demote.hash(&mut h);
+    // 名单按排序后哈希，与书写顺序无关。新增黑名单要触发 release_unmanaged，
+    // 新增豁免要让已迁组的线程退回「只写掩码」，两者都必须整轮重扫
+    let mut bl: Vec<&String> = blacklist.iter().collect();
+    bl.sort();
+    bl.hash(&mut h);
+    let mut ex: Vec<&String> = exempt.iter().collect();
+    ex.sort();
+    ex.hash(&mut h);
     (rt.scope as u8).hash(&mut h);
     match &rt.global {
         RtMatch::Auto => 0u8.hash(&mut h),
@@ -921,6 +963,12 @@ pub fn load_config(
     // WebUI 打开的，配置文件里还留着这一行；直接判「格式无效」等于把一个
     // 官方功能的下线变成他的错误，所以这里只吞掉并提示一次
     let mut legacy_render_guard = false;
+    // 名单默认空；`@blacklist=` 可写多行，逐行累加
+    let mut blacklist: HashSet<String> = HashSet::new();
+    let mut exempt: HashSet<String> = HashSet::new();
+    // 两个新增策略默认关：默认配置的绑核结果必须与 2.6.1 一致
+    let mut foreground_demote = false;
+    let mut auto_assign = false;
     let mut rt = RtConfig::default();
     // 分应用条目先收集原文，等 @rt.max 解析完再统一构造，避免配置行顺序影响缺省上限
     let mut rt_apps: Vec<String> = Vec::new();
@@ -958,6 +1006,25 @@ pub fn load_config(
                 ("render_guard", _) => legacy_render_guard = true,
                 ("group", "own") => group_own = true,
                 ("group", "mask") => group_own = false,
+                ("foreground_demote", "on") => foreground_demote = true,
+                ("foreground_demote", "off") => foreground_demote = false,
+                ("auto_assign", "on") => auto_assign = true,
+                ("auto_assign", "off") => auto_assign = false,
+                // 名单可写多行、逗号或空格分隔；空值不算错误，等价于本行无效
+                ("blacklist", v) | ("exempt", v) if v.is_empty() => {}
+                ("blacklist", v) | ("exempt", v) => match split_names(v) {
+                    Some(names) => {
+                        let dest = if key == "blacklist" {
+                            &mut blacklist
+                        } else {
+                            &mut exempt
+                        };
+                        for n in names {
+                            dest.insert(n);
+                        }
+                    }
+                    None => fail_cnt += 1,
+                },
                 ("rt", "off") => rt.scope = RtScope::Off,
                 ("rt", "global") => rt.scope = RtScope::Global,
                 ("rt", "per_app" | "per-app" | "perapp") => rt.scope = RtScope::PerApp,
@@ -1102,7 +1169,15 @@ pub fn load_config(
         );
     }
 
-    let pkgs: HashSet<String> = rules.iter().map(|r| r.pkg.clone()).collect();
+    // 黑名单在构建索引前剔除：`pkgs` 是所有扫描/匹配入口的唯一闸门，
+    // 剔在这里意味着「不读 cmdline、不读 comm、不写内核」一次到位。
+    // 规则本身保留在 `rules` 里：Web 要能显示它们，用户改回白名单时
+    // 不需要重写配置
+    let pkgs: HashSet<String> = rules
+        .iter()
+        .map(|r| r.pkg.clone())
+        .filter(|p| !blacklist.contains(p))
+        .collect();
     let has_thread_rules: HashSet<String> = rules
         .iter()
         .filter(|r| !r.thread.is_empty())
@@ -1118,6 +1193,9 @@ pub fn load_config(
         sched,
         screen_relax,
         group_own,
+        foreground_demote,
+        &blacklist,
+        &exempt,
         &rt,
     );
 
@@ -1210,6 +1288,15 @@ pub fn load_config(
     if !group_own {
         extra.push("接管组=mask（只写掩码，退回 2.6.1）".to_string());
     }
+    if foreground_demote {
+        extra.push("前后台降档=on（后台线程压到 e-core）".to_string());
+    }
+    if !blacklist.is_empty() {
+        extra.push(format!("黑名单 {} 个包（完全不管理）", blacklist.len()));
+    }
+    if !exempt.is_empty() {
+        extra.push(format!("豁免 {} 个包（只写亲和性，不抢组）", exempt.len()));
+    }
     let extra_desc = if extra.is_empty() {
         String::new()
     } else {
@@ -1289,6 +1376,10 @@ pub fn load_config(
         screen_relax,
         group_own,
         rt,
+        blacklist,
+        exempt,
+        foreground_demote,
+        auto_assign,
         topo: topo.clone(),
     })
 }

@@ -221,6 +221,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <input id="r-filter" placeholder="共 0 个应用">
 <button class="btn" id="r-add">＋ 添加</button>
 </div>
+<div class="card" id="r-cand" hidden></div>
 <div id="r-list"></div>
 </section>
 
@@ -598,12 +599,51 @@ const ICO_EDIT='<svg viewBox="0 0 24 24"><path d="M17 3l4 4L8 20l-5 1 1-5z"/></s
 const ICO_TRASH='<svg viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3m-8 0l1 13h8l1-13"/></svg>';
 async function loadRules(){
   fetchTopo();
+  loadCandidates();
   try{
     const d=await api('/api/rules');
     rulesData=d.rules||[];
     renderRules();
   }catch(e){toast(e.message)}
 }
+/* Auto Assign 候选：只读 AppOpt.autocache.conf，采纳后由后端转 rule_upsert。
+   前端不拼配置文本，避免出现第二套写入器 */
+let candData=[];
+async function loadCandidates(){
+  const box=$('r-cand');
+  try{
+    const d=await api('/api/candidates');
+    candData=d.items||[];
+  }catch(e){candData=[]}
+  if(!candData.length){box.hidden=true;box.innerHTML='';return}
+  box.hidden=false;
+  box.innerHTML=`<div class="card-title">Auto Assign 候选 · ${candData.length}</div>`+
+    candData.map((c,i)=>`
+<div class="rule-row">
+<span class="rule-name">${esc(c.pkg)}${c.thread?' : '+esc(c.thread):' <span class="rule-sub">包级</span>'}</span>
+${chipHtml(c.cpus)}
+<span class="rule-sub">${esc(c.role)} · ${esc(c.confidence)}</span>
+<button class="btn" data-cand-ok="${i}">采纳</button>
+<button class="icon-btn danger" data-cand-no="${i}" title="忽略">${ICO_TRASH}</button>
+</div>`).join('');
+}
+$('r-cand').addEventListener('click',async e=>{
+  const ok=e.target.closest('[data-cand-ok]');
+  const no=e.target.closest('[data-cand-no]');
+  if(!ok&&!no)return;
+  const i=+((ok||no).dataset.candOk||(ok||no).dataset.candNo);
+  const c=candData[i];if(!c)return;
+  try{
+    if(ok){
+      await api('/api/candidate/accept',{pkg:c.pkg,thread:c.thread});
+      toast('已写入规则：'+(c.thread||c.pkg));
+    }else{
+      await api('/api/candidate/del',{pkg:c.pkg,thread:c.thread});
+      toast('已忽略该候选');
+    }
+    loadRules();
+  }catch(err){toast(err.message)}
+});
 async function toggleRt(gi){
   const g=rulesData[gi];if(!g)return;
   try{
@@ -617,6 +657,8 @@ function grpInner(g,gi){
 <div class="grp-head">
 <svg class="chev" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg>
 <span class="grp-name">${esc(g.pkg)}</span>
+${g.bl?'<span class="rule-sub" style="color:var(--orange)">黑名单·不管理</span>':''}
+${g.ex?'<span class="rule-sub">豁免·不抢组</span>':''}
 <span class="grp-count">${g.items.length}</span>
 <button class="rt-btn ${g.rt?'on':''}" data-rtpkg="${gi}" title="${g.rt?'关闭 RT':'为该应用开启 RT（自动挑选 Critical 线程，最多 2 个）'}">RT</button>
 <button class="icon-btn" data-editapp="${gi}" title="编辑应用">${ICO_EDIT}</button>

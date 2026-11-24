@@ -561,6 +561,7 @@ fn dispatch(out: &mut TcpStream, req: &Request) {
         ("GET", "/api/config") => (200, config_json()),
         ("GET", "/api/diag") => (200, diag_json()),
         ("GET", "/api/rt") => (200, rt_json()),
+        ("GET", "/api/candidates") => (200, candidates_json()),
         ("POST", "/api/rule") => rule_api(req),
         ("POST", "/api/rule/del") => rule_del_api(req),
         ("POST", "/api/rule/rename") => rule_rename_api(req),
@@ -572,6 +573,8 @@ fn dispatch(out: &mut TcpStream, req: &Request) {
         ("POST", "/api/behavior") => behavior_api(req),
         ("POST", "/api/adv") => adv_api(req),
         ("POST", "/api/suggest") => suggest_api(req),
+        ("POST", "/api/candidate/accept") => candidate_accept_api(req),
+        ("POST", "/api/candidate/del") => candidate_del_api(req),
         _ => err_json(404, "not found"),
     };
     resp_send(
@@ -669,7 +672,15 @@ fn rules_json() -> String {
     for r in &cfg.rules {
         let gi = *index.entry(r.pkg.as_str()).or_insert_with(|| {
             let rt = per_app && cfg.rt.apps.get(&r.pkg).is_some_and(|a| a.enabled);
-            groups.push(json!({ "pkg": r.pkg, "items": [], "rt": rt }));
+            groups.push(json!({
+                "pkg": r.pkg,
+                "items": [],
+                "rt": rt,
+                // 名单标记随规则一起下发，用户不用去配置文件里核对
+                // 这个包为什么「有规则但没生效」
+                "bl": cfg.is_blacklisted(&r.pkg),
+                "ex": cfg.is_exempt(&r.pkg),
+            }));
             groups.len() - 1
         });
         groups[gi]["items"]
@@ -711,6 +722,71 @@ fn pkg_shape_ok(pkg: &str) -> bool {
 /// `=` 会让集合解析从错误的位置开始。包名不能一起拉黑——`pkg {` 是块语法的开头
 fn thread_token_ok(s: &str, max: usize) -> bool {
     token_ok(s, max) && !s.bytes().any(|b| matches!(b, b'{' | b'}' | b'='))
+}
+
+/// Auto Assign 候选列表。时间同时给 unix 秒与本地日期：前端不想为了
+/// 一个时间戳再写一遍时区换算，日志里也要能直接对上
+fn candidates_json() -> String {
+    let list: Vec<Value> = crate::auto_assign::load_file()
+        .into_iter()
+        .map(|c| {
+            json!({
+                "pkg": c.pkg,
+                "thread": c.thread,
+                "cpus": c.cpus,
+                "role": c.role,
+                "confidence": c.confidence,
+                "reason": c.reason,
+                "created_at": c.created_at,
+                "expires_at": c.expires_at,
+            })
+        })
+        .collect();
+    json!({ "items": list }).to_string()
+}
+
+/// 确认候选：先用 `rule_upsert` 写正式规则，成功后才把候选行删掉。
+/// 顺序不能反——先删候选再写规则失败，用户会同时失去建议和规则
+fn candidate_accept_api(req: &Request) -> (u16, String) {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&req.body) else {
+        return err_json(400, "请求体不是合法 JSON");
+    };
+    let (Some(pkg), Some(thread)) = (v["pkg"].as_str(), v["thread"].as_str()) else {
+        return err_json(400, "缺少 pkg 或 thread 字段");
+    };
+    // 只接受候选文件里确实存在的条目：集合与包名都从文件读，
+    // 不让客户端用这个接口绕过 `/api/rule` 的校验
+    let Some(cand) = crate::auto_assign::load_file()
+        .into_iter()
+        .find(|c| c.pkg == pkg && c.thread == thread)
+    else {
+        return err_json(404, "候选不存在或已过期");
+    };
+    let file = lock_ignore_poison(&CONFIG_FILE).clone();
+    match rule_upsert(&file, &cand.pkg, &cand.thread, &cand.cpus) {
+        RuleEdit::Ok => {
+            crate::auto_assign::remove(&cand.pkg, &cand.thread);
+            config_reload_now();
+            (200, json!({ "ok": true }).to_string())
+        }
+        RuleEdit::Malformed => err_json(409, "配置文件存在未闭合块，请修复后重试"),
+        _ => err_json(500, "配置文件写入失败"),
+    }
+}
+
+/// 忽略一条候选：只删候选行，不动正式规则
+fn candidate_del_api(req: &Request) -> (u16, String) {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&req.body) else {
+        return err_json(400, "请求体不是合法 JSON");
+    };
+    let (Some(pkg), Some(thread)) = (v["pkg"].as_str(), v["thread"].as_str()) else {
+        return err_json(400, "缺少 pkg 或 thread 字段");
+    };
+    if crate::auto_assign::remove(pkg, thread) {
+        (200, json!({ "ok": true }).to_string())
+    } else {
+        err_json(404, "候选不存在")
+    }
 }
 
 fn rule_api(req: &Request) -> (u16, String) {

@@ -3,6 +3,8 @@
 compile_error!("AppOpt requires 64-bit target due to cpu_set_t binary layout assumptions");
 
 mod apply_affinity;
+mod auto_assign;
+mod background;
 mod cache;
 mod config;
 mod cpuset;
@@ -10,6 +12,7 @@ mod diag;
 mod diag_fmt;
 mod ebpf_mode;
 mod lifecycle;
+mod policy;
 mod proc_mode;
 mod roles;
 mod rt;
@@ -375,6 +378,11 @@ fn main() {
     // （宁可多复核），只在文案里标出来，免得用户以为模块自己在乱切
     let mut screen_flip_at: Option<Instant> = None;
     let mut sched_deadline = Instant::now();
+    // Auto Assign 候选落盘周期。观察是内存累加的，写盘一分钟一次足够，
+    // 不必让每个新线程都碰一次文件
+    let mut cand_deadline = Instant::now();
+    // 开关从 on 变 off 时清一次观察，稳态不重复加锁
+    let mut cand_was_on = false;
     // 诊断：卡顿信号 1 秒采样（样本够多才可信），线程表 5 秒刷新一次
     let mut jank = diag::JankSampler::new();
     let mut jank_deadline = Instant::now();
@@ -462,7 +470,12 @@ fn main() {
         if config_changed {
             // 规则可能被删掉了：先把不再受管的线程还回原组，再回收空目录。
             // 顺序不能反——线程还留在子组里，目录就不是空的，GC 只会白跑一趟
-            crate::lifecycle::release_unmanaged(&cfg, false);
+            let rep = crate::lifecycle::release_unmanaged(&cfg, false);
+            // 新增黑名单/豁免时，账本之外可能还有上次运行遗留、仍留在子组里的
+            // 线程。只在这次确实释放过东西时才扫一遍组目录，稳态零开销
+            if rep.released > 0 || rep.dropped > 0 {
+                crate::lifecycle::sweep_orphans(&cfg);
+            }
             // 只改规则时模式不变，set_mode 会直接返回；不单独唤醒，
             // 新规则最坏要等一个休眠间隔（30 秒）才参与判定
             sched_state.note_config_change();
@@ -610,7 +623,7 @@ fn main() {
                 // ESRCH 的线程同时收回 RT 记录，避免事件漏报时配额一直被占
                 for tid in cache
                     .cache
-                    .affinity_sync(&cfg.topo, cfg.sysgroup_respect, cfg.group_own)
+                    .affinity_sync(&cfg)
                 {
                     rt::forget(tid);
                 }
@@ -626,6 +639,28 @@ fn main() {
             let cache = proc_state.get_or_insert_with(ProcScanState::new);
             cache.request_full_scan();
             affinity_deadline = Instant::now();
+        }
+
+        // Auto Assign：只写候选文件，不碰主配置。关掉开关时清空内存观察，
+        // 下次打开重新积累，避免把旧计数当新数据
+        if cfg.auto_assign {
+            cand_was_on = true;
+            if cand_deadline.elapsed() >= Duration::from_secs(60) {
+                cand_deadline = Instant::now();
+                let added = crate::auto_assign::flush(&cfg);
+                if added > 0 {
+                    crate::diag::tag(
+                        "候选",
+                        &format!(
+                            "新增 {} 条 Auto Assign 候选，见 AppOpt.autocache.conf（WebUI 规则页可确认）",
+                            added
+                        ),
+                    );
+                }
+            }
+        } else if cand_was_on {
+            crate::auto_assign::reset();
+            cand_was_on = false;
         }
 
         // S7 采样与迁移。off 时 tick 立即返回，只刷新一次快照供 Web 显示

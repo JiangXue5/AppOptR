@@ -686,6 +686,11 @@ impl SchedState {
             let Some(entry) = cache.tasks.get(&tid) else {
                 continue;
             };
+            // 豁免包不参与 S7：迁移会改写掩码与组归属，等于覆盖另一个模块
+            // 正在做的管理。方案 14.2 的边界
+            if cfg.is_exempt(&entry.pkg) {
+                continue;
+            }
 
             // 允许集合必须按规则重算：entry.cpus 已被上次迁移改写成目标簇，
             // 用它算「与几个簇相交」只会得到 1，线程被误判成非跨簇
@@ -1131,6 +1136,7 @@ mod tests {
             applied: true,
             group: crate::cpuset::SysGroup::Unknown,
             blocked: false,
+            source: crate::policy::PolicySource::UserRule,
         }
     }
 
@@ -1460,6 +1466,7 @@ mod tests {
                 applied: true,
                 group: crate::cpuset::SysGroup::Unknown,
                 blocked: false,
+                source: crate::policy::PolicySource::UserRule,
             },
         );
         let mut st = state_for(&cache, SchedMode::Shadow);
@@ -1707,6 +1714,7 @@ mod tests {
                 applied: true,
                 group: crate::cpuset::SysGroup::Unknown,
                 blocked: false,
+                source: crate::policy::PolicySource::UserRule,
             },
         );
         let mut st = state_for(&cache, SchedMode::On);

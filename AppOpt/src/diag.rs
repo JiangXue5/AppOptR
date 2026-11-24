@@ -197,6 +197,10 @@ struct Seen {
     rule_hit: HashSet<String>,
     /// 本窗口是否已打过「其余规则命中不再列出」
     rule_hit_capped: bool,
+    /// 本窗口打过几条「目标来源变化」，用于限流
+    target_shift: u64,
+    /// 本窗口是否已打过「其余目标变化不再列出」
+    target_shift_capped: bool,
 }
 
 /// 本周期样本：给摘要的明细行用，用完即清零。
@@ -1036,6 +1040,27 @@ pub fn note_sync_tally(total: usize, ok: usize, rebound: usize, failed: usize, b
 /// 目标集合被所在组的生效集合裁小。写全集时内核会求交，返回成功但回读永远是
 /// 子集，接着被判成「写了也白写」白停 300 秒。改成按交集绑之后不会再有回读
 /// 不一致，所以这条说明就是唯一的现场记录，同一组只给一次
+/// 目标来源变化：降档生效、恢复前台、S7 落点接管。
+///
+/// 只在来源真的变了时调用。切后台会让上百个线程在同一轮变化，逐条列出
+/// 会把真正异常的行冲掉，所以前 3 条逐条、其余合并一行
+pub fn note_target_shift(label: &str, from: &str, to: &str, cpus: &str, reason: &str) {
+    let mut guard = sink();
+    let Some(s) = guard.as_mut() else { return };
+    if s.seen.target_shift < 3 {
+        s.seen.target_shift += 1;
+        tag(
+            "目标",
+            &format!("{} {} → {}（{}）｜ {}", label, from, to, cpus, reason),
+        );
+    } else if !s.seen.target_shift_capped {
+        s.seen.target_shift_capped = true;
+        tag("目标", "本窗口其余线程的目标来源变化不再逐条列出（绑定结果不受影响）");
+    }
+}
+
+/// 线程目标集合被所在组裁小（例如前台组只到 0-5，规则要 4-6）。
+/// 按组去重：裁剪会在几百个线程上重复出现，原因却只有一个
 pub fn note_group_clip(group: SysGroup, want: &CpuSet, got: &CpuSet, eff: &str) {
     let mut guard = sink();
     let Some(s) = guard.as_mut() else { return };
@@ -1257,6 +1282,8 @@ pub fn periodic_summary(current: &SchedSnapshot) {
     s.seen.rule_hit_capped = false;
     // 省略提示跟着窗口走：下一窗口前 3 条又能逐条打出来
     s.seen.group_fix_capped = false;
+    s.seen.target_shift = 0;
+    s.seen.target_shift_capped = false;
     let tally = s.tally.take();
     let prev = s.last_snap.replace(current.clone());
 
@@ -1960,6 +1987,7 @@ mod tests {
                 applied: true,
                 group: crate::cpuset::SysGroup::Unknown,
                 blocked: false,
+                source: crate::policy::PolicySource::UserRule,
             },
         );
         let mut s = JankSampler::new();

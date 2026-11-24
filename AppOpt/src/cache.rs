@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::apply_affinity::{AffinityOutcome, ApplyReason, affinity_apply};
 use crate::config::AppConfig;
-use crate::cpuset::{CpuSet, CpuTopology, SysGroup};
+use crate::cpuset::{CpuSet, SysGroup};
 use crate::rule_match::{comm_to_pkg, thread_affinity};
 
 pub struct TaskEntry {
@@ -27,104 +27,9 @@ pub struct TaskEntry {
     /// 目标集合与所在组的生效集合没有交集：写 cpuset 与 sched_setaffinity
     /// 都会被内核拒绝，继续尝试只会产生无效迁移
     pub blocked: bool,
-}
-
-/// 目标集合与线程所在组的匹配结果
-#[derive(PartialEq, Eq, Debug)]
-enum GroupFit {
-    /// 组不限制，或读不到生效集合（不猜）
-    Open,
-    /// 交集比目标小：写全集会被内核裁掉，只留下「成功但回读不一致」。
-    /// 第二项是该组的生效集合，仅用于一次性说明
-    Clamp(CpuSet, String),
-    /// 交集为空：迁组与绑核都会被内核拒绝
-    Blocked,
-}
-
-/// 本轮实际该绑的集合，以及是否该放弃
-pub(crate) struct Target {
-    pub cpus: CpuSet,
-    /// 尊重系统分组且目标不可达：跳过，不计失败
-    pub blocked: bool,
-    /// 被组集合裁小时的原生效集合，仅用于一次性说明
-    pub clipped: Option<String>,
-}
-
-/// 把「规则想要的集合」换算成「这台机器上做得到的集合」。
-///
-/// 三类结论对应三种完全不同的处理：直写、按交集写、直接放弃。
-/// 读不到生效集合时一律算 Open——猜错方向的代价是把前台线程误判成不可绑，
-/// 比多写一次大得多。
-///
-/// `migrate` 表示此刻能不能把线程迁进 AppOpt 自己的组：
-/// - 能迁：线程会离开系统组，目标组就是我们建的那个集合，不必裁剪；
-/// - 不能迁（cpuset 不可用或熔断中）：只有 sched_setaffinity 一条腿，
-///   写全集必然被内核求交成 4-5，回读不一致又被判成「写了也白写」，
-///   于是白停 300 秒。此时按交集绑，一次到位
-fn plan_target(
-    want: &CpuSet,
-    group: SysGroup,
-    eff: Option<&str>,
-    respect: bool,
-    migrate: bool,
-) -> Target {
-    match fit_rule(want, group, eff) {
-        GroupFit::Open => Target {
-            cpus: *want,
-            blocked: false,
-            clipped: None,
-        },
-        // 交集为空：respect 下不动它（迁组才算动），takeover 下交给两步迁组硬抬
-        GroupFit::Blocked => Target {
-            cpus: *want,
-            blocked: respect,
-            clipped: None,
-        },
-        GroupFit::Clamp(_, _) if migrate => Target {
-            cpus: *want,
-            blocked: false,
-            clipped: None,
-        },
-        GroupFit::Clamp(inter, eff) => Target {
-            cpus: inter,
-            blocked: false,
-            clipped: Some(eff),
-        },
-    }
-}
-
-/// 纯判定：给「规则要的集合」和「组的生效集合」，得出直写 / 取交集 / 放弃。
-/// 抽出来是为了能脱离 /proc 与 /dev/cpuset 单测——这套判断错一次，
-/// 日志里就会多出几百行 EINVAL 或几百次无效重绑
-fn fit_rule(want: &CpuSet, group: SysGroup, eff: Option<&str>) -> GroupFit {
-    if matches!(group, SysGroup::Own | SysGroup::Unknown) {
-        return GroupFit::Open;
-    }
-    let Some(eff) = eff else {
-        return GroupFit::Open;
-    };
-    let eff_set = crate::cpuset::parse_cpu_ranges(eff, None);
-    if eff_set.count() == 0 {
-        return GroupFit::Open;
-    }
-    let mut inter = *want;
-    inter.and(&eff_set);
-    if inter.count() == 0 {
-        GroupFit::Blocked
-    } else if inter == *want {
-        GroupFit::Open
-    } else {
-        GroupFit::Clamp(inter, eff.to_string())
-    }
-}
-
-/// S7 落点能否作为本轮基准：必须是当前规则集合的子集。
-///
-/// 这是 S7 与定期校验之间的唯一契约。`want` 永远是规则原值，定期校验若直接
-/// 按 `want` 重算，S7 刚迁到 4-7 的线程下一个周期就被拉回 0-7，计数与落点
-/// 全部对不上。规则改小时旧落点越界，这里返回 `None`，交回规则重算
-fn landing_for(rule: &CpuSet, landing: Option<CpuSet>) -> Option<CpuSet> {
-    landing.filter(|s| s.subset_of(rule))
+    /// 当前目标由谁定：规则 / S7 落点 / 后台降档。
+    /// 只在来源变化时打一行日志，用于回答「这个线程什么时候被降档了」
+    pub source: PolicySource,
 }
 
 /// Own 组短路的定期复核周期（按周期同步轮次计）。
@@ -183,25 +88,9 @@ fn resolve_group(path: Option<&str>, prev: Option<&TaskEntry>) -> SysGroup {
 
 /// 单条线程本轮的目标：能维持 S7 落点就维持，否则回到规则值。
 ///
-/// 返回的第二个值是该落点是否仍然有效，调用方据此决定要不要删除记录。
-/// 「落点有效」的判据有两条：仍在规则集合内，且这次规划没有把它裁小
-/// （迁不进自己的组时，被裁小的落点 S7 自己也维持不住，交回规则更稳定）
-fn plan_entry(
-    rule: &CpuSet,
-    landing: Option<CpuSet>,
-    group: SysGroup,
-    eff: Option<&str>,
-    respect: bool,
-    migrate: bool,
-) -> (Target, Option<CpuSet>) {
-    if let Some(s) = landing_for(rule, landing) {
-        let t = plan_target(&s, group, eff, respect, migrate);
-        if !t.blocked && (t.cpus == s || migrate) {
-            return (t, Some(s));
-        }
-    }
-    (plan_target(rule, group, eff, respect, migrate), None)
-}
+/// 具体判据在 `policy::plan_entry`——那里是纯函数，这套判断错一次，
+/// 日志里就会多出几百行 EINVAL 或几百次无效重绑，必须能脱离真机单测
+use crate::policy::{PolicySource, plan_entry};
 
 /// 双模式共用进程缓存，eBPF 事件驱动增量维护，proc 模式触发全量重建
 pub struct ProcCache {
@@ -298,17 +187,21 @@ impl ProcCache {
         apply_fn: F,
     ) -> bool
     where
-        F: FnOnce(i32, &CpuSet, &str, bool, bool) -> AffinityOutcome,
+        F: FnOnce(i32, &CpuSet, Option<&str>, bool, bool) -> AffinityOutcome,
     {
-        let thread_name = if cfg.has_thread_rules.contains(pkg) {
-            comm
-        } else {
-            ""
-        };
+        // 需要线程名的消费方都在 `needs_comm` 里：线程规则、S7、RT、Auto Assign。
+        // 只按 has_thread_rules 传，会让「只有包级规则但开了 Auto Assign」的包
+        // 永远拿不到 comm，候选也就永远生成不出来
+        let thread_name = if cfg.needs_comm(pkg) { comm } else { "" };
         // 只登记已经通过 pkg_owned 校验、且确实命中规则的包：日志里的每条
         // 样例都要能回答「这是谁的线程」，否则 `HWC release` 这种名字
         // 说它是游戏进程还是 surfaceflinger 的，全凭读者猜
         crate::diag::bind_pkg(tid, pkg, tid == pid);
+        // 必须在规则匹配之前观察：Auto Assign 要看到「当前没命中任何线程规则」
+        // 的线程，否则只能建议已配过的线程，等于没有建议
+        if cfg.auto_assign {
+            crate::auto_assign::note(pkg, thread_name, tid);
+        }
         let Some(result) = thread_affinity(pkg, thread_name, cfg) else {
             return false;
         };
@@ -359,8 +252,11 @@ impl ProcCache {
         } else {
             resolve_group(path.as_deref(), prev)
         };
-        let migrate = cfg.topo.cpuset_enabled && !crate::apply_affinity::cpuset_paused();
-        // 短路时组已知是 Own，生效集合按规则目录自己算，不再走 /proc
+        // 豁免包只写亲和性，不迁组：与其他管 cpuset 的模块共存
+        let exempt = cfg.is_exempt(pkg);
+        let migrate = cfg.topo.cpuset_enabled
+            && !crate::apply_affinity::cpuset_paused()
+            && !exempt;        // 短路时组已知是 Own，生效集合按规则目录自己算，不再走 /proc
         let eff = if reuse {
             crate::cpuset::group_effective_cached(&own_dir_path(&result.cpuset_dir))
         } else {
@@ -372,6 +268,18 @@ impl ProcCache {
         if prev.is_some_and(|old| old.want != result.cpus) {
             self.sched.remove(&tid);
         }
+        // 前后台降档：只作用于没有显式线程规则的线程。用户写明的绑定优先于
+        // 任何自动策略，这一点与 S7 让位同源
+        let floor = if crate::background::should_demote(
+            cfg.foreground_demote,
+            result.is_thread_rule,
+            tid,
+            group,
+        ) {
+            crate::background::floor_of(&cfg.topo)
+        } else {
+            None
+        };
         let (target, keep) = plan_entry(
             &result.cpus,
             self.sched.get(&tid).copied(),
@@ -379,6 +287,7 @@ impl ProcCache {
             eff.as_deref(),
             cfg.sysgroup_respect,
             migrate,
+            floor.as_ref(),
         );
         if keep.is_none() {
             self.sched.remove(&tid);
@@ -424,11 +333,19 @@ impl ProcCache {
                     applied: false,
                     group,
                     blocked: true,
+                    source: target.source,
                 },
             );
             return true;
         }
-        let outcome = apply_fn(tid, &target.cpus, &result.cpuset_dir, recheck, verify_group);
+        // 豁免包传 None：affinity_apply 见到 None 就只写掩码、不碰 cpuset。
+        // 传空字符串不行——空字符串表示「迁到 AppOpt 基组」，那仍然是在抢组
+        let dir_arg = if exempt {
+            None
+        } else {
+            Some(result.cpuset_dir.as_str())
+        };
+        let outcome = apply_fn(tid, &target.cpus, dir_arg, recheck, verify_group);
         if outcome == AffinityOutcome::Gone {
             self.tasks.remove(&tid);
             return false;
@@ -469,6 +386,7 @@ impl ProcCache {
                 applied,
                 group,
                 blocked: false,
+                source: target.source,
             },
         );
         true
@@ -476,7 +394,12 @@ impl ProcCache {
 
     /// 遍历 tasks 应用亲和性，返回 dead_tids 供 eBPF 调用方清理 APPLIED_MAP。
     /// 只有 ESRCH 才算退出，设置失败（EPERM/EINVAL）的线程保留在缓存里等下一轮
-    pub fn affinity_sync(&mut self, topo: &CpuTopology, respect: bool, takeover: bool) -> Vec<i32> {
+    ///
+    /// 传入整个配置而不是几个散装布尔：豁免名单、降档开关都是按包/按线程
+    /// 生效的，散装参数会让调用方各自组装一遍，迟早出现口径不一致
+    pub fn affinity_sync(&mut self, cfg: &AppConfig) -> Vec<i32> {
+        let topo = &cfg.topo;
+        let respect = cfg.sysgroup_respect;
         let mut dead_tids: Vec<i32> = Vec::new();
         let mut blocked_now = 0usize;
         // 被挡线程集中在哪个组、该组可用哪几个核：交给总账解释「为什么一致 0」
@@ -487,7 +410,7 @@ impl ProcCache {
         let mut ok_now = 0usize;
         let mut rebind_now = 0usize;
         let mut fail_now = 0usize;
-        let migrate = topo.cpuset_enabled && !crate::apply_affinity::cpuset_paused();
+        let can_migrate = topo.cpuset_enabled && !crate::apply_affinity::cpuset_paused();
         // 轮次只在周期同步里推进：事件驱动路径每来一个事件都推进的话，
         // 「每 32 轮复核一次」会退化成每秒复核
         self.round = self.round.wrapping_add(1);
@@ -535,6 +458,22 @@ impl ProcCache {
                 path.as_deref()
                     .and_then(crate::cpuset::group_effective_cached)
             };
+            // 豁免包只写亲和性：迁组会跟 LKT/Uperf 这类同样管 cpuset 的模块
+            // 抢归属，两边互相覆盖比谁都不管更糟
+            let exempt = cfg.is_exempt(&e.pkg);
+            let migrate = can_migrate && !exempt;
+            // 降档只在用户显式打开时才算——`floor_of` 与 `is_background` 都在
+            // 闸门里面调用，默认配置下这条路径零系统调用
+            let floor = if crate::background::should_demote(
+                cfg.foreground_demote,
+                e.is_thread_rule,
+                *tid,
+                group,
+            ) {
+                crate::background::floor_of(topo)
+            } else {
+                None
+            };
             // S7 接管过的线程按落点维持，不按规则原值重算：`want` 是规则集，
             // 直接拿它算会把刚迁到 4-7 的线程拉回 0-7，迁移白做
             let (target, keep) = plan_entry(
@@ -544,6 +483,7 @@ impl ProcCache {
                 eff.as_deref(),
                 respect,
                 migrate,
+                floor.as_ref(),
             );
             if keep.is_none() && sched.contains_key(tid) {
                 // 落点已不可达（切后台、组收紧、规则改小）：接管作废
@@ -551,6 +491,24 @@ impl ProcCache {
             }
             // 「首次绑定 / 目标变更」才需要校验组归属；稳态校验等于白读一次
             let changed = !e.applied || e.cpus != target.cpus;
+            // 来源变化单独播报：这是回答「这个线程什么时候被降档了、
+            // 什么时候恢复的」的唯一线索，写入次数本身看不出来
+            let proposal = target.proposal();
+            if e.applied && e.source != proposal.source {
+                let label = if e.comm.is_empty() {
+                    e.pkg.as_str()
+                } else {
+                    e.comm.as_str()
+                };
+                crate::diag::note_target_shift(
+                    label,
+                    e.source.label(),
+                    proposal.source.label(),
+                    &proposal.cpus.to_range_string(),
+                    proposal.reason,
+                );
+            }
+            e.source = proposal.source;
             e.group = group;
             e.cpus = target.cpus;
             e.blocked = target.blocked;
@@ -577,7 +535,7 @@ impl ProcCache {
             // 掩码对但组不对时补写一次组归属。短路复用组时不必校验：
             // 那一轮的组本来就记着 Own
             let verify_group = need_verify_group(
-                migrate && takeover,
+                migrate && cfg.group_own,
                 &e.cpuset_dir,
                 changed,
                 reuse,
@@ -724,10 +682,11 @@ mod tests {
                 applied: true,
                 group: SysGroup::Own,
                 blocked: false,
+                source: PolicySource::UserRule,
             },
         );
         // 目标就是当前亲和性：affinity_apply 会短路，不会真的改测试线程
-        cache.affinity_sync(&CpuTopology::empty(), true, true);
+        cache.affinity_sync(&crate::config::AppConfig::empty());
         assert_eq!(
             cache.tasks.get(&tid).map(|e| e.group),
             Some(SysGroup::Own),
@@ -737,7 +696,7 @@ mod tests {
         // 推到复核轮次：32 % 32 == 0，必须回读。沙箱里当前线程在
         // `/user.slice/...`（Other），不会再被认成 Own
         cache.round = GROUP_RECHECK_ROUNDS - 1;
-        cache.affinity_sync(&CpuTopology::empty(), true, true);
+        cache.affinity_sync(&crate::config::AppConfig::empty());
         assert_ne!(
             cache.tasks.get(&tid).map(|e| e.group),
             Some(SysGroup::Own),
@@ -754,182 +713,6 @@ mod tests {
         assert!(!in_own_dir("/top-app", "6-7"));
         assert!(in_own_dir("/AppOpt", ""));
         assert!(in_own_dir("AppOpt/6-7", "6-7"));
-    }
-
-    /// 后台组 + 目标在大核 + 交集为空，是「写多少遍都 EINVAL」的那一类
-    #[test]
-    fn background_group_blocks_out_of_range_targets() {
-        assert_eq!(
-            fit_rule(&set_of("4-6"), SysGroup::Background, Some("0-3")),
-            GroupFit::Blocked
-        );
-        // 目标本来就在该组范围内，没有理由动它
-        assert_eq!(
-            fit_rule(&set_of("0-2"), SysGroup::Background, Some("0-3")),
-            GroupFit::Open
-        );
-        // 读不到生效集合时不猜，交给内核返回真实 errno
-        assert_eq!(
-            fit_rule(&set_of("4-6"), SysGroup::Background, None),
-            GroupFit::Open
-        );
-        // 文件为空同样不猜
-        assert_eq!(
-            fit_rule(&set_of("4-6"), SysGroup::Background, Some("")),
-            GroupFit::Open
-        );
-    }
-
-    /// 前台组只到 0-5 的机型（真机 2.3.8 日志就是这样）：4-6 的交集是 4-5，
-    /// 必须按交集绑。硬写 4-6 会「返回成功但回读 4-5」，被判成写了也白写，
-    /// 白停 300 秒——真机每 60 秒 182 个线程全撞在这上面
-    #[test]
-    fn partial_group_limit_clamps_instead_of_writing_doomed_set() {
-        assert_eq!(
-            fit_rule(&set_of("4-6"), SysGroup::Foreground, Some("0-5")),
-            GroupFit::Clamp(set_of("4-5"), "0-5".into())
-        );
-        // 目标 7 与 0-5 无交集：迁组和绑核都会被拒
-        assert_eq!(
-            fit_rule(&set_of("7"), SysGroup::Foreground, Some("0-5")),
-            GroupFit::Blocked
-        );
-
-        // 迁不进自己的组时按交集绑，blocked 为假（这是能绑的部分，不是失败）
-        let t = plan_target(
-            &set_of("4-6"),
-            SysGroup::Foreground,
-            Some("0-5"),
-            true,
-            false,
-        );
-        assert!(!t.blocked);
-        assert_eq!(t.cpus.to_range_string(), "4-5");
-        assert_eq!(t.clipped.as_deref(), Some("0-5"));
-
-        // 同一个组，能迁组时直写全集，由迁组把线程抬出系统组
-        let t2 = plan_target(
-            &set_of("4-6"),
-            SysGroup::Foreground,
-            Some("0-5"),
-            true,
-            true,
-        );
-        assert!(!t2.blocked);
-        assert_eq!(t2.cpus.to_range_string(), "4-6");
-
-        // 交集为空 + respect：跳过而不是每秒撞一次 EINVAL
-        assert!(plan_target(&set_of("7"), SysGroup::Foreground, Some("0-5"), true, false).blocked);
-        // takeover 下不拦，交给两步迁组硬抬
-        assert!(
-            !plan_target(
-                &set_of("7"),
-                SysGroup::Foreground,
-                Some("0-5"),
-                false,
-                false
-            )
-            .blocked
-        );
-        // 自己建的组不受系统限制
-        assert_eq!(
-            fit_rule(&set_of("4-6"), SysGroup::Own, Some("0-3")),
-            GroupFit::Open
-        );
-    }
-
-    /// S7 与定期校验的契约：落点必须压过规则原值。
-    /// 修复前 `affinity_sync` 用 `e.want` 重算，S7 刚迁到 4-7 的线程
-    /// 下一个校验周期就被拉回 0-7，日志里 moved 在涨、落点却对不上
-    #[test]
-    fn sched_landing_survives_periodic_check() {
-        let rule = set_of("0-7");
-        let landing = landing_for(&rule, Some(set_of("4-7")));
-        assert_eq!(landing, Some(set_of("4-7")));
-        let t = plan_target(
-            &landing.unwrap_or(rule),
-            SysGroup::TopApp,
-            Some("0-7"),
-            true,
-            true,
-        );
-        assert!(!t.blocked);
-        assert_eq!(t.cpus.to_range_string(), "4-7");
-    }
-
-    /// 规则被改小后旧落点越界，必须交回规则重算，不能继续维持一个非法集合
-    #[test]
-    fn stale_landing_is_dropped_when_rule_shrinks() {
-        assert_eq!(landing_for(&set_of("0-3"), Some(set_of("4-7"))), None);
-        // 规则没变（或变大）时落点仍然有效
-        assert_eq!(
-            landing_for(&set_of("0-7"), Some(set_of("4-7"))),
-            Some(set_of("4-7"))
-        );
-    }
-
-    /// 落点被系统组挡住（应用切后台，组只剩 0-3）：接管作废，
-    /// 本轮就回到规则值并按规则裁剪，而不是每秒撞一次 EINVAL
-    #[test]
-    fn unreachable_landing_falls_back_to_rule() {
-        let rule = set_of("0-7");
-        let landing = landing_for(&rule, Some(set_of("4-6"))).unwrap();
-        assert!(plan_target(&landing, SysGroup::Background, Some("0-3"), true, false).blocked);
-        let t = plan_target(&rule, SysGroup::Background, Some("0-3"), true, false);
-        assert!(!t.blocked);
-        assert_eq!(t.cpus.to_range_string(), "0-3");
-    }
-
-    /// 周期校验的完整决策：落点该留就留，该丢就丢，不能只对一半
-    #[test]
-    fn plan_entry_keeps_or_releases_landing_consistently() {
-        // 规则没变、组能容纳：维持 S7 落点
-        let (t, keep) = plan_entry(
-            &set_of("0-7"),
-            Some(set_of("4-7")),
-            SysGroup::TopApp,
-            Some("0-7"),
-            true,
-            true,
-        );
-        assert_eq!(keep, Some(set_of("4-7")));
-        assert_eq!(t.cpus.to_range_string(), "4-7");
-
-        // 规则改小：落点越界，回到规则值
-        let (t2, keep2) = plan_entry(
-            &set_of("0-3"),
-            Some(set_of("4-7")),
-            SysGroup::TopApp,
-            Some("0-7"),
-            true,
-            true,
-        );
-        assert!(keep2.is_none());
-        assert_eq!(t2.cpus.to_range_string(), "0-3");
-
-        // 组收紧且迁不进自己的组：落点会被裁小，S7 自己也维持不住，交回规则
-        let (t3, keep3) = plan_entry(
-            &set_of("0-7"),
-            Some(set_of("4-7")),
-            SysGroup::Foreground,
-            Some("0-5"),
-            true,
-            false,
-        );
-        assert!(keep3.is_none());
-        assert_eq!(t3.cpus.to_range_string(), "0-5");
-
-        // 能迁组时落点仍成立：迁进 AppOpt/4-7 后不再受系统组限制
-        let (t4, keep4) = plan_entry(
-            &set_of("0-7"),
-            Some(set_of("4-7")),
-            SysGroup::Foreground,
-            Some("0-5"),
-            true,
-            true,
-        );
-        assert_eq!(keep4, Some(set_of("4-7")));
-        assert_eq!(t4.cpus.to_range_string(), "4-7");
     }
 
     /// proc 模式每 60 秒全量重建缓存，eBPF 模式配置变更也会 `clear()`。
@@ -961,6 +744,7 @@ mod tests {
             applied: true,
             group: SysGroup::TopApp,
             blocked: false,
+            source: PolicySource::UserRule,
         };
         assert_eq!(
             resolve_group(Some("/background"), Some(&old)),
