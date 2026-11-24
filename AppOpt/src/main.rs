@@ -83,6 +83,7 @@ fn print_help(prog_name: &str) {
     println!("  com.example=e-core        语义核心，绑定到全部小核");
     println!("  com.example=p-core        语义核心，绑定到全部中核");
     println!("  com.example=hp-core       语义核心，绑定到全部大核");
+    println!("  com.example={{hp_core}}    同上，占位符写法（按拓扑展开，与旧写法等价）");
     println!();
     println!("  块语法，包级规则 + 线程规则");
     println!("  com.example {{");

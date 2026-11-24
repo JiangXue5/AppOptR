@@ -474,7 +474,8 @@ pub fn spec_like(s: &str) -> bool {
             continue;
         }
         any = true;
-        let ok = matches!(t, "e-core" | "p-core" | "hp-core" | "all-core")
+        // 语义核心名与解析共用同一判据（含 `{e_core}` 写法）
+        let ok = crate::cpuset::is_semantic_core(t)
             || t.bytes().all(|b| b.is_ascii_digit())
             || t.split_once('-').is_some_and(|(a, b)| {
                 !a.is_empty()
@@ -1502,6 +1503,13 @@ mod tests {
         for group in [e, p, h] {
             present.or(&set(group));
         }
+        // 测试拓扑：三档就是三层，空层不进 all_tiers（真实检测也不会产出空层）
+        let mut tiers = Vec::new();
+        for group in [e, p, h] {
+            if !group.is_empty() {
+                tiers.push(set(group));
+            }
+        }
         CpuTopology {
             present_cpus: present,
             present_str: present.to_range_string(),
@@ -1510,6 +1518,7 @@ mod tests {
             e_core: set(e),
             p_core: set(p),
             hp_core: set(h),
+            all_tiers: tiers,
             topo_source: "capacity",
             topo_degraded: false,
         }

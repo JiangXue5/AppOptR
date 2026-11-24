@@ -548,7 +548,44 @@ pub fn parse_cpu_ranges(spec: &str, present: Option<&CpuSet>) -> CpuSet {
     set
 }
 
-/// 解析 CPU 规格，支持语义核心名(e-core/p-core/hp-core)与数字范围混合
+/// 语义核心名 → 规范名。同时接受 `e-core` 与 `{e_core}`：
+/// 花括号形式与「按拓扑展开的占位符」写法一致，旧写法永久兼容。
+///
+/// 校验（`spec_like`）与解析（`parse_cpu_spec`）必须共用这一个判据，
+/// 否则会出现「配置校验通过、解析出空集合」这种只在一侧报错的裂口
+fn core_alias(name: &str) -> Option<&'static str> {
+    let bare = name
+        .strip_prefix('{')
+        .and_then(|s| s.strip_suffix('}'))
+        .unwrap_or(name);
+    Some(match bare {
+        "e-core" | "e_core" => "e-core",
+        "p-core" | "p_core" => "p-core",
+        "hp-core" | "hp_core" => "hp-core",
+        "all-core" | "all_core" => "all-core",
+        _ => return None,
+    })
+}
+
+/// 该段是否是语义核心名（含花括号写法）
+pub fn is_semantic_core(name: &str) -> bool {
+    core_alias(name).is_some()
+}
+
+/// 语义核心名对应的集合。展开发生在配置解析阶段（Present 拓扑），
+/// 执行时再被目标组的生效集合裁剪
+pub fn semantic_core<'a>(name: &str, topo: &'a CpuTopology) -> Option<&'a CpuSet> {
+    match core_alias(name)? {
+        "e-core" => Some(&topo.e_core),
+        "p-core" => Some(&topo.p_core),
+        "hp-core" => Some(&topo.hp_core),
+        "all-core" => Some(&topo.present_cpus),
+        _ => None,
+    }
+}
+
+/// 解析 CPU 规格，支持语义核心名(e-core/p-core/hp-core/all-core，
+/// 也接受 `{e_core}` 写法)与数字范围混合
 pub fn parse_cpu_spec(spec: &str, topo: &CpuTopology) -> CpuSet {
     let mut set = CpuSet::new();
     if spec.is_empty() {
@@ -560,17 +597,10 @@ pub fn parse_cpu_spec(spec: &str, topo: &CpuTopology) -> CpuSet {
             continue;
         }
         // 语义名展开为对应核心层，其余按数字范围解析
-        let seg = match part {
-            "e-core" => &topo.e_core,
-            "p-core" => &topo.p_core,
-            "hp-core" => &topo.hp_core,
-            "all-core" => &topo.present_cpus,
-            _ => {
-                set.or(&parse_cpu_ranges(part, Some(&topo.present_cpus)));
-                continue;
-            }
-        };
-        set.or(seg);
+        match semantic_core(part, topo) {
+            Some(seg) => set.or(seg),
+            None => set.or(&parse_cpu_ranges(part, Some(&topo.present_cpus))),
+        }
     }
     set
 }
@@ -745,6 +775,12 @@ fn probe_cpuset(base: &str) -> Result<(), String> {
 
 #[derive(Clone)]
 pub struct CpuTopology {
+    /// 可调度的 CPU 集合（present ∩ online）。
+    ///
+    /// 名字沿用历史的 `present`，实际语义是「能写进亲和性掩码的核」。
+    /// 离线核刻意不进来：执行层不做 `Rule ∩ online` 的求交，把离线位写进
+    /// 掩码只会换来「内核接受但回读不一致」，随后被判成「写了也白写」
+    /// 停 300 秒。真机热插拔时这比少绑一个核贵得多
     pub present_cpus: CpuSet,
     pub present_str: String,
     pub mems_str: String,
@@ -752,6 +788,13 @@ pub struct CpuTopology {
     pub e_core: CpuSet,
     pub p_core: CpuSet,
     pub hp_core: CpuSet,
+    /// 按 capacity/max_freq 升序排列的**每一层**原始分组，只含在线 CPU。
+    ///
+    /// `e_core` / `p_core` / `hp_core` 是它的三档视图：≥3 层时首层为 e、
+    /// 末层为 hp、中间层并集为 p。保留原始层是为了让「1+2+2+3」这类四簇
+    /// 机器不被压成三档后丢失信息——S7 选簇、跨簇判定都需要知道真实簇数。
+    /// 无分层信息时为空，读取方必须回退到 e/p/hp
+    pub all_tiers: Vec<CpuSet>,
     /// 分层依据：capacity / max_freq / fallback
     pub topo_source: &'static str,
     /// 簇数不足 3 时语义名做了降级映射，规则生效范围与原意不同
@@ -770,6 +813,7 @@ impl CpuTopology {
             e_core: CpuSet::new(),
             p_core: CpuSet::new(),
             hp_core: CpuSet::new(),
+            all_tiers: Vec::new(),
             topo_source: "fallback",
             topo_degraded: true,
         }
@@ -837,20 +881,18 @@ impl RankMetric {
     }
 }
 
-/// 由候选簇推导语义核心集合：指标完整时按单一指标排序分组，
-/// 两种指标都不完整时不猜测分层，直接降级到全部在线 CPU。
-fn classify_cores(
-    entries: &[CoreGroup],
-    online: &CpuSet,
-) -> (CpuSet, CpuSet, CpuSet, &'static str, bool) {
+/// 按单一指标排序并合并同指标的簇，结果升序。
+///
+/// 返回 `None` 表示两种指标都不完整——此时不能猜分层，只能整体降级。
+/// 排序与合并是 e/p/hp 三档视图和四层原始视图的共同前提，抽出来是为了
+/// 两者不会因为一处改口径而出现「三档说 3 层、原始层说 4 层」的矛盾
+fn rank_groups(entries: &[CoreGroup], online: &CpuSet) -> Option<(Vec<(u64, CpuSet)>, &'static str)> {
     // 全部离线的簇不参与分组，其指标缺失也不应牵连整体判定
     let active: Vec<&CoreGroup> = entries
         .iter()
         .filter(|g| g.cpus.iter().any(|&c| online.is_set(c)))
         .collect();
-    let Some(metric) = RankMetric::pick(&active) else {
-        return (*online, *online, *online, "fallback", true);
-    };
+    let metric = RankMetric::pick(&active)?;
 
     let mut groups: Vec<(u64, CpuSet)> = Vec::new();
     for g in active {
@@ -870,8 +912,34 @@ fn classify_cores(
         }
     }
     groups.sort_by_key(|(k, _)| *k);
+    Some((groups, metric.source()))
+}
 
-    map_cores(groups, online, metric.source())
+/// 由候选簇推导语义核心集合：指标完整时按单一指标排序分组，
+/// 两种指标都不完整时不猜测分层，直接降级到全部在线 CPU。
+///
+/// 生产路径走 `classify_tiers` + `derive_cores`（要先拿到原始层再派生三档）；
+/// 这里保留单步入口，只给单元测试对照用——两者一旦分叉，测试会立刻发现
+#[cfg(test)]
+fn classify_cores(
+    entries: &[CoreGroup],
+    online: &CpuSet,
+) -> (CpuSet, CpuSet, CpuSet, &'static str, bool) {
+    match rank_groups(entries, online) {
+        Some((groups, source)) => map_cores(groups, online, source),
+        None => (*online, *online, *online, "fallback", true),
+    }
+}
+
+/// 保留每一层的原始分组（升序），供 `CpuTopology::all_tiers` 使用。
+///
+/// 与 `classify_cores` 共用 `rank_groups`：三档视图是这一份数据的派生结果，
+/// 不是另算一遍。无分层信息时返回空 Vec，调用方回退到 e/p/hp
+fn classify_tiers(entries: &[CoreGroup], online: &CpuSet) -> (Vec<CpuSet>, &'static str) {
+    match rank_groups(entries, online) {
+        Some((groups, source)) => (groups.into_iter().map(|(_, set)| set).collect(), source),
+        None => (Vec::new(), "fallback"),
+    }
 }
 
 /// 无 cpufreq policy 时按每核 capacity 归并候选簇。
@@ -908,9 +976,9 @@ fn group_by_cpu_capacity(online: &CpuSet, capacity_of: impl Fn(usize) -> u64) ->
 }
 
 /// CPU 分层检测：优先按 capacity 分组，缺失时回退 cpuinfo_max_freq。
-/// 只纳入在线 CPU；簇数不足 3 时按 e-core → 首簇、hp-core → 末簇、p-core 跟随末簇降级，
-/// 无任何分层信息时三个语义名全部映射到在线 CPU 集合，避免语义规则整体失效。
-fn detect_core_types(online: &CpuSet) -> (CpuSet, CpuSet, CpuSet, &'static str, bool) {
+/// 只纳入在线 CPU。返回升序的每一层与分层依据；层数不足时由 `derive_cores`
+/// 决定语义名怎么降级
+fn detect_tiers(online: &CpuSet) -> (Vec<CpuSet>, &'static str) {
     let mut entries: Vec<CoreGroup> = Vec::new();
 
     if let Ok(dirs) = fs::read_dir("/sys/devices/system/cpu/cpufreq") {
@@ -955,7 +1023,26 @@ fn detect_core_types(online: &CpuSet) -> (CpuSet, CpuSet, CpuSet, &'static str, 
         entries = group_by_cpu_capacity(online, cpu_capacity);
     }
 
-    classify_cores(&entries, online)
+    classify_tiers(&entries, online)
+}
+
+/// 由升序的原始层派生三档语义集合。
+///
+/// 1 层：三者同集合；2 层：p-core 跟随末层（避免 p-core 规则被静默丢弃）；
+/// 3 层及以上：首层 e-core、末层 hp-core、中间层并集 p-core。
+/// 直接复用 `map_cores`，保证「三档」与「原始层」永远出自同一次排序
+fn derive_cores(
+    tiers: &[CpuSet],
+    online: &CpuSet,
+    source: &'static str,
+) -> (CpuSet, CpuSet, CpuSet, bool) {
+    let groups: Vec<(u64, CpuSet)> = tiers
+        .iter()
+        .enumerate()
+        .map(|(i, set)| (i as u64, *set))
+        .collect();
+    let (e, p, h, _, degraded) = map_cores(groups, online, source);
+    (e, p, h, degraded)
 }
 
 /// 核组按 key 升序映射到语义核心名。
@@ -985,6 +1072,34 @@ fn map_cores(
     }
 }
 
+/// 启动行的分层说明。抽成纯函数只为能单测文案——这是用户唯一能看到的
+/// 拓扑结论，层数口径改过一次（三档去重 → 原始层数），必须钉住。
+///
+/// 层数按原始层算：四簇机器（1+2+2+3）的 p-core 是中间两层并集，
+/// 按三档去重会写成「核心层 3」，与实际簇数不符
+fn topo_line(t: &CpuTopology) -> String {
+    if t.topo_degraded {
+        return format!(
+            "未能分层（{}，三档同为 {}，语义核心名不生效）",
+            t.topo_source, t.present_str
+        );
+    }
+    let layers = t.all_tiers.len().max(1);
+    let mut s = format!(
+        "e-core {} ｜ p-core {} ｜ hp-core {} ｜ 分层依据 {} ｜ 核心层 {}",
+        t.e_core.to_range_string(),
+        t.p_core.to_range_string(),
+        t.hp_core.to_range_string(),
+        t.topo_source,
+        layers
+    );
+    if layers > 3 {
+        // 只说「4 层」而不说 p-core 是并集，读者会以为少了一档
+        s.push_str(&format!("（p-core 为中间 {} 层并集）", layers - 2));
+    }
+    s
+}
+
 /// 初始化 CPU 拓扑，检测 cpuset 可用性并创建 BASE_CPUSET 目录
 pub fn init_cpu_topo() -> CpuTopology {
     let raw = fs::read_to_string("/sys/devices/system/cpu/present")
@@ -1011,7 +1126,8 @@ pub fn init_cpu_topo() -> CpuTopology {
         online = present;
     }
 
-    let (e, p, h, topo_source, topo_degraded) = detect_core_types(&online);
+    let (tiers, topo_source) = detect_tiers(&online);
+    let (e, p, h, topo_degraded) = derive_cores(&tiers, &online, topo_source);
 
     let mut topo = CpuTopology {
         present_cpus: online,
@@ -1021,41 +1137,14 @@ pub fn init_cpu_topo() -> CpuTopology {
         e_core: e,
         p_core: p,
         hp_core: h,
+        all_tiers: tiers,
         topo_source,
         topo_degraded,
     };
 
-    // 分层结果直接给「哪几个核是哪一档」+ 依据，规则行随后引用这些档名
-    // 三档取不同集合的个数。降级映射时三档是同一个集合，按「非空集合数」
-    // 会算成 3 层——这正是把「本机没分层」写成「核心层 3」的原因
-    let mut uniq: Vec<String> = Vec::new();
-    for c in [topo.e_core, topo.p_core, topo.hp_core] {
-        if c.count() > 0 {
-            let s = c.to_range_string();
-            if !uniq.contains(&s) {
-                uniq.push(s);
-            }
-        }
-    }
-    let layers = uniq.len();
-    let cores = if topo.topo_degraded {
-        format!(
-            "未能分层（{}，三档同为 {}，语义核心名不生效）",
-            topo.topo_source, topo.present_str
-        )
-    } else {
-        format!(
-            "e-core {} ｜ p-core {} ｜ hp-core {} ｜ 分层依据 {} ｜ 核心层 {}",
-            topo.e_core.to_range_string(),
-            topo.p_core.to_range_string(),
-            topo.hp_core.to_range_string(),
-            topo.topo_source,
-            layers
-        )
-    };
     crate::diag::tag(
         "环境",
-        &format!("CPU 在线 {} ｜ {}", topo.present_str, cores),
+        &format!("CPU 在线 {} ｜ {}", topo.present_str, topo_line(&topo)),
     );
 
     let cpuset_path = CString::new("/dev/cpuset").expect("常量字符串无 NUL");
@@ -1209,6 +1298,98 @@ mod tests {
         assert!(!degraded);
     }
 
+    /// 四层机器（1+2+2+3）必须保住原始层：三档视图里 p-core 是中间两层
+    /// 的并集，但 S7 选簇要知道真实层数与每层边界
+    #[test]
+    fn all_tiers_keep_every_cluster_of_four_layer_soc() {
+        let online = set(&[0, 1, 2, 3, 4, 5, 6, 7]);
+        let entries = vec![
+            grp(&[0], 200, 0),
+            grp(&[1, 2], 500, 0),
+            grp(&[3, 4], 800, 0),
+            grp(&[5, 6, 7], 1024, 0),
+        ];
+        let (tiers, src) = classify_tiers(&entries, &online);
+        assert_eq!(src, "capacity");
+        assert_eq!(tiers.len(), 4, "四簇不能被压成三档：{:?}", tiers);
+        assert_eq!(tiers[0], set(&[0]));
+        assert_eq!(tiers[1], set(&[1, 2]));
+        assert_eq!(tiers[2], set(&[3, 4]));
+        assert_eq!(tiers[3], set(&[5, 6, 7]));
+
+        let (e, p, h, degraded) = derive_cores(&tiers, &online, src);
+        assert_eq!(e, set(&[0]));
+        assert_eq!(p, set(&[1, 2, 3, 4]));
+        assert_eq!(h, set(&[5, 6, 7]));
+        assert!(!degraded);
+    }
+
+    /// 2+2+4：三档与三层一一对应
+    #[test]
+    fn all_tiers_two_plus_two_plus_four() {
+        let online = set(&[0, 1, 2, 3, 4, 5, 6, 7]);
+        let entries = vec![
+            grp(&[0, 1], 300, 0),
+            grp(&[2, 3], 600, 0),
+            grp(&[4, 5, 6, 7], 1024, 0),
+        ];
+        let (tiers, src) = classify_tiers(&entries, &online);
+        assert_eq!(tiers, vec![set(&[0, 1]), set(&[2, 3]), set(&[4, 5, 6, 7])]);
+        let (e, p, h, degraded) = derive_cores(&tiers, &online, src);
+        assert_eq!((e, p, h), (set(&[0, 1]), set(&[2, 3]), set(&[4, 5, 6, 7])));
+        assert!(!degraded);
+    }
+
+    /// 1+3+4：层数够三档，但与「小核 4 个」的常见布局一样要求层边界准确
+    #[test]
+    fn all_tiers_one_plus_three_plus_four() {
+        let online = set(&[0, 1, 2, 3, 4, 5, 6, 7]);
+        let entries = vec![grp(&[0], 200, 0), grp(&[1, 2, 3], 700, 0), grp(&[4, 5, 6, 7], 1024, 0)];
+        let (tiers, src) = classify_tiers(&entries, &online);
+        assert_eq!(tiers, vec![set(&[0]), set(&[1, 2, 3]), set(&[4, 5, 6, 7])]);
+        let (e, p, h, _) = derive_cores(&tiers, &online, src);
+        assert_eq!((e, p, h), (set(&[0]), set(&[1, 2, 3]), set(&[4, 5, 6, 7])));
+    }
+
+    /// 单层 / 两层：三档全部降级，all_tiers 仍如实反映层数
+    #[test]
+    fn all_tiers_single_and_two_layer_degrade() {
+        let online = set(&[0, 1, 2, 3]);
+
+        let one = vec![grp(&[0, 1, 2, 3], 1024, 0)];
+        let (tiers, src) = classify_tiers(&one, &online);
+        assert_eq!(tiers.len(), 1);
+        let (e, p, h, degraded) = derive_cores(&tiers, &online, src);
+        assert_eq!((e, p, h), (online, online, online));
+        assert!(degraded);
+
+        let two = vec![grp(&[0, 1], 512, 0), grp(&[2, 3], 1024, 0)];
+        let (tiers, src) = classify_tiers(&two, &online);
+        assert_eq!(tiers.len(), 2);
+        let (e, p, h, degraded) = derive_cores(&tiers, &online, src);
+        // 两档时 p-core 跟随末层，避免 p-core 规则被静默丢成小核
+        assert_eq!((e, p, h), (set(&[0, 1]), set(&[2, 3]), set(&[2, 3])));
+        assert!(degraded);
+    }
+
+    /// 全离线的簇整层消失：不能留一个空层去占 hp-core 的位置
+    #[test]
+    fn all_tiers_drop_fully_offline_cluster() {
+        let online = set(&[0, 1, 2, 3]);
+        let entries = vec![
+            grp(&[0, 1], 300, 0),
+            grp(&[2, 3], 700, 0),
+            grp(&[4, 5], 1024, 0), // 整簇离线
+        ];
+        let (tiers, src) = classify_tiers(&entries, &online);
+        assert_eq!(tiers.len(), 2, "离线簇不该占层：{:?}", tiers);
+        let (e, p, h, degraded) = derive_cores(&tiers, &online, src);
+        assert_eq!(e, set(&[0, 1]));
+        assert_eq!(p, set(&[2, 3]), "hp 落回最后仍在线的那层");
+        assert_eq!(h, set(&[2, 3]));
+        assert!(degraded);
+    }
+
     #[test]
     fn numeric_ranges_respect_present_mask() {
         let present = set(&[0, 2, 4]);
@@ -1216,6 +1397,71 @@ mod tests {
         assert_eq!(parse_cpu_ranges("1-5", Some(&present)), set(&[2, 4]));
     }
 
+    fn topo3() -> CpuTopology {
+        CpuTopology {
+            present_cpus: set(&[0, 1, 2, 3, 4, 5, 6, 7]),
+            present_str: "0-7".into(),
+            mems_str: "0".into(),
+            cpuset_enabled: true,
+            e_core: set(&[0, 1, 2, 3]),
+            p_core: set(&[4, 5]),
+            hp_core: set(&[6, 7]),
+            all_tiers: vec![set(&[0, 1, 2, 3]), set(&[4, 5]), set(&[6, 7])],
+            topo_source: "capacity",
+            topo_degraded: false,
+        }
+    }
+
+    /// 占位符与旧语义名必须展开成同一集合：新增写法是为了「配置里一眼看出
+    /// 这是按拓扑展开的」，不是为了引入第二套语义
+    /// 启动行的层数按原始层，不按三档去重
+    #[test]
+    fn topo_line_reports_real_cluster_count() {
+        let mut t = topo3();
+        let line = topo_line(&t);
+        assert!(line.contains("核心层 3"), "{}", line);
+        assert!(!line.contains("并集"), "三簇不该提并集：{}", line);
+
+        // 四簇：p-core 是中间两层并集，必须写出来
+        t.all_tiers = vec![set(&[0]), set(&[1, 2]), set(&[3, 4]), set(&[5, 6, 7])];
+        t.p_core = set(&[1, 2, 3, 4]);
+        t.hp_core = set(&[5, 6, 7]);
+        let line = topo_line(&t);
+        assert!(line.contains("核心层 4"), "{}", line);
+        assert!(line.contains("p-core 为中间 2 层并集"), "{}", line);
+
+        // 降级：不能说「核心层 N」，否则会被读成分层成功
+        t.topo_degraded = true;
+        let line = topo_line(&t);
+        assert!(line.contains("未能分层"), "{}", line);
+        assert!(!line.contains("核心层"), "{}", line);
+    }
+
+    #[test]
+    fn brace_placeholders_expand_like_legacy_names() {
+        let t = topo3();
+        assert_eq!(parse_cpu_spec("{e_core}", &t), set(&[0, 1, 2, 3]));
+        assert_eq!(parse_cpu_spec("{p_core}", &t), set(&[4, 5]));
+        assert_eq!(parse_cpu_spec("{hp_core}", &t), set(&[6, 7]));
+        assert_eq!(parse_cpu_spec("{all_core}", &t), t.present_cpus);
+
+        // 旧写法永久兼容，两者结果必须一致
+        assert_eq!(parse_cpu_spec("e-core", &t), parse_cpu_spec("{e_core}", &t));
+        assert_eq!(
+            parse_cpu_spec("hp-core", &t),
+            parse_cpu_spec("{hp_core}", &t)
+        );
+
+        // 与数字混合、花括号里写连字符都要认
+        assert_eq!(parse_cpu_spec("{hp_core},0", &t), set(&[0, 6, 7]));
+        assert_eq!(parse_cpu_spec("{hp-core}", &t), set(&[6, 7]));
+
+        // 未知占位符不能悄悄展开成全集——那会把「写错了」变成「绑了所有核」
+        assert_eq!(parse_cpu_spec("{x_core}", &t).count(), 0);
+        assert!(!is_semantic_core("{x_core}"));
+        assert!(is_semantic_core("{e_core}"));
+        assert!(is_semantic_core("all-core"));
+    }
     fn grp(cpus: &[usize], capacity: u64, max_freq: u64) -> CoreGroup {
         CoreGroup {
             cpus: cpus.to_vec(),

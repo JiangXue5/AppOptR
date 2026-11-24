@@ -1098,6 +1098,7 @@ mod tests {
             e_core: e,
             p_core: p,
             hp_core: h,
+            all_tiers: vec![e, p, h],
             topo_source: "capacity",
             topo_degraded: false,
         }
