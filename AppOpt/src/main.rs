@@ -9,6 +9,7 @@ mod cpuset;
 mod diag;
 mod diag_fmt;
 mod ebpf_mode;
+mod lifecycle;
 mod proc_mode;
 mod roles;
 mod rt;
@@ -325,6 +326,13 @@ fn main() {
     }
     CONFIG_UPDATED.store(true, Ordering::Release);
 
+    // 上次若是被 `kill -9` 结束的，账本随进程消失而线程仍挂在 AppOpt 各组里。
+    // 先对账：仍匹配规则的交给下面的全量扫描重新接管，已不匹配规则但还在
+    // 子组里的移回主体（在线全核）解除限制，原组未知的一律不猜
+    if let Some(cfg) = lock_ignore_poison(&CURRENT_CONFIG).clone() {
+        crate::lifecycle::sweep_orphans(&cfg);
+    }
+
     // RT 全局参数只在这里改一次，配置热更新走循环里的 prepare
     if let Some(cfg) = lock_ignore_poison(&CURRENT_CONFIG).clone() {
         rt::prepare(&cfg);
@@ -389,7 +397,12 @@ fn main() {
 
     loop {
         if SHUTDOWN.load(Ordering::Acquire) {
-            crate::diag::tag("事件", "收到退出信号，正在还原 RT 状态");
+            crate::diag::tag("事件", "收到退出信号：先释放接管，再还原 RT 状态");
+            // 规则还在，但模块要走：线程不该继续留在 AppOpt/<集合> 里被限制。
+            // 身份、组归属、外部改写三项检查照做，拿不准的一律不动
+            if let Some(cfg) = lock_ignore_poison(&CURRENT_CONFIG).clone() {
+                crate::lifecycle::release_unmanaged(&cfg, true);
+            }
             rt::shutdown();
             break;
         }
@@ -446,6 +459,9 @@ fn main() {
         // 模式切换必须立即生效：`on -> off` 依赖 policy_sig 变化触发全量重扫，
         // 这里同时清空 S7 状态，让已迁移线程按规则重新落地
         if config_changed {
+            // 规则可能被删掉了：先把不再受管的线程还回原组，再回收空目录。
+            // 顺序不能反——线程还留在子组里，目录就不是空的，GC 只会白跑一趟
+            crate::lifecycle::release_unmanaged(&cfg, false);
             // 只改规则时模式不变，set_mode 会直接返回；不单独唤醒，
             // 新规则最坏要等一个休眠间隔（30 秒）才参与判定
             sched_state.note_config_change();
@@ -741,13 +757,16 @@ fn apply_move_ebpf(es: &mut EbpfState, cfg: &AppConfig, m: &sched::Move) -> Affi
             // 不改这里，迁移结果几秒后就被拉回规则值
             if let Some(e) = es.cache.tasks.get_mut(&m.tid) {
                 e.cpus = m.cpus;
+                // 账本里的「最后写入」也要跟上：释放前拿它判断是否被外部改过，
+                // 停在旧值会让一次正常的 S7 迁移被误判成外部改写
+                crate::lifecycle::note_applied(m.tid, &m.cpus, &e.cpuset_dir);
             }
             // 落点另存一份：缓存随时可能被全量重建，条目里的值活不过一次重扫
             es.cache.note_sched(m.tid, m.cpus);
             AffinityOutcome::Set
         }
         AffinityOutcome::Gone => {
-            es.cache.task_del(m.tid);
+            es.cache.task_gone(m.tid);
             AffinityOutcome::Gone
         }
         AffinityOutcome::Failed => AffinityOutcome::Failed,
@@ -772,12 +791,13 @@ fn apply_move_proc(ps: &mut ProcScanState, cfg: &AppConfig, m: &sched::Move) -> 
             }
             if let Some(e) = ps.cache.tasks.get_mut(&m.tid) {
                 e.cpus = m.cpus;
+                crate::lifecycle::note_applied(m.tid, &m.cpus, &e.cpuset_dir);
             }
             ps.cache.note_sched(m.tid, m.cpus);
             AffinityOutcome::Set
         }
         AffinityOutcome::Gone => {
-            ps.cache.task_del(m.tid);
+            ps.cache.task_gone(m.tid);
             AffinityOutcome::Gone
         }
         AffinityOutcome::Failed => AffinityOutcome::Failed,

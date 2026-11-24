@@ -239,6 +239,15 @@ impl ProcCache {
         crate::diag::unbind_pkg(tid);
     }
 
+    /// 线程确实退出了：缓存与账本一起清。
+    ///
+    /// 账本不能放进 `task_del`：「不再匹配规则」也走那条路，而那种线程还活着，
+    /// 账必须留着，否则规则一删就没有依据把它还回原组
+    pub fn task_gone(&mut self, tid: i32) {
+        self.task_del(tid);
+        crate::lifecycle::forget(tid);
+    }
+
     /// S7 迁移成功。落点单独存，重建缓存后仍能维持
     pub fn note_sched(&mut self, tid: i32, cpus: CpuSet) {
         self.sched.insert(tid, cpus);
@@ -253,6 +262,8 @@ impl ProcCache {
     pub fn purge_pid(&mut self, pid: i32) {
         self.tasks.retain(|_, e| e.pid != pid);
         self.sched.retain(|tid, _| self.tasks.contains_key(tid));
+        // 进程没了，账本里属于它的记录也一并作废：没有线程可还
+        crate::lifecycle::forget_pid(pid);
     }
 
     /// 包规则变更时清理该包全部线程，返回被清理的 tid 供调用方同步内核表
@@ -380,6 +391,13 @@ impl ProcCache {
             path.as_deref(),
         );
         let prev_applied = prev.is_some_and(|old| old.applied);
+        // 首次接管前先记住「原来在哪一组、什么亲和性」——写完就再也读不回来了。
+        // 只在首次绑定读一次，稳态复核不付这个开销
+        let original = if prev_applied {
+            (None, CpuSet::default())
+        } else {
+            (path.clone(), CpuSet::get_affinity(tid).unwrap_or_default())
+        };
         if target.blocked {
             crate::diag::note_sysgroup_skip(tid, comm, group, &result.cpus, eff.as_deref());
             self.tasks.insert(
@@ -410,6 +428,22 @@ impl ProcCache {
         } else {
             prev_applied
         };
+        // 账本只在真的接管成功时记：匹配到规则但没写进去不算，否则规则一删
+        // 就会去释放一个我们从没动过的线程
+        if outcome == AffinityOutcome::Set {
+            if prev_applied {
+                crate::lifecycle::note_applied(tid, &target.cpus, &result.cpuset_dir);
+            } else {
+                crate::lifecycle::note_managed(
+                    tid,
+                    pkg,
+                    comm,
+                    original,
+                    &target.cpus,
+                    &result.cpuset_dir,
+                );
+            }
+        }
 
         self.tasks.insert(
             tid,
@@ -522,6 +556,13 @@ impl ProcCache {
             } else {
                 ApplyReason::Rule
             };
+            // 首次绑定前留一份原始状态。`reuse` 要求 `applied` 为真，
+            // 与这里互斥，所以 !applied 时 `path` 是这一轮真实读到的组
+            let original = if e.applied {
+                (None, CpuSet::default())
+            } else {
+                (path.clone(), CpuSet::get_affinity(*tid).unwrap_or_default())
+            };
             // 掩码对但组不对时补写一次组归属。短路复用组时不必校验：
             // 那一轮的组本来就记着 Own
             let verify_group = need_verify_group(
@@ -532,6 +573,7 @@ impl ProcCache {
                 path.as_deref(),
             );
             // 只有「读回与期望不一致」才会真写，写入次数就是被外部改写的线程数
+            let was_applied = e.applied;
             let (outcome, wrote) = affinity_apply(
                 *tid,
                 &e.cpus,
@@ -544,6 +586,23 @@ impl ProcCache {
             if wrote {
                 e.applied = true;
                 rebind_now += 1;
+            }
+            // 接管成功才记账。失败时保留旧账：线程还在我们组里，只是这一轮
+            // 没写成，规则一删仍然要能还回去。
+            // 只有写成功（或首次登记）才动账本：稳态每轮都加锁是白费
+            if outcome == AffinityOutcome::Set && (wrote || !was_applied) {
+                if was_applied {
+                    crate::lifecycle::note_applied(*tid, &e.cpus, &e.cpuset_dir);
+                } else {
+                    crate::lifecycle::note_managed(
+                        *tid,
+                        &e.pkg,
+                        &e.comm,
+                        original,
+                        &e.cpus,
+                        &e.cpuset_dir,
+                    );
+                }
             }
             match outcome {
                 AffinityOutcome::Set => {
@@ -562,7 +621,7 @@ impl ProcCache {
             }
         }
         for tid in &dead_tids {
-            self.task_del(*tid);
+            self.task_gone(*tid);
         }
         if blocked_now > 0 {
             crate::diag::note_sysgroup_batch(blocked_now as u64, blocked_hint);

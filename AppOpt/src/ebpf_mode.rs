@@ -631,7 +631,7 @@ pub fn event_dispatch(event: &EbpfProcEvent, cfg: &AppConfig, state: &mut EbpfSt
     match event.event_type {
         EBPF_EVENT_EXIT => {
             // 内核态已在 sched_process_exit 里删除 APPLIED_MAP[tid]，此处不再重复删除
-            state.cache.task_del(tid);
+            state.cache.task_gone(tid);
             rt::forget(tid);
         }
 
