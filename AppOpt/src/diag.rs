@@ -186,6 +186,9 @@ struct Seen {
     /// 已经解释过「补写组归属」的线程名。按线程名去重：同名的游戏主线程
     /// 每局都会重建，按 tid 去重等于每局说一遍
     group_fix: HashSet<String>,
+    /// 本窗口是否已经打过「同批线程不再逐条列出」的省略提示。
+    /// 跟着 `counters.group_fix` 一起按窗口清零，否则一局之后永远不再提示
+    group_fix_capped: bool,
 }
 
 /// 本周期样本：给摘要的明细行用，用完即清零。
@@ -1061,6 +1064,20 @@ pub fn note_group_fix(tid: i32, dir: &str, comm: &str) {
     if !s.seen.group_fix.insert(name.clone()) {
         return;
     }
+    // 一批线程首次接管时会同时补组，真机上一分钟三四十条，逐条打印没有信息量。
+    // 前 3 条给出线程名就够定位是哪类线程，剩下的只留一行省略提示，
+    // 总数由 60 秒汇总那行交代。窗口随 counters 一起清零，下一局重新给 3 条
+    const GROUP_FIX_DETAIL: u64 = 3;
+    if s.counters.group_fix > GROUP_FIX_DETAIL {
+        if !s.seen.group_fix_capped {
+            s.seen.group_fix_capped = true;
+            tag(
+                "改写",
+                "…同批线程的组归属也在补写，不再逐条列出（本窗口总数见周期汇总）",
+            );
+        }
+        return;
+    }
     let target = if dir.is_empty() {
         "AppOpt".to_string()
     } else {
@@ -1087,7 +1104,8 @@ pub fn note_render_guard(pkg: &str, comm: &str, target: &CpuSet, reason: &str) {
         return;
     }
     let line = format!(
-        "{} 的 {} 落在 {}：{}。当前只观察不改绑定，确认收益前不要当成故障",
+        "{} 的 {} 落在 {}：{}｜护栏只观察不拦截，规则仍按此目标绑定；\
+         要放宽就改成两个核以上（如 6-7），或写 @render_guard=off",
         pkg,
         comm,
         target.to_range_string(),
@@ -1177,6 +1195,8 @@ pub fn periodic_summary(current: &SchedSnapshot) {
     let ineff = std::mem::take(&mut s.samples.ineffective);
     let stuck = std::mem::take(&mut s.counters.stuck);
     let group_fix = std::mem::take(&mut s.counters.group_fix);
+    // 省略提示跟着窗口走：下一窗口前 3 条又能逐条打出来
+    s.seen.group_fix_capped = false;
     let guards = std::mem::take(&mut s.guard_hits);
     let tally = s.tally.take();
     let prev = s.last_snap.replace(current.clone());

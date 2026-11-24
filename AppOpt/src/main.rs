@@ -101,6 +101,10 @@ struct InstanceLock {
 /// 退出标志。信号处理函数里只做原子写，真正的清理放回主循环
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
+/// 屏态翻转间隔短于这个值，就在日志里标成「疑似抖动」。
+/// 12 秒能盖住 AOD 抬手亮屏（4~8 秒）又不误伤真实的锁屏-解锁操作
+const SCREEN_FLIP_BRIEF: Duration = Duration::from_secs(12);
+
 extern "C" fn on_exit_signal(_sig: libc::c_int) {
     SHUTDOWN.store(true, Ordering::Release);
 }
@@ -357,6 +361,10 @@ fn main() {
     // 息屏判定。只有 @screen=relax 时才探测，默认配置下不读任何 /sys 节点
     let mut screen_state = screen::ScreenState::new();
     let mut screen_relaxed = false;
+    // 上一次屏态翻转的时刻。AOD、抬腕亮屏、双击亮屏会让判据在几秒内反复跳，
+    // 十几秒内的二次翻转几乎都是抖动而不是两次真实操作。状态机照常切换
+    // （宁可多复核），只在文案里标出来，免得用户以为模块自己在乱切
+    let mut screen_flip_at: Option<Instant> = None;
     let mut sched_deadline = Instant::now();
     // 诊断：卡顿信号 1 秒采样（样本够多才可信），线程表 5 秒刷新一次
     let mut jank = diag::JankSampler::new();
@@ -405,17 +413,31 @@ fn main() {
         let mut resume_now = false;
         if relax != screen_relaxed {
             screen_relaxed = relax;
+            let gap = screen_flip_at.map(|t| t.elapsed());
+            screen_flip_at = Some(Instant::now());
+            let brief = gap.filter(|d| *d < SCREEN_FLIP_BRIEF);
             if relax {
-                crate::diag::tag(
-                    "事件",
-                    &format!(
-                        "屏幕熄灭（判据 {}）：周期复核降为 60 秒，S7 与卡顿采样暂停",
-                        screen_state.source()
-                    ),
+                let mut line = format!(
+                    "屏幕熄灭（判据 {}）：周期复核降为 60 秒，S7 与卡顿采样暂停",
+                    screen_state.source()
                 );
+                if let Some(d) = brief {
+                    line.push_str(&format!(
+                        "（距上次点亮仅 {} 秒，疑似 AOD/抬腕抖动，仍按当前状态处理）",
+                        d.as_secs()
+                    ));
+                }
+                crate::diag::tag("事件", &line);
                 sched_state.pause();
             } else {
-                crate::diag::tag("事件", "屏幕点亮：恢复常规周期复核");
+                let mut line = "屏幕点亮：恢复常规周期复核".to_string();
+                if let Some(d) = brief {
+                    line.push_str(&format!(
+                        "（距上次熄灭仅 {} 秒，疑似 AOD/抬腕抖动）",
+                        d.as_secs()
+                    ));
+                }
+                crate::diag::tag("事件", &line);
                 sched_state.resume();
                 resume_now = true;
             }
