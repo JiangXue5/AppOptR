@@ -735,10 +735,15 @@ fn add_rule(
     true
 }
 
-/// 逗号分隔的线程名模式，供 `@rt` 与 `@rt.app` 共用
+/// 逗号或空白分隔的名字列表，供 `@rt`、`@rt.app`、`@blacklist`、`@exempt` 共用。
+///
+/// 空白也算分隔符是为了包容手写配置：`@blacklist=com.a com.b` 和
+/// `@blacklist=com.a,com.b` 在用户眼里是一回事，只认逗号会让前者被当成
+/// 一个名为 `com.a com.b` 的包，静默失效——名单类配置失效没有任何提示，
+/// 用户只会觉得「这个开关没用」
 fn split_names(s: &str) -> Option<Vec<String>> {
     let names: Vec<String> = s
-        .split(',')
+        .split([',', ' ', '\t'])
         .map(str::trim)
         .filter(|x| !x.is_empty() && x.len() < MAX_THREAD_LEN)
         .map(str::to_string)
@@ -1973,5 +1978,22 @@ mod tests {
         assert_ne!(p1.policy_sig, p2.policy_sig);
         assert_ne!(p1.policy_sig, p3.policy_sig);
         assert_ne!(g.policy_sig, t.policy_sig);
+    }
+
+    /// 名单既接受逗号也接受空白。只认逗号时，`@blacklist=com.a com.b`
+    /// 会被当成一个名为 `com.a com.b` 的包——名单失效没有任何提示，
+    /// 用户只会觉得开关坏了
+    #[test]
+    fn name_lists_accept_space_and_comma() {
+        let c = cfg_of("bl_space", "@blacklist=com.a com.b,com.c\ncom.x=0-1\n");
+        assert!(c.is_blacklisted("com.a"));
+        assert!(c.is_blacklisted("com.b"));
+        assert!(c.is_blacklisted("com.c"));
+        assert!(!c.is_blacklisted("com.a com.b"));
+
+        let e = cfg_of("ex_space", "@exempt=com.a\tcom.b\ncom.x=0-1\n");
+        assert!(e.is_exempt("com.a"));
+        assert!(e.is_exempt("com.b"));
+        assert!(!e.is_exempt("com.c"));
     }
 }

@@ -52,14 +52,30 @@ fn need_verify_group(
     migrate && !dir.is_empty() && changed && !reuse && path.is_some_and(|p| !in_own_dir(p, dir))
 }
 
-/// 规则目录对应的绝对组路径。`dir` 为空表示 base 组本身
+/// 规则目录在 `cgroup` 里的层级相对路径（形如 `/AppOpt/6-7`）。
+///
+/// 必须相对：`group_effective*` 收的就是 `thread_cgroup` 这种相对路径，
+/// 内部自己拼 `/dev/cpuset` 前缀。传绝对路径会拼成
+/// `/dev/cpuset/dev/cpuset/AppOpt/6-7`，读不到就退回「组不限制」——
+/// 短路分支里被组裁小的线程会因此按全集重写，被内核再收敛一次
 fn own_dir_path(dir: &str) -> String {
     let base = crate::cpuset::base_cpuset();
+    let name = base.rsplit('/').next().unwrap_or("AppOpt");
     if dir.is_empty() {
-        base
+        format!("/{name}")
     } else {
-        format!("{}/{}", base, dir)
+        format!("/{name}/{dir}")
     }
+}
+
+/// 执行层该传什么目录。豁免包一律 `None`：`affinity_apply` 见到 `None`
+/// 只写掩码、不碰 cpuset。传 `Some("")` 也不行——空串表示「迁到 base 组」，
+/// 那仍然是在抢组归属
+///
+/// `task_apply` 与 `affinity_sync` 共用这一条判据：两处只要有一处口径不同，
+/// 豁免包就会在周期同步里被迁进 AppOpt 组，与 LKT/Uperf 互相覆盖
+fn cpuset_arg(exempt: bool, dir: &str) -> Option<&str> {
+    (!exempt).then_some(dir)
 }
 
 /// 线程当前路径是否就在 `AppOpt/<dir>`。
@@ -254,9 +270,7 @@ impl ProcCache {
         };
         // 豁免包只写亲和性，不迁组：与其他管 cpuset 的模块共存
         let exempt = cfg.is_exempt(pkg);
-        let migrate = cfg.topo.cpuset_enabled
-            && !crate::apply_affinity::cpuset_paused()
-            && !exempt;        // 短路时组已知是 Own，生效集合按规则目录自己算，不再走 /proc
+        let migrate = cfg.topo.cpuset_enabled && !crate::apply_affinity::cpuset_paused() && !exempt; // 短路时组已知是 Own，生效集合按规则目录自己算，不再走 /proc
         let eff = if reuse {
             crate::cpuset::group_effective_cached(&own_dir_path(&result.cpuset_dir))
         } else {
@@ -340,12 +354,13 @@ impl ProcCache {
         }
         // 豁免包传 None：affinity_apply 见到 None 就只写掩码、不碰 cpuset。
         // 传空字符串不行——空字符串表示「迁到 AppOpt 基组」，那仍然是在抢组
-        let dir_arg = if exempt {
-            None
-        } else {
-            Some(result.cpuset_dir.as_str())
-        };
-        let outcome = apply_fn(tid, &target.cpus, dir_arg, recheck, verify_group);
+        let outcome = apply_fn(
+            tid,
+            &target.cpus,
+            cpuset_arg(exempt, &result.cpuset_dir),
+            recheck,
+            verify_group,
+        );
         if outcome == AffinityOutcome::Gone {
             self.tasks.remove(&tid);
             return false;
@@ -546,7 +561,10 @@ impl ProcCache {
             let (outcome, wrote) = affinity_apply(
                 *tid,
                 &e.cpus,
-                Some(&e.cpuset_dir),
+                // 豁免包必须与 task_apply 同口径传 None：这里过去无条件传
+                // Some，导致「只写亲和性」的承诺在周期同步里被推翻——线程
+                // 会被迁进 AppOpt 组，与 LKT/Uperf 互相覆盖
+                cpuset_arg(exempt, &e.cpuset_dir),
                 topo,
                 reason,
                 &e.comm,
@@ -606,6 +624,33 @@ mod tests {
 
     fn set_of(spec: &str) -> CpuSet {
         crate::cpuset::parse_cpu_ranges(spec, None)
+    }
+
+    /// 自有组路径必须是 cgroup 相对形式：`group_effective*` 内部会拼
+    /// `/dev/cpuset` 前缀，传绝对路径就变成 `/dev/cpuset/dev/cpuset/...`，
+    /// 读不到 → 判成「组不限制」→ 按全集重写，再被内核收敛一次
+    #[test]
+    fn own_dir_path_is_cgroup_relative() {
+        let name = crate::cpuset::base_cpuset()
+            .rsplit('/')
+            .next()
+            .unwrap_or("AppOpt")
+            .to_string();
+        assert_eq!(own_dir_path("6-7"), format!("/{name}/6-7"));
+        assert_eq!(own_dir_path(""), format!("/{name}"));
+        let p = own_dir_path("6-7");
+        assert!(!p.starts_with("/dev"), "不能是绝对路径：{p}");
+        assert_eq!(format!("/dev/cpuset{p}"), format!("/dev/cpuset/{name}/6-7"));
+    }
+
+    /// 豁免包在执行层一律不传目录。`task_apply` 与 `affinity_sync` 共用
+    /// 这一条判据——两处只要有一处传 `Some`，周期同步就会把线程迁进
+    /// AppOpt 组，与 LKT/Uperf 抢归属
+    #[test]
+    fn exempt_never_passes_cpuset_dir() {
+        assert_eq!(cpuset_arg(true, "6-7"), None);
+        assert_eq!(cpuset_arg(false, "6-7"), Some("6-7"));
+        assert_eq!(cpuset_arg(false, ""), Some(""));
     }
 
     /// 组归属校验只在「首次 / 目标变更且真的不在目标组」时发生：

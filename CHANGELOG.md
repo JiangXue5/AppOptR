@@ -1,5 +1,57 @@
 # AppOptR 变更记录
 
+## 2.7.0-beta13（2026-11-25）
+
+M2 收口后的全量审查修复。默认配置行为不变；改动集中在「用户显式约束」与
+「自动策略」冲突时的胜负关系，以及三个只在特定配置下才命中、但命中后很难
+自查的问题。
+
+**豁免包在周期同步里仍会被迁组（最严重）**
+
+`cache::affinity_sync` 无条件把 `Some(cpuset_dir)` 传给执行层，`@exempt`
+只在 `task_apply` 里生效。结果是：新线程第一次绑定时不迁组，但下一轮
+60 秒同步就把线程迁进 `AppOpt/<集合>`——恰好是豁免想避免的「与 LKT/Uperf
+抢组归属」。现在两处共用 `cpuset_arg(exempt, dir)` 一条判据。
+
+**降档 / 组限制优先于 S7 落点**
+
+`policy::plan_entry` 的第一档原本是 S7 落点，降档排在后面。开着
+`@foreground_demote=on` 时，刚降到 `e-core` 的后台线程会在下一轮被 S7
+按负载迁回大核，同步再降回来——两轮一抖，日志上还同时出现「S7 落点」和
+「后台降档」两个来源。现在顺序固定为 **降档 > S7 落点 > 规则值**，且
+`S7::decide` 直接跳过 `entry.blocked` 与正在降档的线程（新增跳过原因
+「降档/组限制优先」）。降档不成立时（规则与 `e-core` 无交集）S7 照常工作，
+不是互斥。
+
+**自有组生效集合拼出了重复前缀**
+
+`own_dir_path` 返回绝对路径（`/dev/cpuset/AppOpt/6-7`），而
+`group_effective*` 收的是 `cgroup` 相对路径、内部自己拼 `/dev/cpuset`，
+于是实际读的是 `/dev/cpuset/dev/cpuset/AppOpt/6-7`，读不到就退回
+「组不限制」。短路分支里被组裁小的线程会按全集重写，再被内核收敛一次。
+现在返回 `/AppOpt/6-7`，与 `thread_cgroup` 同口径。
+
+**Auto Assign 三处**
+
+- 同名线程重建（`tid` 变化）时存活时长从头算。原先只更新 `tid` 保留
+  `first`，旧实例的寿命会算到新实例头上，刚起来 2 秒的线程直接是
+  「高置信度」
+- 过期候选会真的从 `AppOpt.autocache.conf` 删掉。原先只在「有新增」时
+  才写文件，过期行会永久堆积，文件内容与界面列表对不上
+- 已被通配规则覆盖的线程不再建议（`Render*` 配过之后不再提示
+  `RenderThread`），判断走 `rule_match::pattern_hits`，与真正的匹配同一口径
+
+**名单分隔符**
+
+`@blacklist` / `@exempt` 现在同时接受逗号与空白：`@blacklist=com.a com.b`
+原先会被解析成一个名为 `com.a com.b` 的包，静默失效。`@rt` /
+`@rt.app` 的名单共用同一解析函数，行为不变。
+
+回归测试新增 9 条，覆盖上述每一条（`exempt_never_passes_cpuset_dir`、
+`demote_wins_over_s7_landing`、`own_dir_path_is_cgroup_relative`、
+`reused_tid_resets_alive_window`、`merge_drops_expired_and_counts_it`、
+`wildcard_rule_covers_candidate`、`name_lists_accept_space_and_comma` 等）。
+
 ## 2.7.0-beta12（2026-11-24）
 
 融合方案 M2 剩下五项一次做完。**默认配置的绑核结果与 beta11 逐核一致**——

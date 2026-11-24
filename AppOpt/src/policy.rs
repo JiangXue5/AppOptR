@@ -186,7 +186,14 @@ pub fn demote(base: &CpuSet, floor: &CpuSet) -> Option<CpuSet> {
 /// 单条线程本轮的目标：能维持 S7 落点就维持，否则回到规则值，
 /// 最后按需降档。
 ///
-/// 返回的第二个值是该落点是否仍然有效，调用方据此决定要不要删除记录。
+/// 优先级（融合方案第十节，M2 收口后定案）：**降档 > S7 落点 > 规则值**。
+/// 降档代表用户对前后台的显式约束，S7 只是按负载挑簇的优化；让 S7 赢会
+/// 出现「降档到小核 → 下一轮 S7 觉得大核更空又迁回去 → 再降回来」的
+/// 双周期抖动，日志上还会同时出现「S7 落点」和「后台降档」两个来源。
+/// 反过来让降档赢，S7 对这类线程直接不参与（见 `sched::decide`），
+/// 两个策略不会互相踩。
+///
+/// 返回的第二个值是该 S7 落点是否仍然有效，调用方据此决定要不要删除记录。
 /// 「落点有效」的判据有两条：仍在规则集合内，且这次规划没有把它裁小
 /// （迁不进自己的组时，被裁小的落点 S7 自己也维持不住，交回规则更稳定）
 pub fn plan_entry(
@@ -198,16 +205,21 @@ pub fn plan_entry(
     migrate: bool,
     floor: Option<&CpuSet>,
 ) -> (Target, Option<CpuSet>) {
+    // 降档成立时，落点直接作废：落点是为「规则原集合」挑的簇，降档后的
+    // 小核集合与它没有关系，留着只会在下一轮被 `landing_for` 判成有效
+    let demoted = floor.and_then(|f| demote(rule, f));
     // 第一档：S7 落点。它已经是规则子集，不再叠加降档——S7 自己会按负载
     // 选簇，再降一次会把「让位」和「降档」两个意图混在一起，日志说不清
-    if let Some(s) = landing_for(rule, landing) {
+    if demoted.is_none()
+        && let Some(s) = landing_for(rule, landing)
+    {
         let t = plan_target(&s, group, eff, respect, migrate, PolicySource::S7);
         if !t.blocked && (t.cpus == s || migrate) {
             return (t, Some(s));
         }
     }
     // 第二档：规则值，按需降档
-    let (base, source) = match floor.and_then(|f| demote(rule, f)) {
+    let (base, source) = match demoted {
         Some(small) => (small, PolicySource::Background),
         None => (*rule, PolicySource::UserRule),
     };
@@ -239,22 +251,17 @@ mod tests {
         let rule = range("0-7");
         let landing = landing_for(&rule, Some(set(&[4, 5, 6, 7])));
         assert_eq!(landing, Some(set(&[4, 5, 6, 7])));
-        let (t, keep) = plan_entry(
-            &rule,
-            landing,
-            SysGroup::Own,
-            None,
-            true,
-            true,
-            None,
-        );
+        let (t, keep) = plan_entry(&rule, landing, SysGroup::Own, None, true, true, None);
         assert_eq!(t.cpus, set(&[4, 5, 6, 7]));
         assert_eq!(keep, Some(set(&[4, 5, 6, 7])));
     }
 
     #[test]
     fn stale_landing_is_dropped_when_rule_shrinks() {
-        assert_eq!(landing_for(&set(&[0, 1, 2, 3]), Some(set(&[4, 5, 6, 7]))), None);
+        assert_eq!(
+            landing_for(&set(&[0, 1, 2, 3]), Some(set(&[4, 5, 6, 7]))),
+            None
+        );
         let (t, keep) = plan_entry(
             &set(&[0, 1, 2, 3]),
             Some(set(&[4, 5, 6, 7])),
@@ -316,9 +323,10 @@ mod tests {
         assert_eq!(keep, None);
     }
 
-    /// S7 落点优先于降档：落点已是子集，再降会说出两个来源
+    /// 降档优先于 S7 落点：否则 S7 会把刚降档的线程迁回大核，两轮一抖。
+    /// 落点同时作废（`keep` 为 None），让 S7 状态跟着清掉
     #[test]
-    fn s7_landing_wins_over_demote() {
+    fn demote_wins_over_s7_landing() {
         let rule = range("0-7");
         let (t, keep) = plan_entry(
             &rule,
@@ -329,9 +337,28 @@ mod tests {
             true,
             Some(&range("0-3")),
         );
-        assert_eq!(t.cpus, range("4-7"));
+        assert_eq!(t.cpus, range("0-3"));
+        assert!(matches!(t.source, PolicySource::Background));
+        assert_eq!(keep, None, "降档生效时不能把落点判成有效");
+    }
+
+    /// 降档不成立（规则与 floor 无交集 / 本来就只在小核）时 S7 照常维持，
+    /// 这是「优先」而不是「互斥」：没降档就不该影响 S7
+    #[test]
+    fn s7_landing_survives_when_demote_is_noop() {
+        let rule = range("4-7");
+        let (t, keep) = plan_entry(
+            &rule,
+            Some(range("4-5")),
+            SysGroup::Own,
+            None,
+            true,
+            true,
+            Some(&range("0-3")),
+        );
+        assert_eq!(t.cpus, range("4-5"));
         assert!(matches!(t.source, PolicySource::S7));
-        assert_eq!(keep, Some(range("4-7")));
+        assert_eq!(keep, Some(range("4-5")));
     }
 
     /// 迁组路径不受组生效集合裁剪：迁进自己的组后组就是我们建的那一个

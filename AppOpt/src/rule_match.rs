@@ -118,6 +118,16 @@ pub fn thread_affinity<'a>(
     }
 }
 
+/// 单条 pattern 是否命中某个线程名。供 Auto Assign 判断「这条线程是否
+/// 已被某条规则覆盖」——只比字符串相等会漏掉 `Render*` 这类通配规则，
+/// 于是界面一直建议一个用户其实早就配过的线程
+pub fn pattern_hits(pattern: &str, name: &str) -> bool {
+    match CString::new(pattern) {
+        Ok(p) => fnmatch_c(&p, name),
+        Err(_) => false,
+    }
+}
+
 /// POSIX fnmatch 封装，需预转换为 CString
 fn fnmatch_c(pattern: &CString, string: &str) -> bool {
     if string.len() >= MAX_THREAD_LEN {
@@ -331,16 +341,13 @@ mod tests {
     }
 
     /// 方案 9.3 的硬要求：用现有配置样本对照，无跨档冲突时结果必须完全一致。
-///
+    ///
     /// 两个样本都来自仓库实际分发的配置（`module/`），覆盖「包级 + 线程规则」、
     /// `Thread-[0-9]?` / `Thread-?` / `RenderThread*` 这些真实写法
     #[test]
     fn shipped_samples_match_legacy_affinity() {
         let topo = init_cpu_topo();
-        for path in [
-            "../module/applist.conf",
-            "../module/applist.asoulopt.conf",
-        ] {
+        for path in ["../module/applist.conf", "../module/applist.asoulopt.conf"] {
             let mut mtime = -1i64;
             let Some(cfg) = crate::config::load_config(path, &topo, &mut mtime) else {
                 panic!("{} 应能解析", path);
@@ -404,10 +411,7 @@ mod tests {
     /// 同档多条规则继续 OR：这是用户已经依赖的语义，不能被优先级改掉
     #[test]
     fn same_tier_rules_still_union() {
-        let cfg = cfg_with(
-            "spec_same",
-            "com.x {\n  Unity*=4-5\n  Unity*=6-7\n}\n",
-        );
+        let cfg = cfg_with("spec_same", "com.x {\n  Unity*=4-5\n  Unity*=6-7\n}\n");
         let r = thread_affinity("com.x", "UnityMain", &cfg).unwrap();
         assert_eq!(r.cpus.to_range_string(), "4-7");
         assert_eq!(r.hits, 2, "两条同档规则都应参与");
@@ -420,7 +424,10 @@ mod tests {
         use crate::config::MatchSpecificity as S;
         assert_eq!(crate::config::spec_of_pattern("RenderThread"), S::Exact);
         assert_eq!(crate::config::spec_of_pattern("Thread-[0-9]?"), S::Range);
-        assert_eq!(crate::config::spec_of_pattern("Thread-?"), S::QuestionWildcard);
+        assert_eq!(
+            crate::config::spec_of_pattern("Thread-?"),
+            S::QuestionWildcard
+        );
         assert_eq!(crate::config::spec_of_pattern("Thread-*"), S::StarWildcard);
         // `*` 能吞掉任意长度，字符类具体度不再成立
         assert_eq!(crate::config::spec_of_pattern("[0-9]*"), S::StarWildcard);

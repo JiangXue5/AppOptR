@@ -86,8 +86,8 @@ fn suggest_cpus(role: Role) -> Option<&'static str> {
 /// 线程已存活多少秒；tid 对不上（线程已退出或被复用）返回 0，视为不可用。
 /// 读不到 `/proc/<tid>/comm` 时不建议：候选列表里不该出现已经消失的线程
 fn alive_for(s: &Seen, thread: &str, now: u64) -> u64 {
-    let alive = fs::read_to_string(format!("/proc/{}/comm", s.tid))
-        .is_ok_and(|c| c.trim() == thread);
+    let alive =
+        fs::read_to_string(format!("/proc/{}/comm", s.tid)).is_ok_and(|c| c.trim() == thread);
     if !alive {
         return 0;
     }
@@ -104,24 +104,39 @@ fn role_label(role: Role) -> &'static str {
     }
 }
 
-/// 观察一条线程。由 `cache::task_apply` 在「首次登记」时调用一次，
-/// 不在稳态路径上重复计数——那会把「线程活得久」算成「置信度高」。
-/// 未知角色的线程也记：它们不进候选列表，但要让包级兜底建议有依据
+/// 观察一条线程。`cache::task_apply` 每次评估都会调一次，判重靠 `(包, 线程名)`，
+/// 重复调用不累加计数——否则「每轮都看到」会被算成「活得久」，置信度虚高
 pub fn note(pkg: &str, thread: &str, tid: i32) {
     if thread.is_empty() {
         return;
     }
+    let now = now_secs();
     let mut guard = lock_ignore_poison(&SEEN);
     let map = guard.get_or_insert_with(HashMap::new);
     let e = map
         .entry((pkg.to_string(), thread.to_string()))
         .or_insert(Seen {
             role: role_of(thread),
-            first: now_secs(),
+            first: now,
             tid,
         });
-    // 线程重建（tid 变了）时把指针指向新线程，存活校验才不会一直看旧号
-    e.tid = tid;
+    // tid 变了 = 同名的旧线程已退出、编号被新线程拿走（线程重建）。
+    // 存活时长必须从头算：沿用旧 `first` 会把上一个实例的寿命算到新实例头上，
+    // 一个刚起来 2 秒的线程能直接显示「高置信度」，采纳后写进配置的却是
+    // 一个还没被观察过的对象
+    if e.tid != tid {
+        e.first = now;
+        e.tid = tid;
+        e.role = role_of(thread);
+    }
+}
+
+/// 这条线程是否已被用户显式配置覆盖（含通配与包级兜底）。
+/// 抽成纯函数：`collect` 依赖 `/proc` 存活探测，只有它能脱离真机单测
+fn covered(cfg: &AppConfig, pkg: &str, thread: &str) -> bool {
+    cfg.rules.iter().any(|r| {
+        r.pkg == pkg && (r.thread.is_empty() || crate::rule_match::pattern_hits(&r.thread, thread))
+    })
 }
 
 /// 生成当前候选。已存在于正式规则里的跳过：用户已经表态过，不必再问
@@ -135,11 +150,8 @@ pub fn collect(cfg: &AppConfig) -> Vec<Candidate> {
         .iter()
         .filter(|((_, thread), s)| alive_for(s, thread, now) >= MIN_ALIVE_SECS)
         .filter_map(|((pkg, thread), s)| {
-            // 已有同包同名的线程规则就不再建议
-            let exists = cfg.rules.iter().any(|r| {
-                r.pkg == *pkg && (r.thread == *thread || r.thread.is_empty())
-            });
-            if exists {
+            // 已有同包同名（含通配）的线程规则就不再建议
+            if covered(cfg, pkg, thread) {
                 return None;
             }
             let cpus = suggest_cpus(s.role)?;
@@ -203,17 +215,22 @@ pub fn collect(cfg: &AppConfig) -> Vec<Candidate> {
     out
 }
 
-/// 从候选文件读。格式损坏的行直接跳过：这是可再生的派生文件，
+/// 从候选文件读，丢弃过期行。格式损坏的行直接跳过：这是可再生的派生文件，
 /// 不该让一行写坏导致整个列表打不开
 pub fn load_file() -> Vec<Candidate> {
+    let now = now_secs();
+    read_all().into_iter().filter(|c| !c.expired(now)).collect()
+}
+
+/// 文件里的全部可解析行，含已过期。`flush` 要靠它统计「这次清掉了几条」——
+/// 只读未过期的列表，过期行会永远留在文件里，越攒越多
+fn read_all() -> Vec<Candidate> {
     let Ok(text) = fs::read_to_string(candidate_path()) else {
         return Vec::new();
     };
-    let now = now_secs();
     text.lines()
         .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
         .filter_map(parse_line)
-        .filter(|c| !c.expired(now))
         .collect()
 }
 
@@ -235,29 +252,33 @@ fn parse_line(line: &str) -> Option<Candidate> {
             "Background" => "Background",
             _ => "Unknown",
         },
-        confidence: if f[4].trim() == "high" { "high" } else { "medium" },
+        confidence: if f[4].trim() == "high" {
+            "high"
+        } else {
+            "medium"
+        },
         reason: "按线程角色推断，未经负载采样验证",
         created_at: f[6].trim().parse().ok()?,
         expires_at: f[7].trim().parse().ok()?,
     })
 }
 
-/// 把内存候选合并进文件。已有的同键候选保留原创建时间——
-/// 每轮都刷新 created_at 会让它永远不过期
-pub fn flush(cfg: &AppConfig) -> usize {
-    if !cfg.auto_assign {
-        return 0;
-    }
-    let fresh = collect(cfg);
-    if fresh.is_empty() {
-        return 0;
-    }
-    let now = now_secs();
-    let mut merged: HashMap<(String, String), Candidate> = load_file()
+/// 合并「文件里已有」与「本轮新采集」：同键保留旧记录（创建时间不能被
+/// 刷新，否则永远不过期），过期的直接丢弃。
+///
+/// 返回 `(合并结果, 新增条数, 清掉的过期条数)`。纯函数，`flush` 只管读写
+fn merge_into(
+    existing: Vec<Candidate>,
+    fresh: Vec<Candidate>,
+    now: u64,
+) -> (Vec<Candidate>, usize, usize) {
+    let total = existing.len();
+    let mut merged: HashMap<(String, String), Candidate> = existing
         .into_iter()
         .filter(|c| !c.expired(now))
         .map(|c| ((c.pkg.clone(), c.thread.clone()), c))
         .collect();
+    let dropped = total - merged.len();
     let mut added = 0;
     for c in fresh {
         let key = (c.pkg.clone(), c.thread.clone());
@@ -266,16 +287,25 @@ pub fn flush(cfg: &AppConfig) -> usize {
         }
         merged.entry(key).or_insert(c);
     }
-    if added == 0 {
-        return 0;
-    }
     let mut list: Vec<Candidate> = merged.into_values().collect();
     list.sort_by(|a, b| a.pkg.cmp(&b.pkg).then(a.thread.cmp(&b.thread)));
-    if write_file(&list).is_ok() {
-        added
-    } else {
-        0
+    (list, added, dropped)
+}
+
+/// 把内存候选合并进文件。
+///
+/// 本函数同时负责**清理过期行**：`load_file` 已经把它们过滤掉了，若只按
+/// 「有没有新增」决定写不写，过期记录会一直躺在文件里。用户打开
+/// `AppOpt.autocache.conf` 看到的是一堆早就失效的建议，与界面上的列表不符
+pub fn flush(cfg: &AppConfig) -> usize {
+    if !cfg.auto_assign {
+        return 0;
     }
+    let (list, added, dropped) = merge_into(read_all(), collect(cfg), now_secs());
+    if added == 0 && dropped == 0 {
+        return 0;
+    }
+    if write_file(&list).is_ok() { added } else { 0 }
 }
 
 fn write_file(list: &[Candidate]) -> std::io::Result<()> {
@@ -355,5 +385,103 @@ mod tests {
     fn malformed_line_is_skipped() {
         assert!(parse_line("a|b|c").is_none());
         assert!(parse_line("a|b|c|Worker|high|r|x|2").is_none());
+    }
+
+    fn rule(pkg: &str, thread: &str) -> crate::config::AffinityRule {
+        crate::config::AffinityRule {
+            pkg: pkg.to_string(),
+            thread: thread.to_string(),
+            thread_pattern: std::ffi::CString::new(thread).unwrap_or_default(),
+            spec: crate::config::spec_of_pattern(thread),
+            cpuset_dir: String::new(),
+            cpus: crate::cpuset::CpuSet::new(),
+        }
+    }
+
+    fn cand(pkg: &str, thread: &str, created: u64, expires: u64) -> Candidate {
+        Candidate {
+            pkg: pkg.into(),
+            thread: thread.into(),
+            cpus: "e-core".into(),
+            role: "Worker",
+            confidence: "medium",
+            reason: "r",
+            created_at: created,
+            expires_at: expires,
+        }
+    }
+
+    /// 过期行必须被丢掉：只在「有新增」时才写文件的话，一条早就失效的
+    /// 建议会永远留在 `AppOpt.autocache.conf` 里，与界面列表对不上
+    #[test]
+    fn merge_drops_expired_and_counts_it() {
+        let old = vec![
+            cand("com.a", "Old", 100, 200),
+            cand("com.a", "Live", 100, 900),
+        ];
+        let (list, added, dropped) = merge_into(old, Vec::new(), 500);
+        assert_eq!(dropped, 1);
+        assert_eq!(added, 0);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].thread, "Live");
+    }
+
+    /// 同键保留旧的创建时间：每轮刷新会让 created_at 永远是「现在」，
+    /// 30 天过期永远不会触发
+    #[test]
+    fn merge_keeps_original_created_at() {
+        let old = vec![cand("com.a", "RenderThread", 100, 900)];
+        let (list, added, dropped) =
+            merge_into(old, vec![cand("com.a", "RenderThread", 800, 900)], 500);
+        assert_eq!((added, dropped), (0, 0));
+        assert_eq!(list[0].created_at, 100);
+    }
+
+    /// 通配规则已经覆盖的线程不再给建议：`Render*` 配过之后再提示
+    /// 「建议给 RenderThread 加规则」属于重复劳动
+    #[test]
+    fn wildcard_rule_covers_candidate() {
+        let mut cfg = AppConfig::empty();
+        cfg.rules.push(rule("com.a", "Render*"));
+        assert!(covered(&cfg, "com.a", "RenderThread"));
+        assert!(!covered(&cfg, "com.a", "AudioTrack"));
+        // 别的包的通配不构成覆盖
+        assert!(!covered(&cfg, "com.b", "RenderThread"));
+    }
+
+    /// 包级规则覆盖包内全部线程，不必逐条建议
+    #[test]
+    fn package_rule_covers_every_thread() {
+        let mut cfg = AppConfig::empty();
+        cfg.rules.push(rule("com.a", ""));
+        assert!(covered(&cfg, "com.a", "Anything"));
+    }
+
+    /// 同名线程重建（tid 变了）时存活时长从头算：否则旧实例活了一小时，
+    /// 新实例刚起来就被标成「高置信度」
+    #[test]
+    fn reused_tid_resets_alive_window() {
+        reset();
+        let pkg = "com.test.reuse";
+        let thread = "RenderThread";
+        note(pkg, thread, 12345);
+        {
+            let mut g = lock_ignore_poison(&SEEN);
+            let m = g.as_mut().expect("已登记");
+            m.get_mut(&(pkg.to_string(), thread.to_string()))
+                .expect("键存在")
+                .first = 0;
+        }
+        note(pkg, thread, 54321);
+        let g = lock_ignore_poison(&SEEN);
+        let s = g
+            .as_ref()
+            .unwrap()
+            .get(&(pkg.to_string(), thread.to_string()))
+            .unwrap();
+        assert_ne!(s.first, 0, "tid 变化后 first 必须重置");
+        assert_eq!(s.tid, 54321);
+        drop(g);
+        reset();
     }
 }

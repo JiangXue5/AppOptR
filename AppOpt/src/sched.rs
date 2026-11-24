@@ -77,7 +77,10 @@ pub const SKIP_QUOTA: usize = 5;
 /// 采样本身拿不到（`/proc/stat` 读失败、计数器回绕）：与「负载不达标」分开，
 /// 前者该降频，后者是正常判定结果
 pub const SKIP_SAMPLE: usize = 6;
-pub const SKIP_LABELS: [&str; 7] = [
+/// 被其他策略否决：与所在组无交集（`blocked`）或正在后台降档。这类线程
+/// 的落点由 `policy::plan_entry` 决定，S7 再迁一次就是两个策略互相踩
+pub const SKIP_POLICY: usize = 7;
+pub const SKIP_LABELS: [&str; 8] = [
     "允许集合不足两层",
     "线程角色不可迁移",
     "目标没有明显更空",
@@ -85,6 +88,7 @@ pub const SKIP_LABELS: [&str; 7] = [
     "冷却中",
     "目标簇配额已满",
     "负载采样不可用",
+    "降档/组限制优先",
 ];
 
 const CLUSTER_NAME: [&str; 3] = ["e-core", "p-core", "hp-core"];
@@ -300,7 +304,7 @@ pub struct SchedSnapshot {
     /// 因角色、目标簇核数等约束被拒的线程次
     pub blocked: u64,
     /// 各跳过原因计数，下标见 `SKIP_LABELS`
-    pub skip: [u64; 7],
+    pub skip: [u64; 8],
     /// 被反悔冷却拦住的次数
     pub bounced: u64,
     /// 抖动过多被冻结的线程数
@@ -321,7 +325,7 @@ pub struct SchedState {
     moved: u64,
     failed: u64,
     blocked: u64,
-    skip: [u64; 7],
+    skip: [u64; 8],
     bounced: u64,
     frozen: u64,
     threads: HashMap<i32, ThreadState>,
@@ -365,7 +369,7 @@ impl SchedState {
             moved: 0,
             failed: 0,
             blocked: 0,
-            skip: [0; 7],
+            skip: [0; 8],
             bounced: 0,
             frozen: 0,
             threads: HashMap::new(),
@@ -689,6 +693,21 @@ impl SchedState {
             // 豁免包不参与 S7：迁移会改写掩码与组归属，等于覆盖另一个模块
             // 正在做的管理。方案 14.2 的边界
             if cfg.is_exempt(&entry.pkg) {
+                continue;
+            }
+            // 被组拦住、或正在后台降档的线程同样不参与：这两类落点由
+            // `policy::plan_entry` 决定（优先级：降档 > S7 落点 > 规则值）。
+            // S7 在这里再迁一次，就会把刚降到小核的线程拽回大核，下一轮
+            // 同步再降回来——两轮一抖，日志上还会同时出现两个来源
+            if entry.blocked
+                || crate::background::should_demote(
+                    cfg.foreground_demote,
+                    entry.is_thread_rule,
+                    tid,
+                    entry.group,
+                )
+            {
+                self.skip[SKIP_POLICY] += 1;
                 continue;
             }
 
