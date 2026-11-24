@@ -627,6 +627,53 @@ pub fn sched_set(path: &str, mode: &str) -> RuleEdit {
     file_write(path, &lines)
 }
 
+/// 行为开关的目标键。用枚举而不是裸字符串：Web 端直接把 JSON 里的名字
+/// 传进来，拼错一个字母就会在配置里留一行 `@scren=relax`，而配置解析只会
+/// 报「格式无效」，用户看不出是自己拼错了
+#[derive(Clone, Copy)]
+pub enum BehaviorKey {
+    /// 息屏时放松周期复核
+    Screen,
+    /// 渲染护栏（观察模式）
+    RenderGuard,
+    /// 首次绑定是否接管 cpuset 组
+    Group,
+}
+
+impl BehaviorKey {
+    fn name(self) -> &'static str {
+        match self {
+            BehaviorKey::Screen => "screen",
+            BehaviorKey::RenderGuard => "render_guard",
+            BehaviorKey::Group => "group",
+        }
+    }
+
+    /// 布尔值映射到配置里的取值。每个键的两个取值都显式写出，
+    /// 不写成「真 = 第一个」的隐式约定：`group` 的默认值是 `own`，
+    /// 顺序一反过来就会把默认行为翻过去
+    fn value(self, on: bool) -> &'static str {
+        match (self, on) {
+            (BehaviorKey::Screen, true) => "relax",
+            (BehaviorKey::Screen, false) => "off",
+            (BehaviorKey::RenderGuard, true) => "observe",
+            (BehaviorKey::RenderGuard, false) => "off",
+            (BehaviorKey::Group, true) => "own",
+            (BehaviorKey::Group, false) => "mask",
+        }
+    }
+}
+
+/// 写一个全局开关指令。只动这一个键，规则行与其它 `@` 指令原样保留
+pub fn behavior_set(path: &str, key: BehaviorKey, on: bool) -> RuleEdit {
+    let _guard = crate::lock_ignore_poison(&WRITE_LOCK);
+    let Ok(mut lines) = read_conf(path) else {
+        return RuleEdit::IoErr;
+    };
+    directive_put(&mut lines, key.name(), Some(key.value(on)));
+    file_write(path, &lines)
+}
+
 /// 进阶参数一次写盘：`@unmatched`、`@rt.max`、`@rt.timeslice`。
 /// `None` 表示该键不动。三者互不依赖，但分三次写会留下中间态，
 /// 配置线程可能读到只改了一半的文件
@@ -800,6 +847,55 @@ pub fn rt_toggle(path: &str, pkg: &str, enabled: bool) -> RuleEdit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 行为开关只改自己那一个键：规则、注释、其它指令都要原样留着。
+    /// 另外 `group` 的 on/off 映射到 `own`/`mask` 是反直觉的（on=own），
+    /// 写错了会把默认行为翻过去，所以逐个断言
+    #[test]
+    fn behavior_set_touches_only_target_directive() {
+        let dir = format!("/tmp/appopt_behavior_{}", std::process::id());
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let conf = format!("{}/applist.conf", dir);
+        fs::write(
+            &conf,
+            "# 顶部注释\n@sched=on\ncom.a=0-3\ncom.b=4-7  # 尾部注释\n",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            behavior_set(&conf, BehaviorKey::Screen, true),
+            RuleEdit::Ok
+        ));
+        assert!(matches!(
+            behavior_set(&conf, BehaviorKey::Group, false),
+            RuleEdit::Ok
+        ));
+        let out = fs::read_to_string(&conf).unwrap();
+        assert!(out.contains("@screen=relax"), "{out}");
+        assert!(out.contains("@group=mask"), "{out}");
+        assert!(out.contains("@sched=on"), "不能动其它指令: {out}");
+        assert!(out.contains("com.a=0-3"), "不能动规则: {out}");
+        assert!(
+            out.contains("com.b=4-7  # 尾部注释"),
+            "行尾注释要保留: {out}"
+        );
+
+        // 再打开一次：同一个键只能有一行，不能越写越多
+        behavior_set(&conf, BehaviorKey::Screen, false);
+        behavior_set(&conf, BehaviorKey::Screen, true);
+        let out = fs::read_to_string(&conf).unwrap();
+        assert_eq!(out.matches("@screen=").count(), 1, "同键只能留一行: {out}");
+        assert!(out.contains("@screen=relax"));
+
+        // 三个键的取值映射
+        assert_eq!(BehaviorKey::Screen.value(true), "relax");
+        assert_eq!(BehaviorKey::RenderGuard.value(true), "observe");
+        assert_eq!(BehaviorKey::Group.value(true), "own");
+        assert_eq!(BehaviorKey::Group.value(false), "mask");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     /// 非 UTF-8 文件必须报错而不是当成空文件：旧实现会把整个配置替换成一条规则
     #[test]

@@ -5,15 +5,20 @@
 # 完成：工具链检查 → 编译 eBPF → 编译用户态 → 按架构组织模块目录 → 打包 ZIP
 #
 # 用法：
-#   ./build.sh                 构建当前主机架构
-#   ./build.sh -a arm64        构建 arm64-v8a（需 aarch64 交叉链接器）
-#   ./build.sh -a x64          构建 x86_64（需 x86_64 交叉链接器）
+#   ./build.sh -a arm64        构建 arm64-v8a（默认，静态 musl，不需要 NDK）
+#   ./build.sh -a x64          构建 x86_64
 #   ./build.sh -a all          两个架构都构建
 #   ./build.sh -a arm64 --skip-ebpf
+#   ./build.sh                 构建当前主机架构（仅 Termux 等 Android 主机有意义）
 #
 # 说明：
 #   - 产物输出到 dist/，不覆盖 modules_update/ 下的正式发布包。
 #   - 构建目录 .build/、cargo 的 target/ 均不入库。
+#   - 默认目标是 *-unknown-linux-musl（静态单体，无动态依赖）。Rust 的 musl
+#     目标自带 crt 与 libc.a，链接器用随工具链分发的 rust-lld，因此不需要
+#     NDK。之前默认的 *-linux-android 反而编不过：代码用了 SCHED_OTHER，
+#     且 inotify_rm_watch 的 wd 在 bionic 下是 u32，与 Linux 签名不同。
+#   - 需要 NDK 时可显式覆盖：APPOPT_ARM64_TRIPLE=aarch64-linux-android
 #   - eBPF 目标 bpfel 与宿主架构无关，两个架构共用同一份 AppOpt-ebpf。
 #   - 缺少工具链时脚本明确报错退出，不会伪造产物。
 
@@ -87,9 +92,29 @@ abi_of() {
 
 triple_of() {
 	case "$1" in
-	arm64) echo "${APPOPT_ARM64_TRIPLE:-aarch64-linux-android}" ;;
-	x64) echo "${APPOPT_X64_TRIPLE:-x86_64-linux-android}" ;;
+	arm64) echo "${APPOPT_ARM64_TRIPLE:-aarch64-unknown-linux-musl}" ;;
+	x64) echo "${APPOPT_X64_TRIPLE:-x86_64-unknown-linux-musl}" ;;
 	esac
+}
+
+# musl 静态链接的两个变量都必须显式给：
+#   - linker 默认会去找主机 cc，链接阶段报「cannot find -lc」
+#   - self-contained 让 rustc 用自带 crt 与 libc.a，而不是主机的 glibc
+#
+# 只能设目标专属的 `CARGO_TARGET_<TRIPLE>_RUSTFLAGS`。设全局 RUSTFLAGS 会把
+# `-C link-self-contained` 一起传给 eBPF 编译，bpfel-unknown-none 不支持该
+# 选项，构建会在「编译 eBPF」这一步直接失败——这个坑已经踩过一次
+musl_linker_env() {
+	local triple="$1" upper linker_var flags_var
+	upper=$(printf '%s' "$triple" | tr 'a-z-' 'A-Z_')
+	linker_var="CARGO_TARGET_${upper}_LINKER"
+	flags_var="CARGO_TARGET_${upper}_RUSTFLAGS"
+	if [ -z "${!linker_var:-}" ]; then
+		export "${linker_var}=rust-lld"
+	fi
+	if [ -z "${!flags_var:-}" ]; then
+		export "${flags_var}=-C link-self-contained=yes"
+	fi
 }
 
 # ---------- 1. 基础工具 ----------
@@ -113,20 +138,29 @@ check_target() {
 	if ! rustup target list --installed 2>/dev/null | grep -qx "$triple"; then
 		die "缺少 Rust target $triple，请执行: rustup target add $triple"
 	fi
-	# *-android 用 NDK 的 clang，*_TRIPLE 环境变量可覆盖以便改用 musl/gnu 目标
-	local linker_var
-	linker_var="CARGO_TARGET_$(echo "$triple" | tr 'a-z-' 'A-Z_')_LINKER"
-	if [ -z "${!linker_var:-}" ]; then
-		if [ "$arch" = "arm64" ]; then
-			command -v aarch64-linux-android-clang >/dev/null 2>&1 ||
-				[ -n "${ANDROID_NDK_HOME:-}${NDK:-}" ] ||
-				die "缺少 aarch64 交叉链接器（aarch64-linux-android-clang 或 ANDROID_NDK_HOME）"
-		else
-			command -v x86_64-linux-android-clang >/dev/null 2>&1 ||
-				[ -n "${ANDROID_NDK_HOME:-}${NDK:-}" ] ||
-				die "缺少 x86_64 交叉链接器（x86_64-linux-android-clang 或 ANDROID_NDK_HOME）"
+	case "$triple" in
+	*-musl)
+		# 静态 musl：crt 与 libc.a 由 rust 自带，链接器用 rust-lld。
+		# 用户显式设过 LINKER / RUSTFLAGS 时不覆盖
+		musl_linker_env "$triple"
+		;;
+	*)
+		# *-android 或其它目标走外部链接器，*_TRIPLE 可覆盖成 musl/gnu
+		local linker_var
+		linker_var="CARGO_TARGET_$(echo "$triple" | tr 'a-z-' 'A-Z_')_LINKER"
+		if [ -z "${!linker_var:-}" ]; then
+			if [ "$arch" = "arm64" ]; then
+				command -v aarch64-linux-android-clang >/dev/null 2>&1 ||
+					[ -n "${ANDROID_NDK_HOME:-}${NDK:-}" ] ||
+					die "缺少 aarch64 交叉链接器（aarch64-linux-android-clang 或 ANDROID_NDK_HOME）"
+			else
+				command -v x86_64-linux-android-clang >/dev/null 2>&1 ||
+					[ -n "${ANDROID_NDK_HOME:-}${NDK:-}" ] ||
+					die "缺少 x86_64 交叉链接器（x86_64-linux-android-clang 或 ANDROID_NDK_HOME）"
+			fi
 		fi
-	fi
+		;;
+	esac
 }
 
 # ---------- 3. eBPF 工具链 ----------
@@ -140,6 +174,12 @@ check_ebpf() {
 }
 
 build_ebpf() {
+	# eBPF 目标只支持极少数 codegen 选项。全局 RUSTFLAGS 里的 linker 参数
+	# （例如 `-C link-self-contained`）会让这一步直接报
+	# "option ... is not supported on this target"，提前说出来省得排查
+	if [ -n "${RUSTFLAGS:-}" ]; then
+		say "    注意: 检测到全局 RUSTFLAGS，eBPF 目标可能不支持其中某些选项"
+	fi
 	say "==> 编译 eBPF 程序 ($EBPF_TRIPLE)"
 	(
 		cd "$ROOT/AppOpt-ebpf"

@@ -1,5 +1,34 @@
 # AppOptR 变更记录
 
+## 2.7.0-beta2（2026-11-24）
+
+在 beta1 基础上补 WebUI 开关与打包脚本，判定逻辑没动。versionCode 与 beta1
+相同（269），手动刷 zip 即覆盖。
+
+**WebUI**
+
+- 设置页新增三个开关：**息屏放松**、**渲染护栏**、**接管组归属**。切换即写盘
+  并立即重载，日志里的策略行同步显示当前值
+- 接口 `POST /api/behavior`，参数 `{"key":"screen|render_guard|group","on":true|false}`。
+  开关名走枚举白名单：前端拼错一个字母不会在配置里留一行无效指令
+- 关闭时写 `@键=off` 而不是删行，让用户在配置文件里能直接看到当前状态
+
+**打包脚本**
+
+- `build.sh` 默认目标从 `*-linux-android` 改为 `*-unknown-linux-musl`。代码在
+  android 目标下编不过（`SCHED_OTHER` 在 bionic 绑定里缺失、`inotify_rm_watch`
+  的 wd 是 u32），此前一直靠环境变量绕开默认值。现在 `./build.sh -a all`
+  裸跑即可出两个架构
+- 自动为目标设置 `rust-lld` 与 `-C link-self-contained=yes`，不再需要 NDK
+- eBPF 编译前检测全局 `RUSTFLAGS`：`-C link-self-contained` 会让
+  `bpfel-unknown-none` 直接报 "option not supported on this target"
+
+**验证**
+
+- `POST /api/behavior` 三条路径实测：写盘位置正确、`GET /api/config` 回读一致、
+  非法键名与缺字段返回 400、无令牌 401
+- `cargo test` 206 passed；`./build.sh -a all` 产出 arm64 与 x86_64 两个包
+
 ## 2.7.0-beta1（2026-11-24）
 
 测试版，用于真机验证三项新能力与一项接管修复。默认配置下行为与 2.6.1 一致，

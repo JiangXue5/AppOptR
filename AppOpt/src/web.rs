@@ -24,8 +24,8 @@ use crate::diag;
 use crate::ebpf_mode::ebpf_probe;
 use crate::rt;
 use crate::rule_edit::{
-    RuleEdit, adv_configure, rt_app_set, rt_configure, rt_toggle, rule_delete, rule_delete_pkg,
-    rule_rename, rule_upsert, sched_set,
+    BehaviorKey, RuleEdit, adv_configure, behavior_set, rt_app_set, rt_configure, rt_toggle,
+    rule_delete, rule_delete_pkg, rule_rename, rule_upsert, sched_set,
 };
 use crate::sched::SCHED_SNAPSHOT;
 use crate::{EBPF_GAVE_UP, MAX_PKG_LEN, MAX_THREAD_LEN, lock_ignore_poison};
@@ -569,6 +569,7 @@ fn dispatch(out: &mut TcpStream, req: &Request) {
         ("POST", "/api/rt/app") => rt_app_api(req),
         ("POST", "/api/rt/toggle") => rt_toggle_api(req),
         ("POST", "/api/sched") => sched_api(req),
+        ("POST", "/api/behavior") => behavior_api(req),
         ("POST", "/api/adv") => adv_api(req),
         ("POST", "/api/suggest") => suggest_api(req),
         _ => err_json(404, "not found"),
@@ -992,6 +993,22 @@ fn config_json() -> String {
         Some(c) if !c.sysgroup_respect => "takeover",
         _ => "respect",
     };
+    // 三个行为开关同样取配置真值：切换后要立刻反映，不能等主循环刷新。
+    // 配置尚未加载时按默认值回，避免界面显示成「未知」再跳变
+    let screen = if cfg.as_ref().is_some_and(|c| c.screen_relax) {
+        "relax"
+    } else {
+        "off"
+    };
+    let render_guard = if cfg.as_ref().is_some_and(|c| c.render_guard_observe) {
+        "observe"
+    } else {
+        "off"
+    };
+    let group = match cfg.as_ref() {
+        Some(c) if !c.group_own => "mask",
+        _ => "own",
+    };
     let snap = lock_ignore_poison(&SCHED_SNAPSHOT)
         .clone()
         .unwrap_or_default();
@@ -1020,6 +1037,9 @@ fn config_json() -> String {
         "rt_max": rt_max,
         "rt_timeslice": rt_ts,
         "sysgroup": sysgroup,
+        "screen": screen,
+        "render_guard": render_guard,
+        "group": group,
         "sched_mode": sched_mode,
         "sched_state": s_state,
         "sched_ticks": s_ticks,
@@ -1356,6 +1376,34 @@ fn sched_api(req: &Request) -> (u16, String) {
                 200,
                 json!({ "ok": true, "levels": levels, "inactive": inactive }).to_string(),
             )
+        }
+        RuleEdit::Malformed => err_json(409, "配置文件存在未闭合块，请修复后重试"),
+        _ => err_json(500, "配置文件写入失败"),
+    }
+}
+
+/// 行为开关：`@screen`、`@render_guard`、`@group`。一次只改一个键，
+/// 与 `@sched` 走同一条路径（写盘 → 立即重载），改完日志里的策略行会自证
+fn behavior_api(req: &Request) -> (u16, String) {
+    let Ok(v) = serde_json::from_slice::<Value>(&req.body) else {
+        return err_json(400, "请求体不是合法 JSON");
+    };
+    let key = match v["key"].as_str() {
+        Some("screen") => BehaviorKey::Screen,
+        Some("render_guard") => BehaviorKey::RenderGuard,
+        Some("group") => BehaviorKey::Group,
+        Some(_) => return err_json(400, "未知的开关名"),
+        None => return err_json(400, "缺少 key 字段"),
+    };
+    let Some(on) = v["on"].as_bool() else {
+        return err_json(400, "缺少 on 字段（true / false）");
+    };
+
+    let file = lock_ignore_poison(&CONFIG_FILE).clone();
+    match behavior_set(&file, key, on) {
+        RuleEdit::Ok => {
+            config_reload_now();
+            (200, json!({ "ok": true }).to_string())
         }
         RuleEdit::Malformed => err_json(409, "配置文件存在未闭合块，请修复后重试"),
         _ => err_json(500, "配置文件写入失败"),

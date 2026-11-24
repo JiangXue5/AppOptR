@@ -254,6 +254,15 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div class="hint">按三个核心层的实时负载，把跨簇规则里的 Worker 线程挪到空闲层。<b>观察</b>完整走判定但只记日志、不改亲和性，建议先跑几天确认候选合理再开<b>开启</b>。仅在规则允许 ≥2 个核心层、且线程为 Worker/Background 时生效。</div>
 </div>
 <div class="card">
+<div class="card-title">息屏放松</div>
+<div class="seg" id="seg-screen">
+<button data-key="screen" data-val="off" data-on="0">关闭</button>
+<button data-key="screen" data-val="relax" data-on="1">开启</button>
+</div>
+<div class="hint" id="c-screen-state">-</div>
+<div class="hint">屏幕熄灭后，把已绑定线程的复查间隔从几秒拉长到 60 秒，并暂停 S7 采样与卡顿统计，省电。<b>新启动的应用照样立刻绑定</b>，不受影响。判据依次读 <span class="mono">screen_state</span>、背光实际亮度、背光设定亮度、<span class="mono">dpms</span>；四级都读不到时按亮屏处理，等于本开关不生效。</div>
+</div>
+<div class="card">
 <div class="card-title">RT 实时调度</div>
 <div class="seg" id="seg-rt">
 <button data-rt="off">关闭</button>
@@ -264,6 +273,15 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div class="hint">在「规则」页点应用右侧的 <b style="color:var(--orange)">RT</b> 按钮即可开启，参数固定为 AsoulOpt 默认：自动挑选 Critical 线程、每应用最多 2 个、RR 时间片 3 ms。全部关闭后内核时间片自动还原。RT 只在该应用的允许核心不超过 2 个时生效。</div>
 </div>
 <div class="card">
+<div class="card-title">渲染护栏</div>
+<div class="seg" id="seg-render">
+<button data-key="render_guard" data-val="off" data-on="0">关闭</button>
+<button data-key="render_guard" data-val="observe" data-on="1">观察</button>
+</div>
+<div class="hint" id="c-render-state">-</div>
+<div class="hint">关键线程（<span class="mono">RenderThread</span>、<span class="mono">UnityMain</span> 等）被绑到不含性能核、或只剩一个核的集合时，在日志里按包记数并提示一次，<b>不改变任何绑定</b>。先用它确认「这条规则是不是把渲染线程关进了小核」，再决定要不要改规则。只有线程级规则能判定，包级规则没有线程名。</div>
+</div>
+<div class="card">
 <div class="card-title">系统分组</div>
 <div class="seg" id="seg-sysgroup">
 <button data-sysgroup="respect">尊重</button>
@@ -271,6 +289,15 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 </div>
 <div class="hint" id="c-sysgroup-state">-</div>
 <div class="hint">系统会把应用线程划进 <b>background</b> 等组，该组可用核心不含规则要的大核，此时迁组和绑核都会被内核拒绝（日志记「系统分组」）。<b>尊重</b>：跳过并保留系统限制，省电（默认）。<b>强制绑核</b>（<span class="mono">@sysgroup=takeover</span>）：把线程拉出系统组再绑到目标核，能绑上，但后台应用也会占用大核，待机功耗会上升。</div>
+</div>
+<div class="card">
+<div class="card-title">接管组归属</div>
+<div class="seg" id="seg-group">
+<button data-key="group" data-val="own" data-on="1">接管（默认）</button>
+<button data-key="group" data-val="mask" data-on="0">只写掩码</button>
+</div>
+<div class="hint" id="c-group-state">-</div>
+<div class="hint"><b>接管</b>：首次绑定或规则变更时把线程迁进 <span class="mono">AppOpt/&lt;集合&gt;</span> 组，系统就不会再把亲和性收敛回 <span class="mono">top-app</span>——这是「每分钟被改写上百次」的成因。<b>只写掩码</b>是 2.6.1 的行为，只用于对照排查，长期使用会反复被系统冲掉。</div>
 </div>
 <div class="card">
 <div class="card-title">cpuset</div>
@@ -896,6 +923,21 @@ async function loadCfg(){
     $('c-unmatched').textContent=d.unmatched==='all'?'all（未命中规则的线程设为全部核心）':'keep（未命中规则的线程保持原亲和性）';
     $('c-cross').textContent=d.cluster_levels<2?'不适用（当前识别为 '+d.cluster_levels+' 个核心层）':d.cross_rules+' / '+d.rules_total+' 条，'+d.cross_pkgs+' 个包';
     $('c-rt').textContent=d.rt||'off';
+    const sc=d.screen==='relax'?'relax':'off';
+    setSeg('seg-screen',sc);
+    $('c-screen-state').textContent=sc==='relax'
+      ?'当前：开启 · 息屏后复查降到 60 秒，S7 与卡顿采样暂停'
+      :'当前：关闭 · 息屏与亮屏按同一节奏复核';
+    const rgd=d.render_guard==='observe'?'observe':'off';
+    setSeg('seg-render',rgd);
+    $('c-render-state').textContent=rgd==='observe'
+      ?'当前：观察中 · 只记数与提示，不改任何绑定'
+      :'当前：关闭 · 不做护栏判定';
+    const gp=d.group==='mask'?'mask':'own';
+    setSeg('seg-group',gp);
+    $('c-group-state').textContent=gp==='own'
+      ?'当前：接管组归属 · 迁入 AppOpt 组后不再被系统收敛'
+      :'当前：只写掩码 · 2.6.1 行为，可能被系统反复冲掉';
     const sg=d.sysgroup==='takeover'?'takeover':'respect';
     document.querySelectorAll('#seg-sysgroup button').forEach(b=>b.classList.toggle('on',b.dataset.sysgroup===sg));
     $('c-sysgroup-state').textContent=sg==='takeover'
@@ -932,6 +974,26 @@ document.querySelectorAll('#seg-sysgroup button').forEach(b=>b.onclick=async()=>
     loadCfg();
   }catch(e){toast(e.message)}
 });
+// 三个行为开关共用同一个接口，只有键名与提示语不同。
+// 统一用 data-key / data-val / data-on，避免 data-render-guard 这类
+// 带下划线的属性名在 dataset 里变成驼峰、取不到值
+function setSeg(id,val){
+  document.querySelectorAll('#'+id+' button').forEach(b=>b.classList.toggle('on',b.dataset.val===val));
+}
+function bindBehavior(id,onText,offText){
+  document.querySelectorAll('#'+id+' button').forEach(b=>b.onclick=async()=>{
+    const on=b.dataset.on==='1';
+    try{
+      await api('/api/behavior',{key:b.dataset.key,on:on});
+      toast(on?onText:offText);
+      loadCfg();
+    }catch(e){toast(e.message)}
+  });
+}
+bindBehavior('seg-screen','已开启息屏放松','已关闭息屏放松');
+bindBehavior('seg-render','已开启渲染护栏（仅观察）','已关闭渲染护栏');
+bindBehavior('seg-group','已改为接管组归属','已改为只写掩码（退回 2.6.1）');
+
 async function saveField(body){
   try{await api('/api/config',body);toast('已保存');loadCfg()}
   catch(e){toast(e.message)}
