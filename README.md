@@ -58,6 +58,24 @@ http://appopt.suto.top
 | `@rt.app` | `<包名> on\|off [auto\|names:名1,名2] [上限]` | — | 单个应用的 RT 条目。参数省略时按 `auto` 与 `@rt.max`。 |
 | `@sysgroup` | `respect` / `takeover` | `respect` | 线程被 Android 放进 `background`/`system-background`/`restricted` 组时，该组的生效集合只有小核。`respect` 尊重系统安排，规则要的大核绑不上就跳过并说明；`takeover` 强行把线程拉进 AppOpt 组再绑（大核跑后台，耗电上升）。 |
 | `@group` | `own` / `mask` | `own` | 首次绑定或目标变更时，把线程迁进 `AppOpt/<集合>` 组。只在掩码上绑、不接管组时，系统会在进程状态变化时把亲和性收敛回组允许集合——这是「绑上又被冲掉」的主因。`mask` 退回 2.6.1 的「只写掩码」行为。 |
+| `@foreground_demote` | `on` / `off` | `off` | 前后台降档。`on` 时，判为后台（系统后台组，或已被接管但 `oom_score_adj ≥ 900`）且**没有显式线程规则**的线程，目标缩到 `e-core`。应用切回前台后按规则原值重算，不会停在降档值上。 |
+| `@blacklist` | `<包名>[,<包名>…]` | — | 完全不管理：不读 cmdline/comm、不匹配规则、不进 S7/RT。可写多行累加。新增后热加载会立即把已在 `AppOpt` 组里的线程还回去。 |
+| `@exempt` | `<包名>[,<包名>…]` | — | 半管理：只写 `sched_setaffinity`，不迁组、不补组、不参与 S7。给 LKT / Uperf 这类同样管 cpuset 的模块让路，避免两边互相覆盖。 |
+| `@auto_assign` | `on` / `off` | `off` | 采集 Auto Assign 候选，写入同目录的 `AppOpt.autocache.conf`（30 天过期）。只观察、不改规则；在 WebUI 规则页逐条采纳或忽略，采纳才会经 `rule_edit` 写进主配置。 |
+
+### CPU 规格怎么写
+
+规则右边可以写数字范围，也可以写语义核心名：
+
+| 写法 | 含义 |
+|------|------|
+| `0-3`、`4,5,7` | 直接写核号，可用逗号与区间 |
+| `e-core` / `{e_core}` | 能效核（最低一档） |
+| `p-core` / `{p_core}` | 大核（中间层；四簇机器上是中间两层的并集） |
+| `hp-core` / `{hp_core}` | 超大核（最高一档） |
+| `all-core` / `{all_core}` | 当前在线的全部核 |
+
+语义名按 `cpu_capacity` 分层，缺这个节点时回退 `cpuinfo_max_freq`。两者都读不到时启动行会写「未能分层」，此时三个语义名都指向全集——规则不会失效，但也不再区分核心层。启动行会如实报层数，四簇机器写「核心层 4（p-core 为中间 2 层并集）」。
 
 ```
 @unmatched=all
