@@ -256,6 +256,10 @@ pub struct AppConfig {
     /// Auto Assign 候选采集：`@auto_assign=on` 打开，默认关。
     /// 只写 `AppOpt.autocache.conf`，不改主配置
     pub auto_assign: bool,
+    /// PMU 观察：`@pmu=observe` 打开，默认关。只读硬件计数器、
+    /// 只写日志与 Web 面板，**不参与任何迁移决策**——这是 M3 第一阶段的
+    /// 边界，执行路径上没有任何一行会因为本开关而改变
+    pub pmu_observe: bool,
     pub topo: CpuTopology,
 }
 
@@ -312,6 +316,9 @@ impl AppConfig {
             || self.rt.policy(pkg).is_some()
             // Auto Assign 靠线程名判角色；不开这个开关就没有任何额外读取
             || (self.auto_assign && self.pkgs.contains(pkg))
+            // PMU 的输出必须回答「这是谁的线程」：只写 tid 的采样表
+            // 对排查没有用，用户没法把一行数字对应到具体线程
+            || (self.pmu_observe && self.pkgs.contains(pkg))
     }
 
     /// 是否存在真正会被管理的 RT 应用。全局时间片是否改写以此为闸门：
@@ -354,6 +361,7 @@ impl AppConfig {
             exempt: HashSet::new(),
             foreground_demote: false,
             auto_assign: false,
+            pmu_observe: false,
             topo: CpuTopology::empty(),
         }
     }
@@ -974,6 +982,8 @@ pub fn load_config(
     // 两个新增策略默认关：默认配置的绑核结果必须与 2.6.1 一致
     let mut foreground_demote = false;
     let mut auto_assign = false;
+    // PMU 只采样、不迁移，默认关；关掉时运行期一次 perf 系统调用都不发
+    let mut pmu_observe = false;
     let mut rt = RtConfig::default();
     // 分应用条目先收集原文，等 @rt.max 解析完再统一构造，避免配置行顺序影响缺省上限
     let mut rt_apps: Vec<String> = Vec::new();
@@ -1015,6 +1025,8 @@ pub fn load_config(
                 ("foreground_demote", "off") => foreground_demote = false,
                 ("auto_assign", "on") => auto_assign = true,
                 ("auto_assign", "off") => auto_assign = false,
+                ("pmu", "observe" | "on") => pmu_observe = true,
+                ("pmu", "off") => pmu_observe = false,
                 // 名单可写多行、逗号或空格分隔；空值不算错误，等价于本行无效
                 ("blacklist", v) | ("exempt", v) if v.is_empty() => {}
                 ("blacklist", v) | ("exempt", v) => match split_names(v) {
@@ -1296,6 +1308,12 @@ pub fn load_config(
     if foreground_demote {
         extra.push("前后台降档=on（后台线程压到 e-core）".to_string());
     }
+    if auto_assign {
+        extra.push("Auto Assign=on（只写候选文件）".to_string());
+    }
+    if pmu_observe {
+        extra.push("PMU 观察=on（只采样，不迁移）".to_string());
+    }
     if !blacklist.is_empty() {
         extra.push(format!("黑名单 {} 个包（完全不管理）", blacklist.len()));
     }
@@ -1385,6 +1403,7 @@ pub fn load_config(
         exempt,
         foreground_demote,
         auto_assign,
+        pmu_observe,
         topo: topo.clone(),
     })
 }

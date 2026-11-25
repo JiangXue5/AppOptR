@@ -12,6 +12,7 @@ mod diag;
 mod diag_fmt;
 mod ebpf_mode;
 mod lifecycle;
+mod pmu;
 mod policy;
 mod proc_mode;
 mod roles;
@@ -388,6 +389,9 @@ fn main() {
     let mut jank_deadline = Instant::now();
     let mut diag_deadline = Instant::now();
     let mut summary_deadline = Instant::now();
+    // PMU 观察窗口。与 S7 独立：S7 要快，PMU 靠窗口差分才稳定。
+    // 默认关，关掉时 tick 只是清一次状态就返回
+    let mut pmu_deadline = Instant::now();
 
     // 恢复的强制 proc 模式无需 eBPF 初始化
     let mut ebpf_state: Option<EbpfState> = if MODE_FORCE.load(Ordering::Relaxed) == 2 {
@@ -709,6 +713,22 @@ fn main() {
                 }
 
                 sched_state.publish();
+            }
+        }
+
+        // PMU 观察：只采样、只写日志与 Web 面板，不参与任何迁移决策。
+        // 息屏时暂停（关 FD）：这段时间的计数不代表前台体验，而且息屏后
+        // 进程本来就不干活，开着只是白占 FD
+        if pmu_deadline.elapsed() >= pmu::SAMPLE_WINDOW {
+            pmu_deadline = Instant::now();
+            if relax {
+                pmu::pause();
+            } else {
+                match (&ebpf_state, &proc_state) {
+                    (Some(es), _) => pmu::tick(&cfg, &es.cache),
+                    (None, Some(ps)) => pmu::tick(&cfg, &ps.cache),
+                    _ => {}
+                }
             }
         }
 

@@ -636,6 +636,12 @@ pub enum BehaviorKey {
     Screen,
     /// 首次绑定是否接管 cpuset 组
     Group,
+    /// 前后台降档
+    Demote,
+    /// Auto Assign 候选采集
+    AutoAssign,
+    /// PMU 观察（只采样）
+    Pmu,
 }
 
 impl BehaviorKey {
@@ -643,6 +649,9 @@ impl BehaviorKey {
         match self {
             BehaviorKey::Screen => "screen",
             BehaviorKey::Group => "group",
+            BehaviorKey::Demote => "foreground_demote",
+            BehaviorKey::AutoAssign => "auto_assign",
+            BehaviorKey::Pmu => "pmu",
         }
     }
 
@@ -655,6 +664,14 @@ impl BehaviorKey {
             (BehaviorKey::Screen, false) => "off",
             (BehaviorKey::Group, true) => "own",
             (BehaviorKey::Group, false) => "mask",
+            (BehaviorKey::Demote, true) => "on",
+            (BehaviorKey::Demote, false) => "off",
+            (BehaviorKey::AutoAssign, true) => "on",
+            (BehaviorKey::AutoAssign, false) => "off",
+            // 值名与开关名不同：`@pmu=observe` 明确写着「只观察」，
+            // 避免被理解成「开启 PMU 调度」
+            (BehaviorKey::Pmu, true) => "observe",
+            (BehaviorKey::Pmu, false) => "off",
         }
     }
 }

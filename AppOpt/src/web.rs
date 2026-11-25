@@ -1080,6 +1080,10 @@ fn config_json() -> String {
         Some(c) if !c.group_own => "mask",
         _ => "own",
     };
+    // 新增的三个开关同样取配置真值，界面切换后立即反映
+    let demote = cfg.as_ref().is_some_and(|c| c.foreground_demote);
+    let auto_assign = cfg.as_ref().is_some_and(|c| c.auto_assign);
+    let pmu = cfg.as_ref().is_some_and(|c| c.pmu_observe);
     let snap = lock_ignore_poison(&SCHED_SNAPSHOT)
         .clone()
         .unwrap_or_default();
@@ -1110,6 +1114,9 @@ fn config_json() -> String {
         "sysgroup": sysgroup,
         "screen": screen,
         "group": group,
+        "demote": demote,
+        "auto_assign": auto_assign,
+        "pmu": pmu,
         "sched_mode": sched_mode,
         "sched_state": s_state,
         "sched_ticks": s_ticks,
@@ -1131,6 +1138,7 @@ fn config_json() -> String {
 /// 因此这里的 `actual` 最多滞后 5 秒，够用来发现「一直没绑上」
 fn diag_json() -> String {
     let d = diag::snapshot();
+    let pmu_snap = crate::pmu::snapshot();
     let snap = lock_ignore_poison(&SCHED_SNAPSHOT)
         .clone()
         .unwrap_or_default();
@@ -1205,6 +1213,24 @@ fn diag_json() -> String {
         "jank": jank,
         "pressure": d.pressure,
         "threads": threads,
+        "pmu": {
+            "state": pmu_snap.state,
+            "fds": pmu_snap.fds,
+            "budget": pmu_snap.budget,
+            "threads": pmu_snap.threads,
+            "windows": pmu_snap.windows,
+            "miss_ok": pmu_snap.miss_ok,
+            "samples": pmu_snap.samples.iter().map(|s| json!({
+                "tid": s.tid,
+                "pkg": s.pkg,
+                "comm": s.comm,
+                "inst": s.inst,
+                "cycles": s.cycles,
+                "misses": s.misses,
+                "cpi": (s.cpi() * 100.0).round() / 100.0,
+                "mips": (s.inst_per_ms() * 10.0).round() / 10.0,
+            })).collect::<Vec<_>>(),
+        },
         "events": d.events,
     })
     .to_string()
@@ -1461,6 +1487,9 @@ fn behavior_api(req: &Request) -> (u16, String) {
     let key = match v["key"].as_str() {
         Some("screen") => BehaviorKey::Screen,
         Some("group") => BehaviorKey::Group,
+        Some("foreground_demote") => BehaviorKey::Demote,
+        Some("auto_assign") => BehaviorKey::AutoAssign,
+        Some("pmu") => BehaviorKey::Pmu,
         Some(_) => return err_json(400, "未知的开关名"),
         None => return err_json(400, "缺少 key 字段"),
     };
