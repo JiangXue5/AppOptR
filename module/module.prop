@@ -1,6 +1,6 @@
 id=AppOpt
 name=线程优化
-version=2.7.0-beta15
+version=2.7.0-beta16
 versionCode=279
 author=Suto
 description=一个支持自定义规则的安卓应用线程CPU亲和性优化程序
