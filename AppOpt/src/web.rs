@@ -1220,6 +1220,7 @@ fn diag_json() -> String {
             "threads": pmu_snap.threads,
             "windows": pmu_snap.windows,
             "miss_ok": pmu_snap.miss_ok,
+            "mode": pmu_snap.mode,
             "samples": pmu_snap.samples.iter().map(|s| json!({
                 "tid": s.tid,
                 "pkg": s.pkg,
@@ -1231,6 +1232,8 @@ fn diag_json() -> String {
                 "mips": (s.mips() * 10.0).round() / 10.0,
                 // 部分设备只放出 cycles：面板要能退到这一项，不能显示 0
                 "gcyc": (s.gcyc() * 100.0).round() / 100.0,
+                "cpu_ms": (s.cpu_ms() * 10.0).round() / 10.0,
+                "cpu_pct": (s.cpu_pct() * 10.0).round() / 10.0,
                 "window_ms": s.window_ms,
             })).collect::<Vec<_>>(),
         },

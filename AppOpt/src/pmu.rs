@@ -62,13 +62,22 @@ const INDEX_CYCLES: usize = 1;
 const INDEX_MISS: usize = 2;
 
 const PERF_TYPE_HARDWARE: u32 = 0;
+const PERF_TYPE_SOFTWARE: u32 = 1;
 const PERF_COUNT_HW_CPU_CYCLES: u64 = 0;
 const PERF_COUNT_HW_INSTRUCTIONS: u64 = 1;
 const PERF_COUNT_HW_CACHE_MISSES: u64 = 3;
+/// 每线程实际占用 CPU 的纳秒数。不依赖 PMU 硬件，绝大多数内核都放行；
+/// 硬件计数器读 0 时用它兜底，至少能回答「谁在吃 CPU」
+const PERF_COUNT_SW_TASK_CLOCK: u64 = 1;
+/// `read_format` 带上 enabled / running，才能判断「事件有没有被调度过」：
+/// 只读一个计数时，0 分不清是「没干活」还是「PMU 被厂商占着没排上」
+const READ_FORMAT_TIME: u64 = 1 | 2;
 /// `PERF_ATTR_SIZE_VER0`：只声明第一版布局，老内核也能收
 const PERF_ATTR_SIZE: u32 = 64;
 /// `exclude_hv`：Android 上没有有意义的 hypervisor 时间
 const FLAG_EXCLUDE_HV: u64 = 1 << 6;
+/// `exclude_kernel`：只统计用户态。paranoid 挡住内核计数时用这一档
+const FLAG_EXCLUDE_KERNEL: u64 = 1 << 5;
 
 /// `perf_event_attr` 的前 64 字节（`PERF_ATTR_SIZE_VER0`）。
 ///
@@ -104,6 +113,9 @@ pub struct Sample {
     pub cycles: u64,
     /// cache-misses 增量。设备不支持时为 `None`，不是 0
     pub misses: Option<u64>,
+    /// 窗口内 CPU 时间（纳秒）。硬件计数器不可用时用它计量，
+    /// 此时 inst / cycles 恒为 0，`cpu_ns` 为 `Some`
+    pub cpu_ns: Option<u64>,
     /// 本样本覆盖的实际窗口长度（毫秒）。主循环是 2 秒一跳，采样窗口
     /// 实际会是 6 秒左右，用固定 5 秒算速率会系统性偏高
     pub window_ms: u64,
@@ -130,19 +142,40 @@ impl Sample {
         self.cycles as f64 / (self.window_ms.max(1) as f64 * 1_000_000.0)
     }
 
-    /// 本窗口是否真的在干活。**不能只看 inst**：部分内核/厂商只放出
-    /// cycles 计数，instructions 常读 0，按 inst 判活跃会把整台机器的
-    /// 样本全丢掉，表现为「开了一堆 FD 却永远没有活跃线程」
-    pub fn is_active(&self) -> bool {
-        self.inst > 0 || self.cycles > 0
+    /// 窗口内 CPU 时间（毫秒）
+    pub fn cpu_ms(&self) -> f64 {
+        self.cpu_ns.unwrap_or(0) as f64 / 1_000_000.0
     }
 
-    /// 日志里的速率描述：有指令就说指令速率，只有周期就说周期速率
+    /// 占单核的百分比。窗口 6 秒、CPU 时间 3 秒 → 50%
+    pub fn cpu_pct(&self) -> f64 {
+        if self.window_ms == 0 {
+            return 0.0;
+        }
+        self.cpu_ms() / self.window_ms as f64 * 100.0
+    }
+
+    /// 本窗口是否真的在干活。**不能只看 inst**：部分内核/厂商只放出
+    /// cycles 计数，instructions 常读 0；也有设备两个硬件计数器都不计数，
+    /// 只能靠 CPU 时间。三种情况任一生效都算活跃
+    pub fn is_active(&self) -> bool {
+        self.inst > 0 || self.cycles > 0 || self.cpu_ns.unwrap_or(0) > 0
+    }
+
+    /// 日志里的速率描述：有指令说指令速率，只有周期说周期速率，
+    /// 都没有就说 CPU 占用
     pub fn rate_text(&self) -> String {
         if self.inst > 0 {
             format!("{:.0} M/s CPI {:.2}", self.mips(), self.cpi())
         } else if self.cycles > 0 {
             format!("{:.2} Gcyc/s", self.gcyc())
+        } else if self.cpu_ns.is_some() {
+            format!(
+                "{:.0}% CPU（{:.0} ms/{} ms）",
+                self.cpu_pct(),
+                self.cpu_ms(),
+                self.window_ms
+            )
         } else {
             "0".to_string()
         }
@@ -159,6 +192,8 @@ pub struct PmuSnapshot {
     pub threads: usize,
     pub windows: u64,
     pub miss_ok: bool,
+    /// 当前计量方式：「指令计数」或「CPU 时间」
+    pub mode: String,
     pub samples: Vec<Sample>,
 }
 
@@ -214,9 +249,23 @@ impl Drop for Slot {
     }
 }
 
+/// 计量方式。硬件计数器最准，但不少设备（尤其厂商锁了 PMU 的机型）
+/// 能打开、能读、值恒为 0；这种时候退到 CPU 时间，至少还有「谁在吃 CPU」
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Mode {
+    /// instructions / cycles / cache-misses
+    Hw,
+    /// TASK_CLOCK：每线程实际占用 CPU 的纳秒数
+    Sw,
+}
+
 struct Pmu {
     /// 一旦置位就不再尝试：权限、内核不支持、FD 耗尽都属这一类
     off: Option<String>,
+    mode: Mode,
+    /// 只统计用户态。`perf_event_paranoid >= 2` 时内核计数会被拒，
+    /// 打开会直接 EACCES；退一步只算用户态至少能拿到数据
+    exclude_kernel: bool,
     slots: HashMap<i32, Slot>,
     /// 本轮最多允许打开多少个线程
     budget: usize,
@@ -235,8 +284,8 @@ struct Pmu {
     /// 连续多少个窗口「FD 开着、线程在跑，但计数器一个字节都没涨」。
     /// 这既不是「没线程」也不是「没权限」，是设备真的不计数，必须单独说
     zero_windows: u8,
-    /// 已经报告过「计数器不计数」，不再重复刷屏
-    blind_reported: bool,
+    /// 读到了 0 且 time_running = 0：内核从未调度过这个事件
+    starved: bool,
     /// 最近一次读计数器的 errno，用来解释「Fd 开着但读不出来」
     read_err: Option<i32>,
     /// 连续读失败的窗口数
@@ -247,6 +296,8 @@ impl Pmu {
     fn new() -> Self {
         Self {
             off: None,
+            mode: Mode::Hw,
+            exclude_kernel: false,
             slots: HashMap::new(),
             budget: 0,
             windows: 0,
@@ -262,7 +313,7 @@ impl Pmu {
             last_had_samples: false,
             last_tick: None,
             zero_windows: 0,
-            blind_reported: false,
+            starved: false,
             read_err: None,
             read_fails: 0,
         }
@@ -388,15 +439,18 @@ pub fn tick(cfg: &AppConfig, cache: &ProcCache) {
                     continue;
                 }
             }
-            match read_sample(slot, *tid, window_ms) {
+            match read_sample(slot, *tid, window_ms, p.mode) {
                 ReadOut::Got(s) => {
                     p.read_fails = 0;
                     p.read_err = None;
                     fresh.push(s);
                 }
-                ReadOut::Flat => {
+                ReadOut::Flat { starved } => {
                     p.read_fails = 0;
                     p.read_err = None;
+                    if starved {
+                        p.starved = true;
+                    }
                 }
                 ReadOut::Err(errno) => {
                     p.read_err = Some(errno);
@@ -415,16 +469,36 @@ pub fn tick(cfg: &AppConfig, cache: &ProcCache) {
     let busy = active_tids.len();
     if busy > 0 && p.open_threads() > 0 && fresh.is_empty() && p.read_err.is_none() {
         p.zero_windows = p.zero_windows.saturating_add(1);
-        if p.zero_windows >= ZERO_WINDOWS && !p.blind_reported {
-            p.blind_reported = true;
-            let reason = "硬件计数器读数为 0（线程在跑，instructions/cycles 都不涨；\
-                          内核或厂商未向用户态开放 PMU 计数）";
-            disable(p, reason.to_string());
-            publish(p, format!("不可用：{reason}"));
-            return;
-        }
     } else {
         p.zero_windows = 0;
+        p.starved = false;
+    }
+
+    if p.zero_windows >= ZERO_WINDOWS {
+        if p.mode == Mode::Hw {
+            // 硬件计数器能打开、能读，但值恒为 0：这台机器的 PMU 没有
+            // 向用户态开放（真机 sgame 实测，109 个线程全 0）。退到
+            // TASK_CLOCK 至少还能回答「谁在吃 CPU」，而这是第二阶段
+            // 分重/中/轻真正要的输入
+            let why = if p.starved {
+                "计数器从未被调度（PMU 被厂商独占）"
+            } else {
+                "instructions/cycles 读数恒为 0（内核未向用户态开放 PMU）"
+            };
+            crate::diag::tag(
+                "PMU",
+                &format!(
+                    "硬件计数器不可用：{why}；改用软件计时（CPU 时间）继续观察，绑核结果不受影响"
+                ),
+            );
+            switch_to_sw(p, p.exclude_kernel);
+            publish(p, "运行中（CPU 时间）".to_string());
+            return;
+        }
+        let reason = "硬件计数器与软件计时都读不到增量（PMU 与 TASK_CLOCK 均被拒绝）";
+        disable(p, reason.to_string());
+        publish(p, format!("不可用：{reason}"));
+        return;
     }
 
     // 只给「有 tick 增量」的线程开 FD。方案 16.2：活跃线程才开，
@@ -441,7 +515,29 @@ pub fn tick(cfg: &AppConfig, cache: &ProcCache) {
         if slot.any_fd() {
             continue;
         }
-        if let Err((reason, fatal)) = open_slot(p, tid) {
+        if let Err((reason, fatal, perm)) = open_slot(p, tid) {
+            // 权限失败还有两步退让。paranoid >= 2 挡的是内核计数，
+            // 先把 exclude_kernel 打开（仍是指令/周期，信息量最大），
+            // 还不行再退到软件计时
+            if perm && p.mode == Mode::Hw && !p.exclude_kernel {
+                crate::diag::tag(
+                    "PMU",
+                    &format!("{reason}；改为只统计用户态（exclude_kernel=1）继续尝试"),
+                );
+                p.exclude_kernel = true;
+                reset_slots(p);
+                publish(p, "运行中（仅用户态）".to_string());
+                return;
+            }
+            if perm && p.mode == Mode::Hw {
+                crate::diag::tag(
+                    "PMU",
+                    &format!("{reason}；硬件计数器不可用，改用软件计时（只计用户态）继续观察"),
+                );
+                switch_to_sw(p, true);
+                publish(p, "运行中（CPU 时间）".to_string());
+                return;
+            }
             // 线程刚退出的 ESRCH 是常态，不该让整台机器的 PMU 陪葬；
             // 权限 / 内核不支持 / FD 耗尽才是一次性放弃的理由
             if !fatal {
@@ -522,6 +618,30 @@ fn shutdown() {
     });
 }
 
+/// 硬件计数器不可用时切到软件计时。槽位必须整体重建：旧 FD 指向的
+/// 是硬件事件，`prev` 里也是硬件计数，接着用会把两套量纲混在一起
+/// 清空所有槽位与基线。换计量方式（或换 flags）时旧 FD 与 `prev`
+/// 都属于上一套量纲，必须整体丢弃，否则增量会是负数或天文数字
+fn reset_slots(p: &mut Pmu) {
+    p.close_all();
+    p.slots.clear();
+    p.zero_windows = 0;
+    p.starved = false;
+    p.samples.clear();
+    p.last_had_samples = false;
+    p.last_tick = None;
+    p.read_err = None;
+    p.read_fails = 0;
+}
+
+fn switch_to_sw(p: &mut Pmu, exclude_kernel: bool) {
+    reset_slots(p);
+    p.mode = Mode::Sw;
+    p.exclude_kernel = exclude_kernel;
+    p.miss_ok = false;
+    p.miss_probed = true;
+}
+
 /// 一次性放弃。必须打日志：只在 Web 面板里写原因，不看界面的人会以为
 /// 开关没生效。文案要点明「不影响绑核」，否则会被当成故障去排查
 fn disable(p: &mut Pmu, reason: String) {
@@ -541,6 +661,11 @@ fn publish(p: &Pmu, state: String) {
         threads: p.open_threads(),
         windows: p.windows,
         miss_ok: p.miss_ok,
+        mode: if p.mode == Mode::Hw {
+            "指令计数".to_string()
+        } else {
+            "CPU 时间".to_string()
+        },
         samples: p.samples.clone(),
     });
 }
@@ -580,7 +705,9 @@ fn log_line(p: &Pmu) {
         .map(|s| format!("{}({}) {}", s.comm, s.tid, s.rate_text()))
         .collect::<Vec<_>>()
         .join("、");
-    let miss = if p.miss_ok {
+    let miss = if p.mode == Mode::Sw {
+        " ｜ 硬件计数器不可用，按 CPU 时间统计".to_string()
+    } else if p.miss_ok {
         let m: u64 = p.samples.iter().filter_map(|s| s.misses).sum();
         format!(" ｜ cache-miss {}", m)
     } else {
@@ -607,17 +734,23 @@ fn log_line(p: &Pmu) {
 }
 
 /// 打开一个线程的全部事件。任一必选事件失败就返回关闭原因
-fn open_slot(p: &mut Pmu, tid: i32) -> Result<(), (String, bool)> {
+fn open_slot(p: &mut Pmu, tid: i32) -> Result<(), (String, bool, bool)> {
+    let mode = p.mode;
     let Some(slot) = p.slots.get_mut(&tid) else {
         return Ok(());
     };
-    let want_miss = !p.miss_probed || p.miss_ok;
-    let configs = [
-        (INDEX_INST, PERF_COUNT_HW_INSTRUCTIONS),
-        (INDEX_CYCLES, PERF_COUNT_HW_CPU_CYCLES),
-    ];
-    for (idx, config) in configs {
-        match open_counter(tid, config) {
+    let want_miss = mode == Mode::Hw && (!p.miss_probed || p.miss_ok);
+    // 软件计时只有一个事件，借用 instructions 那格
+    let configs: &[(usize, u32, u64)] = if mode == Mode::Hw {
+        &[
+            (INDEX_INST, PERF_TYPE_HARDWARE, PERF_COUNT_HW_INSTRUCTIONS),
+            (INDEX_CYCLES, PERF_TYPE_HARDWARE, PERF_COUNT_HW_CPU_CYCLES),
+        ]
+    } else {
+        &[(INDEX_INST, PERF_TYPE_SOFTWARE, PERF_COUNT_SW_TASK_CLOCK)]
+    };
+    for &(idx, type_, config) in configs {
+        match open_counter(tid, type_, config, p.exclude_kernel) {
             Ok(fd) => {
                 slot.fds[idx] = fd;
                 slot.prev[idx] = 0;
@@ -626,7 +759,12 @@ fn open_slot(p: &mut Pmu, tid: i32) -> Result<(), (String, bool)> {
         }
     }
     if want_miss {
-        match open_counter(tid, PERF_COUNT_HW_CACHE_MISSES) {
+        match open_counter(
+            tid,
+            PERF_TYPE_HARDWARE,
+            PERF_COUNT_HW_CACHE_MISSES,
+            p.exclude_kernel,
+        ) {
             Ok(fd) => {
                 slot.fds[INDEX_MISS] = fd;
                 slot.prev[INDEX_MISS] = 0;
@@ -648,15 +786,20 @@ fn open_slot(p: &mut Pmu, tid: i32) -> Result<(), (String, bool)> {
 /// 根本读不出来。混成一个 `Option` 会把「设备不计数」说成「线程没干活」
 enum ReadOut {
     Got(Sample),
-    /// 读成功，但这一窗口两个计数器都没涨
-    Flat,
+    /// 读成功，但这一窗口计数器都没涨。`starved` 表示内核压根没给这个
+    /// 事件分配过时间片（time_running = 0）——那是 PMU 被别的东西占着，
+    /// 不是线程闲
+    Flat {
+        starved: bool,
+    },
     /// 一个都没读出来，附带最后一次 errno
     Err(i32),
 }
 
-fn read_sample(slot: &mut Slot, tid: i32, window_ms: u64) -> ReadOut {
+fn read_sample(slot: &mut Slot, tid: i32, window_ms: u64, mode: Mode) -> ReadOut {
     let mut got = [0u64; EVENTS];
     let mut read_any = false;
+    let mut ran = false;
     let mut err = 0;
     for (idx, out) in got.iter_mut().enumerate() {
         let fd = slot.fds[idx];
@@ -664,9 +807,12 @@ fn read_sample(slot: &mut Slot, tid: i32, window_ms: u64) -> ReadOut {
             continue;
         }
         match read_counter(fd) {
-            Ok(v) => {
-                *out = delta(v, slot.prev[idx]);
-                slot.prev[idx] = v;
+            Ok(c) => {
+                *out = delta(c.value, slot.prev[idx]);
+                slot.prev[idx] = c.value;
+                if c.running > 0 {
+                    ran = true;
+                }
                 read_any = true;
             }
             Err(errno) => {
@@ -684,15 +830,21 @@ fn read_sample(slot: &mut Slot, tid: i32, window_ms: u64) -> ReadOut {
         tid,
         pkg: slot.pkg.clone(),
         comm: slot.comm.clone(),
-        inst: got[INDEX_INST],
-        cycles: got[INDEX_CYCLES],
+        // 软件计时只有一个事件，值放在 instructions 那格，读出后归位
+        inst: if mode == Mode::Hw { got[INDEX_INST] } else { 0 },
+        cycles: if mode == Mode::Hw {
+            got[INDEX_CYCLES]
+        } else {
+            0
+        },
         misses: (slot.fds[INDEX_MISS] >= 0).then_some(got[INDEX_MISS]),
+        cpu_ns: (mode == Mode::Sw).then_some(got[INDEX_INST]),
         window_ms,
     };
     if s.is_active() {
         ReadOut::Got(s)
     } else {
-        ReadOut::Flat
+        ReadOut::Flat { starved: !ran }
     }
 }
 
@@ -702,13 +854,20 @@ fn delta(cur: u64, prev: u64) -> u64 {
     cur.saturating_sub(prev)
 }
 
-fn open_counter(tid: i32, config: u64) -> Result<i32, i32> {
+fn open_counter(tid: i32, type_: u32, config: u64, exclude_kernel: bool) -> Result<i32, i32> {
     let attr = PerfEventAttr {
-        type_: PERF_TYPE_HARDWARE,
+        type_,
         size: PERF_ATTR_SIZE,
         config,
-        // disabled = 0：立即开始计数；exclude_kernel 不设，CPI 要看完整执行
-        flags: FLAG_EXCLUDE_HV,
+        // 带上 time_enabled / time_running，才能区分「没干活」和「没被调度」
+        read_format: READ_FORMAT_TIME,
+        // disabled = 0：立即开始计数
+        flags: FLAG_EXCLUDE_HV
+            | if exclude_kernel {
+                FLAG_EXCLUDE_KERNEL
+            } else {
+                0
+            },
         ..Default::default()
     };
     let ret = unsafe {
@@ -730,17 +889,34 @@ fn open_counter(tid: i32, config: u64) -> Result<i32, i32> {
     }
 }
 
-fn read_counter(fd: i32) -> Result<u64, i32> {
-    let mut v: u64 = 0;
+/// 一次读取的结果：计数、内核给的时间片。`read_format` 带
+/// TIME_ENABLED|TIME_RUNNING 时内核回三个 u64
+struct Counter {
+    value: u64,
+    running: u64,
+}
+
+fn read_counter(fd: i32) -> Result<Counter, i32> {
+    let mut buf = [0u64; 3];
     let n = unsafe {
         libc::read(
             fd,
-            &mut v as *mut u64 as *mut libc::c_void,
-            std::mem::size_of::<u64>(),
+            buf.as_mut_ptr() as *mut libc::c_void,
+            std::mem::size_of_val(&buf),
         )
     };
-    if n == std::mem::size_of::<u64>() as isize {
-        Ok(v)
+    if n == std::mem::size_of_val(&buf) as isize {
+        Ok(Counter {
+            value: buf[0],
+            running: buf[2],
+        })
+    } else if n as usize == std::mem::size_of::<u64>() {
+        // 内核没按 read_format 回三元组时只给计数：当作「调度正常」，
+        // 不能因为拿不到 time_running 就判成读失败
+        Ok(Counter {
+            value: buf[0],
+            running: u64::MAX,
+        })
     } else {
         Err(std::io::Error::last_os_error()
             .raw_os_error()
@@ -751,19 +927,22 @@ fn read_counter(fd: i32) -> Result<u64, i32> {
 /// 打开失败分三类：权限、环境不支持、FD 不够。三类的处置完全不同，
 /// 混成一句「打开失败」会让用户不知道该改 `perf_event_paranoid` 还是
 /// 该放弃这个功能
-fn classify_open_error(errno: i32) -> (String, bool) {
+/// 第三个返回值表示「是权限问题」：这类失败还有一步退让（只算用户态），
+/// 其余致命错误没有
+fn classify_open_error(errno: i32) -> (String, bool, bool) {
     match errno {
         libc::EACCES | libc::EPERM => (
             "权限不足（内核 perf_event_paranoid 或 SELinux 限制）".to_string(),
             true,
+            true,
         ),
         libc::EINVAL | libc::ENOENT | libc::EOPNOTSUPP | libc::ENOSYS => {
-            ("内核或设备不支持硬件计数器".to_string(), true)
+            ("内核或设备不支持硬件计数器".to_string(), true, false)
         }
-        libc::EMFILE | libc::ENFILE => ("FD 预算耗尽".to_string(), true),
+        libc::EMFILE | libc::ENFILE => ("FD 预算耗尽".to_string(), true, false),
         // 线程刚退出：下一轮 `retain` 会清掉它，不能算作环境问题
-        libc::ESRCH => ("线程已退出".to_string(), false),
-        other => (format!("打开计数器失败（errno {other}）"), false),
+        libc::ESRCH => ("线程已退出".to_string(), false, false),
+        other => (format!("打开计数器失败（errno {other}）"), false, false),
     }
 }
 
@@ -817,6 +996,7 @@ mod tests {
             inst,
             cycles,
             misses: None,
+            cpu_ns: None,
             window_ms: SAMPLE_WINDOW.as_millis() as u64,
         }
     }
@@ -854,6 +1034,39 @@ mod tests {
         assert!(!idle.is_active());
     }
 
+    /// 真机上硬件计数器能打开但恒读 0（厂商锁 PMU）。退到 TASK_CLOCK 后
+    /// inst / cycles 一定是 0，判活跃与显示都不能再依赖它们
+    #[test]
+    fn sw_sample_uses_cpu_time() {
+        let mut s = sample(0, 0);
+        s.cpu_ns = Some(3_000_000_000);
+        s.window_ms = 6_000;
+        assert!(s.is_active(), "只有 CPU 时间的样本不能丢");
+        assert!((s.cpu_ms() - 3_000.0).abs() < 1e-6);
+        assert!((s.cpu_pct() - 50.0).abs() < 1e-6, "3s/6s 应是 50%");
+        assert!(s.rate_text().contains("% CPU"));
+        let idle = sample(0, 0);
+        assert!(!idle.is_active(), "cpu_ns 为 None 且计数为 0 才是空闲");
+    }
+
+    /// 切到软件计时必须清空槽位与基线：旧 FD 是硬件事件，prev 是硬件计数，
+    /// 混着用会得出「负数/天文数字」的增量
+    #[test]
+    fn switch_to_sw_clears_state() {
+        let mut p = Pmu::new();
+        p.slots
+            .insert(1, Slot::new(1, 100, "com.a".into(), "T".into()));
+        p.samples = vec![sample(10, 20)];
+        p.zero_windows = 3;
+        p.miss_ok = true;
+        switch_to_sw(&mut p, false);
+        assert_eq!(p.mode, Mode::Sw);
+        assert!(p.slots.is_empty());
+        assert!(p.samples.is_empty());
+        assert_eq!(p.zero_windows, 0);
+        assert!(!p.miss_ok);
+    }
+
     /// 速率要按真实窗口算。主循环 2 秒一跳，实际窗口 6 秒，
     /// 固定按 5 秒除会系统性偏高
     #[test]
@@ -878,7 +1091,7 @@ mod tests {
             libc::EOPNOTSUPP,
             libc::EMFILE,
         ] {
-            let (_, fatal) = classify_open_error(errno);
+            let (_, fatal, _) = classify_open_error(errno);
             assert!(fatal, "errno {errno} 应判定为致命");
         }
         assert!(classify_open_error(libc::EACCES).0.contains("权限"));

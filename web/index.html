@@ -288,7 +288,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <button data-key="pmu" data-val="observe" data-on="1">观察</button>
 </div>
 <div class="hint" id="c-pmu-state">-</div>
-<div class="hint">读取硬件计数器（instructions / cycles / cache-misses），在诊断页显示受管线程的 CPI 与指令速率，用于评估 S7 的迁移是否真的划算。<b>只采样、不迁移</b>：执行路径不会因为本开关改变任何一个核。需要内核允许 <span class="mono">perf_event_open</span>；权限不足或计数器不支持时自动关闭，原因写在诊断页。max 128 线程、按 <span class="mono">RLIMIT_NOFILE</span> 预算自动收缩。</div>
+<div class="hint">读取硬件计数器（instructions / cycles / cache-misses），在诊断页显示受管线程的 CPI 与指令速率，用于评估 S7 的迁移是否真的划算。硬件计数器打不开、或能打开但读数恒为 0（部分厂商锁了 PMU）时，自动退到软件计时，按 <span class="mono">CPU 时间</span>显示线程占用，不再当成故障。<b>只采样、不迁移</b>：执行路径不会因为本开关改变任何一个核。需要内核允许 <span class="mono">perf_event_open</span>；权限不足时自动关闭，原因写在诊断页。max 128 线程、按 <span class="mono">RLIMIT_NOFILE</span> 预算自动收缩。</div>
 </div>
 <div class="card">
 <div class="card-title">RT 实时调度</div>
@@ -1104,10 +1104,14 @@ async function loadDiag(){
     $('d-pmu').textContent=(()=>{
       if(!p.state||p.state==='未启用')return 'PMU · 未启用（在设置里打开「PMU 观察」，或写 @pmu=observe）';
       const head='PMU · '+p.state+' · 采样 '+p.threads+' 线程 · FD '+p.fds+'（上限 '+p.budget+' 线程）· 第 '+p.windows+' 轮'
-        +(p.miss_ok?'':' · cache-miss 不可用');
-      // 只放出 cycles 的设备上 inst 恒为 0：退回显示周期速率，不能显示 0
+        +' · '+p.mode
+        +(p.miss_ok||p.mode!=='指令计数'?'':' · cache-miss 不可用');
+      // 三级退让：指令 → 周期 → CPU 占用。设备能不能给硬件计数不由我们决定，
+      // 但面板不能因此显示 0
       const list=(p.samples||[]).slice(0,4).map(s=>s.comm+'('+s.tid+') '
-        +(s.inst>0? s.mips+'M/s CPI '+s.cpi : s.gcyc+'Gcyc/s')).join(' / ');
+        +(s.inst>0? s.mips+'M/s CPI '+s.cpi
+          : s.cycles>0? s.gcyc+'Gcyc/s'
+          : s.cpu_pct+'% CPU')).join(' / ');
       return head+(list?' · '+list:'');
     })();
     const th=d.threads||[];
