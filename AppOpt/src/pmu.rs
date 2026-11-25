@@ -60,6 +60,10 @@ const LOG_SAMPLES: usize = 3;
 const SNAP_SAMPLES: usize = 8;
 /// 日志间隔：每 30 秒一行，5 秒一行等于刷屏
 const LOG_GAP: Duration = Duration::from_secs(30);
+/// 软件计时是单向降级，重新试硬件的冷却期。真机上 sgame 的 PMU 不计数、
+/// 同机 osgame 正常，所以「换了个受管应用」时值得再试一次；120 秒是
+/// 重建 128 个槽位（最多 384 个 FD）的代价与灵敏度的折中
+const HW_RETRY_GAP: Duration = Duration::from_secs(120);
 /// 一个线程都没管的时候没有任何变化，5 分钟说一次「还是没事干」就够。
 /// 否则挂着不动也会每 30 秒刷一行，日志里全是噪音
 const IDLE_LOG_GAP: Duration = Duration::from_secs(300);
@@ -322,6 +326,10 @@ struct Pmu {
     read_err: Option<i32>,
     /// 连续读失败的窗口数
     read_fails: u8,
+    /// 受管包集合的指纹。只有它变化（换了游戏）才考虑重试硬件计数器
+    pkg_sig: u64,
+    /// 上次尝试硬件计数器的时刻，用于冷却
+    hw_tried: Option<Instant>,
 }
 
 impl Pmu {
@@ -348,6 +356,8 @@ impl Pmu {
             starved: false,
             read_err: None,
             read_fails: 0,
+            pkg_sig: 0,
+            hw_tried: None,
         }
     }
 
@@ -425,6 +435,26 @@ pub fn tick(cfg: &AppConfig, cache: &ProcCache) {
     // 出现在「采样中」，增量却永远是 0
     let live: std::collections::HashSet<i32> = cache.tasks.keys().copied().collect();
     p.slots.retain(|tid, _| live.contains(tid));
+
+    // 降级到软件计时是单向的：真机上 sgame 的 PMU 恒读 0，同机的 osgame
+    // 却完全正常。不重试的话「先打王者再开和平精英」整局都只剩 CPU 时间，
+    // 白白丢掉 CPI 与 cache-miss。受管包集合一变（换了游戏）就给硬件一次
+    // 机会，冷却期内不重复试，避免每轮重建几百个 FD
+    let sig = pkg_signature(cache);
+    if sig != p.pkg_sig {
+        p.pkg_sig = sig;
+        let cooled = p.hw_tried.is_none_or(|t| t.elapsed() >= HW_RETRY_GAP);
+        if p.mode == Mode::Sw && cooled && !cache.tasks.is_empty() {
+            p.hw_tried = Some(Instant::now());
+            crate::diag::tag(
+                "PMU",
+                "受管应用变化：重新尝试硬件计数器（此前的软件计时读数不受影响，失败会再退回去）",
+            );
+            switch_to_hw(p);
+            publish(p, "运行中".to_string());
+            return;
+        }
+    }
 
     let mut fresh: Vec<Sample> = Vec::new();
     // 本窗口的候选：(tick 增量, tid)。只收「还没有 FD、但确实在跑」的，
@@ -695,6 +725,38 @@ fn switch_to_sw(p: &mut Pmu, exclude_kernel: bool) {
     p.exclude_kernel = exclude_kernel;
     p.miss_ok = false;
     p.miss_probed = true;
+}
+
+/// 回到硬件计数器。只用于「受管应用变了，换台游戏也许能读到 PMU」；
+/// 失败会在三个零窗口后自动退回软件计时，不需要额外状态
+fn switch_to_hw(p: &mut Pmu) {
+    reset_slots(p);
+    p.mode = Mode::Hw;
+    p.exclude_kernel = false;
+    p.miss_ok = false;
+    p.miss_probed = false;
+}
+
+/// 受管包集合的指纹。只看包名、不看线程数：线程进出极频繁，拿它当
+/// 触发条件会让硬件重试变成每轮一次，白白重建几百个 FD
+fn pkg_signature(cache: &ProcCache) -> u64 {
+    pkg_sig_of(cache.tasks.values().map(|e| e.pkg.as_str()))
+}
+
+/// FNV-1a。不引入依赖，用来区分几个包名足够
+fn pkg_sig_of<'a>(names: impl Iterator<Item = &'a str>) -> u64 {
+    let mut names: Vec<&str> = names.collect();
+    names.sort_unstable();
+    names.dedup();
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for name in names {
+        for b in name.as_bytes() {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+        h ^= 0xff;
+    }
+    h
 }
 
 /// 一次性放弃。必须打日志：只在 Web 面板里写原因，不看界面的人会以为
@@ -1261,5 +1323,36 @@ mod tests {
         assert_eq!(pick_victim(&mut v), Some(12));
         assert_eq!(pick_victim(&mut v), Some(10));
         assert_eq!(pick_victim(&mut v), None, "没有可让的就必须停手");
+    }
+
+    /// 指纹只看包名集合：顺序、重复都不能影响，否则线程抖动会误触发
+    /// 硬件重试（每轮重建几百个 FD）
+    #[test]
+    fn pkg_signature_is_stable() {
+        let a = pkg_sig_of(["com.a", "com.b"].into_iter());
+        assert_eq!(a, pkg_sig_of(["com.b", "com.a", "com.a"].into_iter()));
+        assert_ne!(a, pkg_sig_of(["com.a"].into_iter()));
+        assert_ne!(a, pkg_sig_of(["com.a", "com.c"].into_iter()));
+        assert_ne!(pkg_sig_of(std::iter::empty()), a);
+    }
+
+    /// 从软件计时回到硬件必须清干净：旧 FD 是 TASK_CLOCK，prev 是纳秒，
+    /// 混进硬件计数会得出负数或天文数字；miss 也要重新探测
+    #[test]
+    fn switch_to_hw_clears_state() {
+        let mut p = Pmu::new();
+        p.mode = Mode::Sw;
+        p.exclude_kernel = true;
+        p.miss_ok = true;
+        p.miss_probed = true;
+        p.slots
+            .insert(1, Slot::new(1, 100, "com.a".into(), "T".into()));
+        switch_to_hw(&mut p);
+        assert_eq!(p.mode, Mode::Hw);
+        assert!(!p.exclude_kernel, "硬件全量要重新允许内核计数");
+        assert!(!p.miss_ok);
+        assert!(!p.miss_probed, "换回硬件后 cache-miss 要重新探测");
+        assert!(p.slots.is_empty());
+        assert_eq!(p.active, 0);
     }
 }
