@@ -1105,6 +1105,7 @@ async function loadDiag(){
       if(!p.state||p.state==='未启用')return 'PMU · 未启用（在设置里打开「PMU 观察」，或写 @pmu=observe）';
       const head='PMU · '+p.state+' · 采样 '+p.threads+' 线程 · FD '+p.fds+'（上限 '+p.budget+' 线程）· 第 '+p.windows+' 轮'
         +' · '+p.mode
+        +(p.active>0?' · 本窗口 '+p.active+' 个在跑':'')
         +(p.miss_ok||p.mode!=='指令计数'?'':' · cache-miss 不可用');
       // 三级退让：指令 → 周期 → CPU 占用。设备能不能给硬件计数不由我们决定，
       // 但面板不能因此显示 0

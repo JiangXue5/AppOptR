@@ -40,10 +40,17 @@ pub const MAX_THREADS: usize = 128;
 const EVENTS: usize = 3;
 /// 给主程序其余 FD 留的余量：cpuset、日志、socket 都要用
 const FD_RESERVE: u64 = 64;
-/// 连续多少个窗口没有 tick 增长就关 FD（6 × 5s = 30s）
-const IDLE_WINDOWS: u8 = 6;
-/// 连续打开失败多少次就整体关闭，避免每轮都撞同一个错误
-const MAX_OPEN_FAILS: u8 = 3;
+/// 连续多少个窗口没有 tick 增长就关 FD（3 × 5s ≈ 15s）。取 6 的话
+/// 槽位要 30 秒才周转一次，游戏启动洪峰期抢到 FD 的冷线程会把名额
+/// 占得太久
+const IDLE_WINDOWS: u8 = 3;
+/// 闲置到这个窗口数就有资格被抢占（2 × 5s ≈ 10s）。比 `IDLE_WINDOWS`
+/// 略小：先让更闲的让位，而不是等它们自然过期
+const EVICT_IDLE: u8 = 2;
+/// 同一个线程连续打开失败多少次就不再尝试。这是**单线程**的放弃，
+/// 不能升级成整体关闭——线程频繁退出是常态，一个坏线程不该让整台
+/// 机器的观察停摆
+const MAX_OPEN_FAILS: u8 = 5;
 /// 连续多少个窗口「线程在跑、计数器却一个都没涨」才判定设备不计数。
 /// 3 × 5s：偶发的空窗口不会误判，真不计数也不会拖太久
 const ZERO_WINDOWS: u8 = 3;
@@ -162,6 +169,23 @@ impl Sample {
         self.inst > 0 || self.cycles > 0 || self.cpu_ns.unwrap_or(0) > 0
     }
 
+    /// 本窗口的工作量，用来给线程排序、挑「最忙的几个」。
+    ///
+    /// 三种量纲只有一种有值（同一窗口内所有样本必属同一模式），所以
+    /// 直接比数值是安全的。**软件计时下 inst / cycles 恒为 0**，若还按
+    /// cycles 排序，全部样本都是 0 分，`sort_by` 等于没排——真机上表现
+    /// 为「永远只显示同样几个 0% 的睡线程」，而真正吃满 CPU 的渲染
+    /// 线程即使采到了也被 `truncate` 挤掉
+    pub fn weight(&self) -> u64 {
+        if let Some(ns) = self.cpu_ns {
+            return ns;
+        }
+        if self.inst > 0 {
+            return self.inst;
+        }
+        self.cycles
+    }
+
     /// 日志里的速率描述：有指令说指令速率，只有周期说周期速率，
     /// 都没有就说 CPU 占用
     pub fn rate_text(&self) -> String {
@@ -190,6 +214,9 @@ pub struct PmuSnapshot {
     pub fds: usize,
     pub budget: usize,
     pub threads: usize,
+    /// 本窗口真正消耗了 CPU 的线程数（`samples` 只是其中最忙的几条，
+    /// 两者不等时面板要能看出规模）
+    pub active: usize,
     pub windows: u64,
     pub miss_ok: bool,
     /// 当前计量方式：「指令计数」或「CPU 时间」
@@ -208,6 +235,9 @@ struct Slot {
     last_ticks: u64,
     /// 连续多少个窗口 tick 没有增长
     idle: u8,
+    /// 连续打开失败次数。达到 `MAX_OPEN_FAILS` 后本线程不再尝试，
+    /// 但不牵连其他线程
+    fails: u8,
     pkg: String,
     comm: String,
 }
@@ -220,6 +250,7 @@ impl Slot {
             prev: [0; EVENTS],
             last_ticks,
             idle: 0,
+            fails: 0,
             pkg,
             comm,
         }
@@ -270,7 +301,8 @@ struct Pmu {
     /// 本轮最多允许打开多少个线程
     budget: usize,
     windows: u64,
-    open_fails: u8,
+    /// 本窗口有 tick 增量的线程数
+    active: usize,
     /// cache-misses 是否可用（只探测一次）
     miss_ok: bool,
     miss_probed: bool,
@@ -301,7 +333,7 @@ impl Pmu {
             slots: HashMap::new(),
             budget: 0,
             windows: 0,
-            open_fails: 0,
+            active: 0,
             miss_ok: false,
             miss_probed: false,
             samples: Vec::new(),
@@ -395,7 +427,18 @@ pub fn tick(cfg: &AppConfig, cache: &ProcCache) {
     p.slots.retain(|tid, _| live.contains(tid));
 
     let mut fresh: Vec<Sample> = Vec::new();
-    let mut active_tids: Vec<i32> = Vec::new();
+    // 本窗口的候选：(tick 增量, tid)。只收「还没有 FD、但确实在跑」的，
+    // 后面按增量**降序**分配槽位。
+    //
+    // 以前是按 tid 升序先到先得：游戏启动时线程洪峰，前 128 个（最小的
+    // tid）把槽位全部抢走，其中大多数几秒后就开始睡；真正的渲染线程 tid
+    // 偏大，再热也一个 FD 都拿不到。真机日志里「FD 128/128、本窗口计数
+    // 没有增长」就是这来的
+    let mut ranked: Vec<(u64, i32)> = Vec::new();
+    // 本窗口没干活、且已经闲了两个窗口以上的已开槽位。槽位不够时从
+    // 这里挑最闲的让位，让热线程插进来
+    let mut idle_open: Vec<(u8, i32)> = Vec::new();
+    let mut busy = 0usize;
 
     for (tid, entry) in &cache.tasks {
         let Some(st) = read_stat(*tid) else {
@@ -418,18 +461,22 @@ pub fn tick(cfg: &AppConfig, cache: &ProcCache) {
             slot.starttime = st.starttime;
             slot.prev = [0; EVENTS];
             slot.idle = 0;
+            slot.fails = 0;
             slot.pkg = entry.pkg.clone();
             slot.comm = entry.comm.clone();
         }
 
         // 必须先算增量再更新基线，否则「本轮有没有干活」永远为假
-        let grew = st.ticks > slot.last_ticks;
+        let delta = st.ticks.saturating_sub(slot.last_ticks);
+        let grew = delta > 0;
         slot.last_ticks = st.ticks;
+        if grew {
+            busy += 1;
+        }
 
         if slot.any_fd() {
             if grew {
                 slot.idle = 0;
-                active_tids.push(*tid);
             } else {
                 slot.idle = slot.idle.saturating_add(1);
                 if slot.idle >= IDLE_WINDOWS {
@@ -437,6 +484,9 @@ pub fn tick(cfg: &AppConfig, cache: &ProcCache) {
                     slot.close_all();
                     slot.idle = 0;
                     continue;
+                }
+                if slot.idle >= EVICT_IDLE {
+                    idle_open.push((slot.idle, *tid));
                 }
             }
             match read_sample(slot, *tid, window_ms, p.mode) {
@@ -458,7 +508,7 @@ pub fn tick(cfg: &AppConfig, cache: &ProcCache) {
                 }
             }
         } else if grew {
-            active_tids.push(*tid);
+            ranked.push((delta, *tid));
         }
     }
 
@@ -466,7 +516,7 @@ pub fn tick(cfg: &AppConfig, cache: &ProcCache) {
     // 一个计数器都没涨，只能是设备没向用户态开放 PMU 计数（厂商独占、
     // 内核未编入硬件事件）。这种情况以前被当成「没有活跃线程」，
     // 日志看起来像功能正常，实际一条数据都没有
-    let busy = active_tids.len();
+    p.active = busy;
     if busy > 0 && p.open_threads() > 0 && fresh.is_empty() && p.read_err.is_none() {
         p.zero_windows = p.zero_windows.saturating_add(1);
     } else {
@@ -503,17 +553,23 @@ pub fn tick(cfg: &AppConfig, cache: &ProcCache) {
 
     // 只给「有 tick 增量」的线程开 FD。方案 16.2：活跃线程才开，
     // 否则 128 个 FD 会被一堆睡着的线程占满
-    active_tids.sort_unstable();
-    active_tids.dedup();
-    for tid in active_tids {
-        if p.open_threads() >= p.budget {
-            break;
+    //
+    // 按增量降序分配：最忙的先拿槽位。槽位满时让最闲的已开线程让位，
+    // 而不是简单地 break——真机上就是「前 128 个先到的把坑占死，
+    // 渲染线程永远进不来」
+    ranked.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    for (_, tid) in ranked {
+        if p.slots.get(&tid).is_some_and(|s| s.any_fd()) {
+            continue;
         }
-        let Some(slot) = p.slots.get(&tid) else {
-            continue;
-        };
-        if slot.any_fd() {
-            continue;
+        if p.open_threads() >= p.budget {
+            let Some(victim) = pick_victim(&mut idle_open) else {
+                break;
+            };
+            if let Some(v) = p.slots.get_mut(&victim) {
+                v.close_all();
+                v.idle = 0;
+            }
         }
         if let Err((reason, fatal, perm)) = open_slot(p, tid) {
             // 权限失败还有两步退让。paranoid >= 2 挡的是内核计数，
@@ -539,16 +595,10 @@ pub fn tick(cfg: &AppConfig, cache: &ProcCache) {
                 return;
             }
             // 线程刚退出的 ESRCH 是常态，不该让整台机器的 PMU 陪葬；
-            // 权限 / 内核不支持 / FD 耗尽才是一次性放弃的理由
-            if !fatal {
-                p.open_fails = p.open_fails.saturating_add(1);
-            }
-            if fatal || p.open_fails >= MAX_OPEN_FAILS {
-                let reason = if fatal {
-                    reason
-                } else {
-                    format!("连续 {MAX_OPEN_FAILS} 次打开失败：{reason}")
-                };
+            // 权限 / 内核不支持 / FD 耗尽才是一次性放弃的理由。
+            // 非致命失败只记在这个线程自己头上（`open_slot` 里累加），
+            // 连续多次才跳过它——一个坏线程不能关掉整台机器的观察
+            if fatal {
                 disable(p, reason.clone());
                 publish(p, format!("不可用：{reason}"));
                 return;
@@ -571,7 +621,10 @@ pub fn tick(cfg: &AppConfig, cache: &ProcCache) {
     // 判据是「任一计数器涨了」而不是「instructions 涨了」——只放出 cycles
     // 的设备上，按 inst 判会把全部样本丢掉
     fresh.retain(Sample::is_active);
-    fresh.sort_by(|a, b| b.cycles.cmp(&a.cycles).then(b.inst.cmp(&a.inst)));
+    // 按本窗口真实工作量排序。以前按 cycles 排，软件计时下 cycles 恒为 0，
+    // 等于没排，`truncate` 留下的是 HashMap 迭代顺序里的任意 8 个——真机
+    // 日志里「永远是那几个 0% 的睡线程」就是这么来的
+    fresh.sort_unstable_by(|a, b| b.weight().cmp(&a.weight()).then(a.tid.cmp(&b.tid)));
     fresh.truncate(SNAP_SAMPLES);
     p.samples = fresh;
 
@@ -599,6 +652,7 @@ pub fn pause() {
         }
         p.close_all();
         p.samples.clear();
+        p.active = 0;
         // 亮屏后的第一个窗口不能按「息屏了多久」算速率
         p.last_tick = None;
         publish(p, "息屏暂停".to_string());
@@ -628,6 +682,7 @@ fn reset_slots(p: &mut Pmu) {
     p.zero_windows = 0;
     p.starved = false;
     p.samples.clear();
+    p.active = 0;
     p.last_had_samples = false;
     p.last_tick = None;
     p.read_err = None;
@@ -659,6 +714,7 @@ fn publish(p: &Pmu, state: String) {
         fds: p.open_fds(),
         budget: p.budget,
         threads: p.open_threads(),
+        active: p.active,
         windows: p.windows,
         miss_ok: p.miss_ok,
         mode: if p.mode == Mode::Hw {
@@ -721,8 +777,8 @@ fn log_line(p: &Pmu) {
     crate::diag::tag(
         "PMU",
         &format!(
-            "采样 {} 线程（FD {}，{} 线程）｜ 第 {} 轮 / {} ms ｜ {}{}",
-            p.samples.len(),
+            "采样 {} 个线程在跑（FD {}，{} 线程）｜ 第 {} 轮 / {} ms ｜ 最忙：{}{}",
+            p.active.max(p.samples.len()),
             p.open_fds(),
             p.open_threads(),
             p.windows,
@@ -733,12 +789,25 @@ fn log_line(p: &Pmu) {
     );
 }
 
+/// 槽位满了、又有更忙的线程要进来：从「本窗口没干活」的已开线程里
+/// 挑最闲的一个让位。闲得最久的先走；同样闲则 tid 大的先走（后创建的
+/// 线程通常更短命）
+fn pick_victim(idle_open: &mut Vec<(u8, i32)>) -> Option<i32> {
+    idle_open.sort_unstable_by_key(|x| (x.0, x.1));
+    idle_open.pop().map(|(_, tid)| tid)
+}
+
 /// 打开一个线程的全部事件。任一必选事件失败就返回关闭原因
 fn open_slot(p: &mut Pmu, tid: i32) -> Result<(), (String, bool, bool)> {
     let mode = p.mode;
     let Some(slot) = p.slots.get_mut(&tid) else {
         return Ok(());
     };
+    // 连续失败够多的线程不再试：它多半一直报同一个错，每轮重开只是白烧
+    // syscall。线程真退了会被 `retain` 清掉，tid 被复用则会重置 `fails`
+    if slot.fails >= MAX_OPEN_FAILS {
+        return Ok(());
+    }
     let want_miss = mode == Mode::Hw && (!p.miss_probed || p.miss_ok);
     // 软件计时只有一个事件，借用 instructions 那格
     let configs: &[(usize, u32, u64)] = if mode == Mode::Hw {
@@ -755,7 +824,10 @@ fn open_slot(p: &mut Pmu, tid: i32) -> Result<(), (String, bool, bool)> {
                 slot.fds[idx] = fd;
                 slot.prev[idx] = 0;
             }
-            Err(errno) => return Err(classify_open_error(errno)),
+            Err(errno) => {
+                slot.fails = slot.fails.saturating_add(1);
+                return Err(classify_open_error(errno));
+            }
         }
     }
     if want_miss {
@@ -778,7 +850,7 @@ fn open_slot(p: &mut Pmu, tid: i32) -> Result<(), (String, bool, bool)> {
         }
         p.miss_probed = true;
     }
-    p.open_fails = 0;
+    slot.fails = 0;
     Ok(())
 }
 
@@ -1145,5 +1217,49 @@ mod tests {
         let s = snapshot();
         assert_eq!(s.state, "未启用");
         assert_eq!(s.fds, 0);
+    }
+
+    /// 三种量纲各自取值，不能串。软件计时下 inst/cycles 恒 0，
+    /// 排序若还看它们就等于没排
+    #[test]
+    fn weight_prefers_the_live_metric() {
+        assert_eq!(sample(1_000, 9_999).weight(), 1_000, "硬件模式按指令数");
+        assert_eq!(sample(0, 9_999).weight(), 9_999, "只放出 cycles 时按周期");
+        let mut sw = sample(0, 0);
+        sw.cpu_ns = Some(42);
+        assert_eq!(sw.weight(), 42, "软件计时按 CPU 时间");
+    }
+
+    /// 真机日志里「采样 8 线程」永远是同样几个 0% 的睡线程：软件计时下
+    /// 按 cycles 排序全为 0，`truncate` 留下的是 HashMap 迭代顺序里的任意
+    /// 几条。排序必须按 CPU 时间，让最忙的活下来
+    #[test]
+    fn busiest_threads_survive_truncation() {
+        let mut v: Vec<Sample> = (0..20)
+            .map(|i| {
+                let mut s = sample(0, 0);
+                s.tid = i;
+                s.cpu_ns = Some(i as u64 * 10_000_000);
+                s
+            })
+            .collect();
+        v.sort_unstable_by(|a, b| b.weight().cmp(&a.weight()).then(a.tid.cmp(&b.tid)));
+        v.truncate(3);
+        assert_eq!(
+            v.iter().map(|s| s.tid).collect::<Vec<_>>(),
+            vec![19, 18, 17],
+            "截断后留下的必须是最忙的三个"
+        );
+    }
+
+    /// 槽位满了要让最闲的走。以前是直接 break，128 个坑被启动期的冷线程
+    /// 占死，之后的渲染线程一个 FD 都拿不到
+    #[test]
+    fn eviction_prefers_idlest() {
+        let mut v = vec![(2u8, 10), (5, 11), (3, 12)];
+        assert_eq!(pick_victim(&mut v), Some(11), "闲了 5 个窗口的先让位");
+        assert_eq!(pick_victim(&mut v), Some(12));
+        assert_eq!(pick_victim(&mut v), Some(10));
+        assert_eq!(pick_victim(&mut v), None, "没有可让的就必须停手");
     }
 }

@@ -1218,6 +1218,7 @@ fn diag_json() -> String {
             "fds": pmu_snap.fds,
             "budget": pmu_snap.budget,
             "threads": pmu_snap.threads,
+            "active": pmu_snap.active,
             "windows": pmu_snap.windows,
             "miss_ok": pmu_snap.miss_ok,
             "mode": pmu_snap.mode,
