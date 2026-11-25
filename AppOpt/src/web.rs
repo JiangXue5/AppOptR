@@ -1084,6 +1084,7 @@ fn config_json() -> String {
     let demote = cfg.as_ref().is_some_and(|c| c.foreground_demote);
     let auto_assign = cfg.as_ref().is_some_and(|c| c.auto_assign);
     let pmu = cfg.as_ref().is_some_and(|c| c.pmu_observe);
+    let pmu_alloc = cfg.as_ref().is_some_and(|c| c.pmu_alloc && c.pmu_observe);
     let snap = lock_ignore_poison(&SCHED_SNAPSHOT)
         .clone()
         .unwrap_or_default();
@@ -1117,6 +1118,7 @@ fn config_json() -> String {
         "demote": demote,
         "auto_assign": auto_assign,
         "pmu": pmu,
+        "pmu_alloc": pmu_alloc,
         "sched_mode": sched_mode,
         "sched_state": s_state,
         "sched_ticks": s_ticks,
@@ -1237,6 +1239,20 @@ fn diag_json() -> String {
                 "cpu_pct": (s.cpu_pct() * 10.0).round() / 10.0,
                 "window_ms": s.window_ms,
             })).collect::<Vec<_>>(),
+            // Shadow 配额：只算不执行，字段命名与日志保持同一套口径
+            "alloc": crate::pmu_allocator::snapshot().map(|a| json!({
+                "heavy": a.heavy,
+                "medium": a.medium,
+                "light": a.light,
+                "heavy_share": (a.heavy_share * 1000.0).round() / 10.0,
+                "want": a.want.iter().map(|x| (x * 1000.0).round() / 10.0).collect::<Vec<_>>(),
+                "got": a.got.map(|g| g.iter().map(|x| (x * 1000.0).round() / 10.0).collect::<Vec<_>>()),
+                "gap": a.gap.iter().map(|x| (x * 1000.0).round() / 10.0).collect::<Vec<_>>(),
+                "fit": (a.fit * 1000.0).round() / 10.0,
+                "starved": a.starved_name,
+                "hints": a.hints,
+                "samples": a.samples,
+            })),
         },
         "events": d.events,
     })
@@ -1497,6 +1513,7 @@ fn behavior_api(req: &Request) -> (u16, String) {
         Some("foreground_demote") => BehaviorKey::Demote,
         Some("auto_assign") => BehaviorKey::AutoAssign,
         Some("pmu") => BehaviorKey::Pmu,
+        Some("pmu_alloc") => BehaviorKey::PmuAlloc,
         Some(_) => return err_json(400, "未知的开关名"),
         None => return err_json(400, "缺少 key 字段"),
     };

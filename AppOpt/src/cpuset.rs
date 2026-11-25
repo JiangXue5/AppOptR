@@ -829,7 +829,7 @@ pub(crate) fn cpu_is_online(cpu: usize) -> bool {
 }
 
 /// 读取单核 capacity，部分内核不提供该节点时返回 0
-fn cpu_capacity(cpu: usize) -> u64 {
+pub(crate) fn cpu_capacity(cpu: usize) -> u64 {
     fs::read_to_string(format!("/sys/devices/system/cpu/cpu{}/cpu_capacity", cpu))
         .ok()
         .and_then(|s| s.trim().parse().ok())

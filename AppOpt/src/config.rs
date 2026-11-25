@@ -260,6 +260,10 @@ pub struct AppConfig {
     /// 只写日志与 Web 面板，**不参与任何迁移决策**——这是 M3 第一阶段的
     /// 边界，执行路径上没有任何一行会因为本开关而改变
     pub pmu_observe: bool,
+    /// PMU 配额 shadow：`@pmu_alloc=shadow` 打开，默认随 `@pmu` 走。
+    /// 拿本窗口的采样算重/中/轻与各簇建议承载，**只算不执行**，
+    /// 输出只有日志和诊断面板
+    pub pmu_alloc: bool,
     pub topo: CpuTopology,
 }
 
@@ -362,6 +366,7 @@ impl AppConfig {
             foreground_demote: false,
             auto_assign: false,
             pmu_observe: false,
+            pmu_alloc: true,
             topo: CpuTopology::empty(),
         }
     }
@@ -987,6 +992,9 @@ pub fn load_config(
     let mut auto_assign = false;
     // PMU 只采样、不迁移，默认关；关掉时运行期一次 perf 系统调用都不发
     let mut pmu_observe = false;
+    // 配额 shadow 默认开：它只是把已采到的数据算一遍，不发任何写操作。
+    // 显式写 @pmu_alloc=off 才关
+    let mut pmu_alloc = true;
     let mut rt = RtConfig::default();
     // 分应用条目先收集原文，等 @rt.max 解析完再统一构造，避免配置行顺序影响缺省上限
     let mut rt_apps: Vec<String> = Vec::new();
@@ -1030,6 +1038,8 @@ pub fn load_config(
                 ("auto_assign", "off") => auto_assign = false,
                 ("pmu", "observe" | "on") => pmu_observe = true,
                 ("pmu", "off") => pmu_observe = false,
+                ("pmu_alloc", "shadow" | "on") => pmu_alloc = true,
+                ("pmu_alloc", "off") => pmu_alloc = false,
                 // 名单可写多行、逗号或空格分隔；空值不算错误，等价于本行无效
                 ("blacklist", v) | ("exempt", v) if v.is_empty() => {}
                 ("blacklist", v) | ("exempt", v) => match split_names(v) {
@@ -1318,6 +1328,9 @@ pub fn load_config(
     }
     if pmu_observe {
         extra.push("PMU 观察=on（只采样，不迁移）".to_string());
+        if pmu_alloc {
+            extra.push("PMU 配额=shadow（只算不执行）".to_string());
+        }
     }
     if !blacklist.is_empty() {
         extra.push(format!("黑名单 {} 个包（完全不管理）", blacklist.len()));
@@ -1409,6 +1422,7 @@ pub fn load_config(
         foreground_demote,
         auto_assign,
         pmu_observe,
+        pmu_alloc,
         topo: topo.clone(),
     })
 }

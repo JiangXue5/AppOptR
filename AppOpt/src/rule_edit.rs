@@ -642,6 +642,8 @@ pub enum BehaviorKey {
     AutoAssign,
     /// PMU 观察（只采样）
     Pmu,
+    /// PMU 配额 shadow（只算不执行）
+    PmuAlloc,
 }
 
 impl BehaviorKey {
@@ -652,6 +654,7 @@ impl BehaviorKey {
             BehaviorKey::Demote => "foreground_demote",
             BehaviorKey::AutoAssign => "auto_assign",
             BehaviorKey::Pmu => "pmu",
+            BehaviorKey::PmuAlloc => "pmu_alloc",
         }
     }
 
@@ -672,6 +675,8 @@ impl BehaviorKey {
             // 避免被理解成「开启 PMU 调度」
             (BehaviorKey::Pmu, true) => "observe",
             (BehaviorKey::Pmu, false) => "off",
+            (BehaviorKey::PmuAlloc, true) => "shadow",
+            (BehaviorKey::PmuAlloc, false) => "off",
         }
     }
 }

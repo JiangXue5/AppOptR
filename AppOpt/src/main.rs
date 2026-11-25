@@ -13,6 +13,7 @@ mod diag_fmt;
 mod ebpf_mode;
 mod lifecycle;
 mod pmu;
+mod pmu_allocator;
 mod policy;
 mod proc_mode;
 mod roles;

@@ -655,6 +655,17 @@ pub fn tick(cfg: &AppConfig, cache: &ProcCache) {
     // 等于没排，`truncate` 留下的是 HashMap 迭代顺序里的任意 8 个——真机
     // 日志里「永远是那几个 0% 的睡线程」就是这么来的
     fresh.sort_unstable_by(|a, b| b.weight().cmp(&a.weight()).then(a.tid.cmp(&b.tid)));
+
+    // Shadow 配额必须拿**全量**样本：分成重/中/轻靠的是全部线程的活动量，
+    // 只喂最忙的八条会让「轻」这一档直接消失。这里只算不执行
+    if cfg.pmu_alloc {
+        if fresh.is_empty() {
+            crate::pmu_allocator::clear();
+        } else {
+            crate::pmu_allocator::update(&fresh, &cfg.topo);
+        }
+    }
+
     fresh.truncate(SNAP_SAMPLES);
     p.samples = fresh;
 
@@ -667,7 +678,7 @@ pub fn tick(cfg: &AppConfig, cache: &ProcCache) {
     if p.last_log.elapsed() >= gap || had != p.last_had_samples {
         p.last_log = Instant::now();
         p.last_had_samples = had;
-        log_line(p);
+        log_line(p, cfg);
     }
     publish(p, "运行中".to_string());
 }
@@ -683,6 +694,8 @@ pub fn pause() {
         p.close_all();
         p.samples.clear();
         p.active = 0;
+        // 息屏期间的数据不代表前台体验，配额结论也一并作废
+        crate::pmu_allocator::clear();
         // 亮屏后的第一个窗口不能按「息屏了多久」算速率
         p.last_tick = None;
         publish(p, "息屏暂停".to_string());
@@ -696,6 +709,7 @@ fn shutdown() {
         return;
     };
     p.close_all();
+    crate::pmu_allocator::clear();
     *lock_ignore_poison(&SNAPSHOT) = Some(PmuSnapshot {
         state: "未启用".to_string(),
         ..Default::default()
@@ -788,7 +802,7 @@ fn publish(p: &Pmu, state: String) {
     });
 }
 
-fn log_line(p: &Pmu) {
+fn log_line(p: &Pmu, cfg: &AppConfig) {
     if p.samples.is_empty() {
         // 「没有线程在跑」和「开了 FD 却没有读数」是两种完全不同的状态：
         // 前者正常，后者说明计数器没工作。日志混成一句会把故障说成正常
@@ -849,6 +863,12 @@ fn log_line(p: &Pmu) {
             miss
         ),
     );
+    // 配额单独一行：和采样行挤在一起会超过终端宽度，也看不清对照关系
+    if cfg.pmu_alloc
+        && let Some(plan) = crate::pmu_allocator::snapshot()
+    {
+        crate::diag::tag("配额", &plan.log_text());
+    }
 }
 
 /// 槽位满了、又有更忙的线程要进来：从「本窗口没干活」的已开线程里
