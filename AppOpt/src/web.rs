@@ -1228,7 +1228,10 @@ fn diag_json() -> String {
                 "cycles": s.cycles,
                 "misses": s.misses,
                 "cpi": (s.cpi() * 100.0).round() / 100.0,
-                "mips": (s.inst_per_ms() * 10.0).round() / 10.0,
+                "mips": (s.mips() * 10.0).round() / 10.0,
+                // 部分设备只放出 cycles：面板要能退到这一项，不能显示 0
+                "gcyc": (s.gcyc() * 100.0).round() / 100.0,
+                "window_ms": s.window_ms,
             })).collect::<Vec<_>>(),
         },
         "events": d.events,

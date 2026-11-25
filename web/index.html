@@ -1103,9 +1103,11 @@ async function loadDiag(){
     const p=d.pmu||{};
     $('d-pmu').textContent=(()=>{
       if(!p.state||p.state==='未启用')return 'PMU · 未启用（在设置里打开「PMU 观察」，或写 @pmu=observe）';
-      const head='PMU · '+p.state+' · 采样 '+p.threads+' 线程 · FD '+p.fds+'/'+p.budget+' · 第 '+p.windows+' 轮'
+      const head='PMU · '+p.state+' · 采样 '+p.threads+' 线程 · FD '+p.fds+'（上限 '+p.budget+' 线程）· 第 '+p.windows+' 轮'
         +(p.miss_ok?'':' · cache-miss 不可用');
-      const list=(p.samples||[]).slice(0,4).map(s=>s.comm+'('+s.tid+') '+s.mips+'M/s CPI '+s.cpi).join(' / ');
+      // 只放出 cycles 的设备上 inst 恒为 0：退回显示周期速率，不能显示 0
+      const list=(p.samples||[]).slice(0,4).map(s=>s.comm+'('+s.tid+') '
+        +(s.inst>0? s.mips+'M/s CPI '+s.cpi : s.gcyc+'Gcyc/s')).join(' / ');
       return head+(list?' · '+list:'');
     })();
     const th=d.threads||[];

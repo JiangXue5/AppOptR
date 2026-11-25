@@ -563,6 +563,9 @@ pub static CURRENT_CONFIG: Mutex<Option<Arc<AppConfig>>> = Mutex::new(None);
 
 pub static PARSE_FAILS: AtomicUsize = AtomicUsize::new(0);
 
+/// `@render_guard` 的迁移提示只对用户说一次，热重载不再重复
+static LEGACY_WARNED: AtomicBool = AtomicBool::new(false);
+
 /// 校验 CPU 规格形态
 pub fn spec_like(s: &str) -> bool {
     let mut any = false;
@@ -1179,7 +1182,9 @@ pub fn load_config(
     PARSE_FAILS.store(fail_cnt, Ordering::Relaxed);
 
     // 不静默吞掉：用户得知道这行已经不起作用，否则会以为护栏还开着
-    if legacy_render_guard {
+    if legacy_render_guard && !LEGACY_WARNED.swap(true, Ordering::Relaxed) {
+        // 每次热重载都打一遍没有信息量：用户改一行业务规则就被这条
+        // 与改动无关的旧配置刷一次屏
         crate::diag::tag(
             "配置",
             "@render_guard 已在 2.7.0 移除（判据长期无有效命中），本行忽略，可以从配置里删掉",

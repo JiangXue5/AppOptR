@@ -44,12 +44,18 @@ const FD_RESERVE: u64 = 64;
 const IDLE_WINDOWS: u8 = 6;
 /// 连续打开失败多少次就整体关闭，避免每轮都撞同一个错误
 const MAX_OPEN_FAILS: u8 = 3;
+/// 连续多少个窗口「线程在跑、计数器却一个都没涨」才判定设备不计数。
+/// 3 × 5s：偶发的空窗口不会误判，真不计数也不会拖太久
+const ZERO_WINDOWS: u8 = 3;
 /// 日志里最多列几条最忙线程
 const LOG_SAMPLES: usize = 3;
 /// Web 快照里最多保留几条
 const SNAP_SAMPLES: usize = 8;
 /// 日志间隔：每 30 秒一行，5 秒一行等于刷屏
 const LOG_GAP: Duration = Duration::from_secs(30);
+/// 一个线程都没管的时候没有任何变化，5 分钟说一次「还是没事干」就够。
+/// 否则挂着不动也会每 30 秒刷一行，日志里全是噪音
+const IDLE_LOG_GAP: Duration = Duration::from_secs(300);
 
 const INDEX_INST: usize = 0;
 const INDEX_CYCLES: usize = 1;
@@ -98,6 +104,9 @@ pub struct Sample {
     pub cycles: u64,
     /// cache-misses 增量。设备不支持时为 `None`，不是 0
     pub misses: Option<u64>,
+    /// 本样本覆盖的实际窗口长度（毫秒）。主循环是 2 秒一跳，采样窗口
+    /// 实际会是 6 秒左右，用固定 5 秒算速率会系统性偏高
+    pub window_ms: u64,
 }
 
 impl Sample {
@@ -109,9 +118,34 @@ impl Sample {
         self.cycles as f64 / self.inst as f64
     }
 
-    /// 每毫秒指令数，用来横向比较线程的忙闲
-    pub fn inst_per_ms(&self) -> f64 {
-        self.inst as f64 / SAMPLE_WINDOW.as_millis() as f64
+    /// 每秒百万条指令（M/s）。窗口是毫秒，所以要多除 1000——
+    /// 以前直接拿「每毫秒指令数」当 M/s 打印，数值虚高一千倍
+    pub fn mips(&self) -> f64 {
+        self.inst as f64 / (self.window_ms.max(1) as f64 * 1000.0)
+    }
+
+    /// 每秒十亿周期（Gcyc/s）。ARM64 上有设备只暴露 cycles、
+    /// instructions 恒为 0，这时速率只能看这一项
+    pub fn gcyc(&self) -> f64 {
+        self.cycles as f64 / (self.window_ms.max(1) as f64 * 1_000_000.0)
+    }
+
+    /// 本窗口是否真的在干活。**不能只看 inst**：部分内核/厂商只放出
+    /// cycles 计数，instructions 常读 0，按 inst 判活跃会把整台机器的
+    /// 样本全丢掉，表现为「开了一堆 FD 却永远没有活跃线程」
+    pub fn is_active(&self) -> bool {
+        self.inst > 0 || self.cycles > 0
+    }
+
+    /// 日志里的速率描述：有指令就说指令速率，只有周期就说周期速率
+    pub fn rate_text(&self) -> String {
+        if self.inst > 0 {
+            format!("{:.0} M/s CPI {:.2}", self.mips(), self.cpi())
+        } else if self.cycles > 0 {
+            format!("{:.2} Gcyc/s", self.gcyc())
+        } else {
+            "0".to_string()
+        }
     }
 }
 
@@ -196,6 +230,17 @@ struct Pmu {
     /// 上一窗口是否采到了数据。状态翻转要立即出声：从「没有活跃线程」
     /// 变成「采到数据」正是用户想确认的那一刻，等 30 秒才说等于没说
     last_had_samples: bool,
+    /// 上一窗口的开始时刻，用来算真实窗口长度
+    last_tick: Option<Instant>,
+    /// 连续多少个窗口「FD 开着、线程在跑，但计数器一个字节都没涨」。
+    /// 这既不是「没线程」也不是「没权限」，是设备真的不计数，必须单独说
+    zero_windows: u8,
+    /// 已经报告过「计数器不计数」，不再重复刷屏
+    blind_reported: bool,
+    /// 最近一次读计数器的 errno，用来解释「Fd 开着但读不出来」
+    read_err: Option<i32>,
+    /// 连续读失败的窗口数
+    read_fails: u8,
 }
 
 impl Pmu {
@@ -209,16 +254,29 @@ impl Pmu {
             miss_ok: false,
             miss_probed: false,
             samples: Vec::new(),
-            // 首轮就打印一次：30 秒后才出声，用户会以为开关没生效
+            // 首轮就打印一次：30 秒后才出声，用户会以为开关没生效。
+            // 往回拨最长的那档间隔，空闲场景下第一行也不会被压掉
             last_log: Instant::now()
-                .checked_sub(LOG_GAP)
+                .checked_sub(IDLE_LOG_GAP)
                 .unwrap_or_else(Instant::now),
             last_had_samples: false,
+            last_tick: None,
+            zero_windows: 0,
+            blind_reported: false,
+            read_err: None,
+            read_fails: 0,
         }
     }
 
-    fn fd_count(&self) -> usize {
+    /// 已打开计数器的线程数（决定还能不能再开）
+    fn open_threads(&self) -> usize {
         self.slots.values().filter(|s| s.any_fd()).count()
+    }
+
+    /// 实际占用的 FD 数（每线程最多 3 个）。日志里说「FD」就该是它，
+    /// 之前拿线程数当 FD 数，128 线程显示成「FD 128/128」会被读成用满
+    fn open_fds(&self) -> usize {
+        self.slots.values().map(Slot::fd_count).sum()
     }
 
     fn close_all(&mut self) {
@@ -251,6 +309,17 @@ pub fn tick(cfg: &AppConfig, cache: &ProcCache) {
     let mut guard = lock_ignore_poison(&PMU);
     let p = guard.get_or_insert_with(Pmu::new);
     p.windows += 1;
+
+    // 真实窗口长度：主循环 2 秒一跳，调用方是「距上次 >= 5 秒」才进来，
+    // 实际窗口 6 秒左右。速率按固定 5 秒算会系统性偏高两成
+    let now = Instant::now();
+    let span = p
+        .last_tick
+        .map(|t| now.saturating_duration_since(t))
+        .unwrap_or(SAMPLE_WINDOW)
+        .clamp(Duration::from_millis(100), Duration::from_secs(60));
+    p.last_tick = Some(now);
+    let window_ms = span.as_millis() as u64;
 
     if let Some(reason) = p.off.clone() {
         publish(p, format!("不可用：{reason}"));
@@ -319,12 +388,43 @@ pub fn tick(cfg: &AppConfig, cache: &ProcCache) {
                     continue;
                 }
             }
-            if let Some(s) = read_sample(slot, *tid) {
-                fresh.push(s);
+            match read_sample(slot, *tid, window_ms) {
+                ReadOut::Got(s) => {
+                    p.read_fails = 0;
+                    p.read_err = None;
+                    fresh.push(s);
+                }
+                ReadOut::Flat => {
+                    p.read_fails = 0;
+                    p.read_err = None;
+                }
+                ReadOut::Err(errno) => {
+                    p.read_err = Some(errno);
+                    p.read_fails = p.read_fails.saturating_add(1);
+                }
             }
         } else if grew {
             active_tids.push(*tid);
         }
+    }
+
+    // 「有线程在跑」与「计数器在涨」是两件事。线程在跑但连续几个窗口
+    // 一个计数器都没涨，只能是设备没向用户态开放 PMU 计数（厂商独占、
+    // 内核未编入硬件事件）。这种情况以前被当成「没有活跃线程」，
+    // 日志看起来像功能正常，实际一条数据都没有
+    let busy = active_tids.len();
+    if busy > 0 && p.open_threads() > 0 && fresh.is_empty() && p.read_err.is_none() {
+        p.zero_windows = p.zero_windows.saturating_add(1);
+        if p.zero_windows >= ZERO_WINDOWS && !p.blind_reported {
+            p.blind_reported = true;
+            let reason = "硬件计数器读数为 0（线程在跑，instructions/cycles 都不涨；\
+                          内核或厂商未向用户态开放 PMU 计数）";
+            disable(p, reason.to_string());
+            publish(p, format!("不可用：{reason}"));
+            return;
+        }
+    } else {
+        p.zero_windows = 0;
     }
 
     // 只给「有 tick 增量」的线程开 FD。方案 16.2：活跃线程才开，
@@ -332,7 +432,7 @@ pub fn tick(cfg: &AppConfig, cache: &ProcCache) {
     active_tids.sort_unstable();
     active_tids.dedup();
     for tid in active_tids {
-        if p.fd_count() >= p.budget {
+        if p.open_threads() >= p.budget {
             break;
         }
         let Some(slot) = p.slots.get(&tid) else {
@@ -360,15 +460,32 @@ pub fn tick(cfg: &AppConfig, cache: &ProcCache) {
         }
     }
 
-    // 增量为 0 的线程不进样本：它们只是「FD 还开着但这一轮没干活」，
-    // 混进来会把「采样线程数」抬高，看日志的人会以为它们正在消耗 CPU
-    fresh.retain(|s| s.inst > 0);
-    fresh.sort_by(|a, b| b.inst.cmp(&a.inst));
+    // 读失败连着来：FD 可能已经坏了（线程退出与新建撞在同一 tid 上时
+    // 常见）。一直重开没有意义，说清 errno 比空转有用
+    if p.read_fails >= MAX_OPEN_FAILS {
+        let errno = p.read_err.unwrap_or(0);
+        let reason = format!("读计数器连续失败（errno {errno}）");
+        disable(p, reason.clone());
+        publish(p, format!("不可用：{reason}"));
+        return;
+    }
+
+    // 计数器没有增量的线程不进样本：它们只是「FD 还开着但这一轮没干活」，
+    // 混进来会把「采样线程数」抬高，看日志的人会以为它们正在消耗 CPU。
+    // 判据是「任一计数器涨了」而不是「instructions 涨了」——只放出 cycles
+    // 的设备上，按 inst 判会把全部样本丢掉
+    fresh.retain(Sample::is_active);
+    fresh.sort_by(|a, b| b.cycles.cmp(&a.cycles).then(b.inst.cmp(&a.inst)));
     fresh.truncate(SNAP_SAMPLES);
     p.samples = fresh;
 
     let had = !p.samples.is_empty();
-    if p.last_log.elapsed() >= LOG_GAP || had != p.last_had_samples {
+    let gap = if had || p.open_threads() > 0 {
+        LOG_GAP
+    } else {
+        IDLE_LOG_GAP
+    };
+    if p.last_log.elapsed() >= gap || had != p.last_had_samples {
         p.last_log = Instant::now();
         p.last_had_samples = had;
         log_line(p);
@@ -386,6 +503,8 @@ pub fn pause() {
         }
         p.close_all();
         p.samples.clear();
+        // 亮屏后的第一个窗口不能按「息屏了多久」算速率
+        p.last_tick = None;
         publish(p, "息屏暂停".to_string());
     }
 }
@@ -415,13 +534,11 @@ fn disable(p: &mut Pmu, reason: String) {
 }
 
 fn publish(p: &Pmu, state: String) {
-    let fds = p.slots.values().map(Slot::fd_count).sum();
-    let threads = p.slots.values().filter(|s| s.any_fd()).count();
     *lock_ignore_poison(&SNAPSHOT) = Some(PmuSnapshot {
         state,
-        fds,
+        fds: p.open_fds(),
         budget: p.budget,
-        threads,
+        threads: p.open_threads(),
         windows: p.windows,
         miss_ok: p.miss_ok,
         samples: p.samples.clone(),
@@ -430,30 +547,37 @@ fn publish(p: &Pmu, state: String) {
 
 fn log_line(p: &Pmu) {
     if p.samples.is_empty() {
-        crate::diag::tag(
-            "PMU",
-            &format!(
-                "采样 {} 轮，本窗口没有活跃线程（FD {}/{} 可用）",
+        // 「没有线程在跑」和「开了 FD 却没有读数」是两种完全不同的状态：
+        // 前者正常，后者说明计数器没工作。日志混成一句会把故障说成正常
+        let threads = p.open_threads();
+        let text = if threads > 0 {
+            format!(
+                "采样 {} 轮，{} 个线程的 FD 已打开但本窗口计数没有增长（上限 {} 线程）",
+                p.windows, threads, p.budget
+            )
+        } else if !p.slots.is_empty() {
+            // 有受管线程但都在睡：这是最常态的一行，不能写成「没有线程」，
+            // 否则用户会以为扫描没找到进程
+            format!(
+                "采样 {} 轮，{} 个受管线程本轮没有消耗 CPU（未开 FD，上限 {} 线程）",
                 p.windows,
-                p.fd_count(),
+                p.slots.len(),
                 p.budget
-            ),
-        );
+            )
+        } else {
+            format!(
+                "采样 {} 轮，没有受管线程（FD 未占用，上限 {} 线程）",
+                p.windows, p.budget
+            )
+        };
+        crate::diag::tag("PMU", &text);
         return;
     }
     let top = p
         .samples
         .iter()
         .take(LOG_SAMPLES)
-        .map(|s| {
-            format!(
-                "{}({}) {:.1}M/s CPI {:.2}",
-                s.comm,
-                s.tid,
-                s.inst_per_ms(),
-                s.cpi()
-            )
-        })
+        .map(|s| format!("{}({}) {}", s.comm, s.tid, s.rate_text()))
         .collect::<Vec<_>>()
         .join("、");
     let miss = if p.miss_ok {
@@ -462,14 +586,20 @@ fn log_line(p: &Pmu) {
     } else {
         " ｜ cache-miss 不可用".to_string()
     };
+    let window = p
+        .samples
+        .first()
+        .map(|s| s.window_ms)
+        .unwrap_or(SAMPLE_WINDOW.as_millis() as u64);
     crate::diag::tag(
         "PMU",
         &format!(
-            "采样 {} 线程（FD {}/{}）｜ 第 {} 轮 ｜ {}{}",
+            "采样 {} 线程（FD {}，{} 线程）｜ 第 {} 轮 / {} ms ｜ {}{}",
             p.samples.len(),
-            p.fd_count(),
-            p.budget,
+            p.open_fds(),
+            p.open_threads(),
             p.windows,
+            window,
             top,
             miss
         ),
@@ -514,9 +644,20 @@ fn open_slot(p: &mut Pmu, tid: i32) -> Result<(), (String, bool)> {
     Ok(())
 }
 
-fn read_sample(slot: &mut Slot, tid: i32) -> Option<Sample> {
+/// 一次读取的结果。三种情况必须分开：读到了且涨了、读到了但没涨、
+/// 根本读不出来。混成一个 `Option` 会把「设备不计数」说成「线程没干活」
+enum ReadOut {
+    Got(Sample),
+    /// 读成功，但这一窗口两个计数器都没涨
+    Flat,
+    /// 一个都没读出来，附带最后一次 errno
+    Err(i32),
+}
+
+fn read_sample(slot: &mut Slot, tid: i32, window_ms: u64) -> ReadOut {
     let mut got = [0u64; EVENTS];
-    let mut any = false;
+    let mut read_any = false;
+    let mut err = 0;
     for (idx, out) in got.iter_mut().enumerate() {
         let fd = slot.fds[idx];
         if fd < 0 {
@@ -526,26 +667,33 @@ fn read_sample(slot: &mut Slot, tid: i32) -> Option<Sample> {
             Ok(v) => {
                 *out = delta(v, slot.prev[idx]);
                 slot.prev[idx] = v;
-                any = true;
+                read_any = true;
             }
-            Err(()) => {
+            Err(errno) => {
                 // 读失败（线程刚退出）就关掉，下一轮按需重开
+                err = errno;
                 unsafe { libc::close(fd) };
                 slot.fds[idx] = -1;
             }
         }
     }
-    if !any {
-        return None;
+    if !read_any {
+        return ReadOut::Err(err);
     }
-    Some(Sample {
+    let s = Sample {
         tid,
         pkg: slot.pkg.clone(),
         comm: slot.comm.clone(),
         inst: got[INDEX_INST],
         cycles: got[INDEX_CYCLES],
         misses: (slot.fds[INDEX_MISS] >= 0).then_some(got[INDEX_MISS]),
-    })
+        window_ms,
+    };
+    if s.is_active() {
+        ReadOut::Got(s)
+    } else {
+        ReadOut::Flat
+    }
 }
 
 /// 计数器增量。回绕或线程重建导致的倒退按「从 0 重新计」处理，
@@ -582,7 +730,7 @@ fn open_counter(tid: i32, config: u64) -> Result<i32, i32> {
     }
 }
 
-fn read_counter(fd: i32) -> Result<u64, ()> {
+fn read_counter(fd: i32) -> Result<u64, i32> {
     let mut v: u64 = 0;
     let n = unsafe {
         libc::read(
@@ -594,7 +742,9 @@ fn read_counter(fd: i32) -> Result<u64, ()> {
     if n == std::mem::size_of::<u64>() as isize {
         Ok(v)
     } else {
-        Err(())
+        Err(std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO))
     }
 }
 
@@ -667,6 +817,7 @@ mod tests {
             inst,
             cycles,
             misses: None,
+            window_ms: SAMPLE_WINDOW.as_millis() as u64,
         }
     }
 
@@ -674,8 +825,9 @@ mod tests {
     fn cpi_and_rate() {
         let s = sample(1_000, 2_000);
         assert!((s.cpi() - 2.0).abs() < 1e-9);
-        // 5 秒窗口
-        assert!((s.inst_per_ms() - 0.2).abs() < 1e-9);
+        // 5 秒窗口：1000 条指令 / 5 秒 = 200 条每秒 = 0.0002 M/s
+        assert!((s.mips() - 0.0002).abs() < 1e-12);
+        assert!((s.gcyc() - 0.0000004).abs() < 1e-12);
         // 指令为 0 时不能出现 inf / NaN
         let z = sample(0, 100);
         assert_eq!(z.cpi(), 0.0);
@@ -687,6 +839,32 @@ mod tests {
         assert_eq!(delta(120, 100), 20);
         assert_eq!(delta(5, 100), 0);
         assert_eq!(delta(u64::MAX, u64::MAX - 1), 1);
+    }
+
+    /// 真机上出现过「128 个 FD 都开着，日志却永远写没有活跃线程」：
+    /// 部分内核只放出 cycles，instructions 恒为 0，按 inst 判活跃会把
+    /// 全部样本丢掉。活跃判据必须是「任一计数器涨了」
+    #[test]
+    fn cycles_only_still_counts_as_active() {
+        let s = sample(0, 5_000_000);
+        assert!(s.is_active(), "只有 cycles 的样本不能被丢掉");
+        assert_eq!(s.cpi(), 0.0);
+        assert!(s.rate_text().contains("Gcyc/s"));
+        let idle = sample(0, 0);
+        assert!(!idle.is_active());
+    }
+
+    /// 速率要按真实窗口算。主循环 2 秒一跳，实际窗口 6 秒，
+    /// 固定按 5 秒除会系统性偏高
+    #[test]
+    fn rate_uses_actual_window() {
+        let mut s = sample(6_000_000, 12_000_000_000);
+        s.window_ms = 6_000;
+        // 600 万条 / 6 秒 = 1 M/s；120 亿周期 / 6 秒 = 2 Gcyc/s
+        assert!((s.mips() - 1.0).abs() < 1e-9);
+        assert!((s.gcyc() - 2.0).abs() < 1e-9);
+        s.window_ms = 0; // 除零不能出 inf
+        assert!(s.mips().is_finite() && s.gcyc().is_finite());
     }
 
     /// 失败分类决定用户该改内核参数还是该放弃功能，不能混；
@@ -730,6 +908,21 @@ mod tests {
     fn fd_budget_is_capped() {
         let n = fd_budget();
         assert!(n <= MAX_THREADS, "方案上限 128，实得 {n}");
+    }
+
+    /// `perf_event_attr` 是我们手写的内核 ABI 结构：字段顺序或对齐错一位，
+    /// 内核会把 `config` 读成别的值，`perf_event_open` 成功但计数器不计数。
+    /// 真机上「FD 开着却没有读数」正是这个症状，所以布局要锁死
+    #[test]
+    fn perf_attr_layout_matches_kernel_abi() {
+        use std::mem::{offset_of, size_of};
+        assert_eq!(offset_of!(PerfEventAttr, type_), 0);
+        assert_eq!(offset_of!(PerfEventAttr, size), 4);
+        assert_eq!(offset_of!(PerfEventAttr, config), 8);
+        assert_eq!(offset_of!(PerfEventAttr, flags), 40);
+        assert_eq!(size_of::<PerfEventAttr>(), 72);
+        // 声明 64 字节时内核只读前 64 字节，必须真的够长
+        assert!(size_of::<PerfEventAttr>() >= PERF_ATTR_SIZE as usize);
     }
 
     /// 关掉开关后快照必须回到「未启用」，FD 全部关闭

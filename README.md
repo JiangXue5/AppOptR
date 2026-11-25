@@ -66,7 +66,7 @@ http://appopt.suto.top
 | `@blacklist` | `<包名>[ ,<包名>…]`（逗号或空格分隔） | — | 完全不管理：不读 cmdline/comm、不匹配规则、不进 S7/RT。可写多行累加。新增后热加载会立即把已在 `AppOpt` 组里的线程还回去。 |
 | `@exempt` | `<包名>[ ,<包名>…]`（逗号或空格分隔） | — | 半管理：只写 `sched_setaffinity`，不迁组、不补组、不参与 S7。给 LKT / Uperf 这类同样管 cpuset 的模块让路，避免两边互相覆盖。 |
 | `@auto_assign` | `on` / `off` | `off` | 采集 Auto Assign 候选，写入同目录的 `AppOpt.autocache.conf`（30 天过期）。只观察、不改规则；在 WebUI 规则页逐条采纳或忽略，采纳才会经 `rule_edit` 写进主配置。 |
-| `@pmu` | `observe` / `off` | `off` | PMU 观察。`observe` 时读取硬件计数器（Instructions / Cycles / cache-misses），在诊断页显示每个受管线程的 CPI 与指令速率，用于评估 S7 迁移是否真的划算。**只采样、不迁移**：执行路径不会因为本开关改变一个核。上限 128 线程，FD 按 `RLIMIT_NOFILE` 预算自动收缩；权限不足或计数器不支持时自动关闭并说明原因。 |
+| `@pmu` | `observe` / `off` | `off` | PMU 观察。`observe` 时读取硬件计数器（Instructions / Cycles / cache-misses），在诊断页显示每个受管线程的 CPI 与指令速率，用于评估 S7 迁移是否真的划算。**只采样、不迁移**：执行路径不会因为本开关改变一个核。上限 128 线程，FD 按 `RLIMIT_NOFILE` 预算自动收缩。只放出 cycles 的内核上按周期速率显示（`Gcyc/s`），不会显示成 0。权限不足、计数器不支持、读数为 0（厂商独占 PMU）时自动关闭并写明原因，绑核结果不受影响。 |
 
 ### CPU 规格怎么写
 
