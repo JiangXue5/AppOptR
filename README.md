@@ -49,6 +49,23 @@ http://appopt.suto.top
 - 交叉编译目标可用 `APPOPT_ARM64_TRIPLE` / `APPOPT_X64_TRIPLE` 覆盖，链接器用 `CARGO_TARGET_<TRIPLE>_LINKER` 指定。
 
 
+### 发版
+
+推送 tag 不等于发版——tag 只是个 git 对象，Release 和安装包要在两个平台各建一次。
+beta8~beta23 就是这么漏的：代码和 tag 都在，Gitee 上一片空白。
+
+```sh
+./build.sh -a all
+git push origin HEAD && git push origin v<版本>
+git push github HEAD && git push github v<版本>
+python3 tools/release.py <版本>            # GitHub + Gitee 一起建 Release 并传包
+python3 tools/release.py <版本> --dry-run  # 先看要做什么
+```
+
+脚本幂等：Release 已存在就复用，附件已存在就跳过，缺哪个补哪个；也支持
+`--only github` / `--only gitee`。令牌从 `~/.git-credentials` 读。
+
+
 ### 规则文件指令
 
 规则文件与规则行同级的指令行以 `@` 开头，目前支持：
