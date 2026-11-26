@@ -3,166 +3,278 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<meta name="theme-color" content="#f2f2f7">
+<meta name="theme-color" content="#f3f4f5">
 <title>AppOpt</title>
 <style>
-:root{--bg:#f2f2f7;--card:#fff;--fg:#1c1c1e;--sub:#8e8e93;--blue:#007aff;--orange:#ff9500;--red:#ff3b30;--border:rgba(0,0,0,.08);--font:system-ui,-apple-system,"PingFang SC",sans-serif;--mono:'SF Mono',Consolas,monospace;--r-md:16px;--sh:0 1px 2px rgba(0,0,0,.04),0 4px 16px rgba(0,0,0,.05);--max-w:760px}
+/* AppOpt 面板
+   设计取向：仪表读数 + 分组设置单，不是卡片墙。
+   核带用同一色相的明度梯度编码容量（浅=小核，深=大核）——容量是序量，
+   用三种色相去分类反而误导。整页只有核带有颜色，其余克制。 */
+:root{
+--paper:#f3f4f5;--sheet:#fff;
+--ink:#14161a;--ink2:#5c626b;--ink3:#8d939c;
+--line:#e4e6e9;--line2:#eef0f2;
+--accent:#0e6b5e;
+--e:#9fbdd8;--p:#4d80b8;--hp:#1f4e79;
+--warn:#a35a00;--danger:#b3261e;
+--r:12px;--max:720px;
+--sh:0 0 0 1px rgba(20,22,26,.04);
+--font:system-ui,-apple-system,"PingFang SC","Noto Sans SC",sans-serif;
+--mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+}
 *{box-sizing:border-box;margin:0;padding:0}
 [hidden]{display:none!important}
-body{font-family:var(--font);background:var(--bg);color:var(--fg);font-size:14px;-webkit-tap-highlight-color:transparent;height:100dvh;overflow:hidden}
-button{cursor:pointer;border:none;font-family:inherit;background:none;color:inherit}
-.app{position:relative;max-width:var(--max-w);margin:0 auto;display:flex;flex-direction:column;height:100dvh;overflow:hidden}
+html,body{height:100%}
+body{font-family:var(--font);background:var(--paper);color:var(--ink);font-size:15px;line-height:1.45;
+-webkit-tap-highlight-color:transparent;overflow:hidden;font-variant-numeric:tabular-nums}
+button{cursor:pointer;border:none;background:none;color:inherit;font:inherit;text-align:left}
+a{color:var(--accent)}
+.app{position:relative;max-width:var(--max);margin:0 auto;display:flex;flex-direction:column;height:100dvh;overflow:hidden}
 @media(max-width:760px){.app{width:100%}}
 .main{flex:1;overflow:hidden}
-.panel{height:100%;overflow:auto;padding:12px 12px 24px;-webkit-overflow-scrolling:touch}
-@keyframes fadeUp{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
-.card,.grp{background:var(--card);border-radius:var(--r-md);margin-bottom:12px;box-shadow:var(--sh);animation:fadeUp .15s ease both}
-.card{padding:16px}
-.card-title{font-size:13px;color:var(--sub);margin-bottom:12px}
-.row{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:8px 0;font-size:14px}
-.row+.row{border-top:1px solid var(--border)}
-.row .label{color:var(--sub);flex-shrink:0}
-.row .value{font-weight:600;text-align:right;word-break:break-all}
+.panel{height:100%;overflow:auto;padding:14px 14px 28px;-webkit-overflow-scrolling:touch}
+
+/* 卡片：只用一条极轻的外描边，不再叠两层阴影 */
+.card{background:var(--sheet);border-radius:var(--r);box-shadow:var(--sh);margin-bottom:14px;overflow:hidden}
+.card.pad{padding:16px}
+.card-title{font-size:13px;font-weight:600;color:var(--ink2);padding:14px 16px 8px}
+
+/* 核带 */
+.band{background:var(--sheet);border-radius:var(--r);box-shadow:var(--sh);padding:15px 16px 13px;margin-bottom:14px}
+.band-top{display:flex;align-items:baseline;justify-content:space-between;gap:10px;margin-bottom:14px}
+.band-h{font-size:13px;color:var(--ink2)}
+.band-n{font-size:12px;color:var(--ink3);text-align:right;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bars{display:flex;align-items:flex-end;gap:12px}
+.cl{display:flex;flex-direction:column;min-width:0}
+.cl-v{font-size:12px;font-weight:600;color:var(--ink2);margin-bottom:5px;white-space:nowrap}
+.cl-col{height:56px;border-radius:3px;background:#f1f3f5;display:flex;align-items:flex-end;overflow:hidden}
+.cl-col i{display:block;width:100%;border-radius:2px;transition:height .45s cubic-bezier(.3,.9,.3,1)}
+.cl-e i{background:var(--e)}.cl-p i{background:var(--p)}.cl-hp i{background:var(--hp)}
+.cl-col.unk i{background:repeating-linear-gradient(45deg,#e3e6e9 0 5px,#f1f3f5 5px 10px)}
+.cl-n{font-size:11px;color:var(--ink3);margin-top:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+/* 读数表 */
+.rows{display:flex;flex-direction:column}
+.row{display:flex;align-items:baseline;justify-content:space-between;gap:14px;padding:11px 16px;font-size:14px}
+.row+.row{border-top:1px solid var(--line2)}
+.row .label{color:var(--ink2);flex-shrink:0}
+.row .value{flex:1;min-width:0;text-align:right;word-break:break-all}
+.row .value b{font-weight:600}
+.row .value em{font-style:normal;color:var(--ink3)}
 .mono{font-family:var(--mono);font-size:13px}
-.badge{padding:2px 10px;border-radius:999px;font-size:12px;font-weight:600}
-.badge.ebpf{background:rgba(52,199,89,.14);color:#248a3d}
-.badge.proc{background:rgba(0,122,255,.13);color:#0062cc}
-.grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-.stat{background:var(--bg);border-radius:12px;padding:12px 8px;text-align:center}
-.stat .num{font-size:24px;font-weight:700;font-variant-numeric:tabular-nums}
-.stat .lbl{font-size:12px;color:var(--sub);margin-top:2px}
-.chip{display:inline-block;padding:2px 8px;border-radius:6px;font-size:11px;font-weight:600;font-family:var(--mono);max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.chip.e{background:rgba(52,199,89,.15);color:#248a3d}
-.chip.p{background:rgba(0,122,255,.13);color:#0062cc}
-.chip.h{background:rgba(175,82,222,.15);color:#8944ab}
-.chip.c{background:rgba(142,142,147,.16);color:#636366}
-.tabbar,.navbar{background:rgba(255,255,255,.85);backdrop-filter:blur(20px) saturate(1.6);-webkit-backdrop-filter:blur(20px) saturate(1.6)}
-.tabbar{display:flex;height:56px;border-top:1px solid var(--border);flex-shrink:0;padding-bottom:env(safe-area-inset-bottom)}
-.tab{flex:1;color:var(--sub);font-size:11px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;transition:color .15s}
-.tab svg{width:24px;height:24px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;transition:transform .15s}
-.tab.active{color:var(--blue)}
-.tab.active svg{transform:translateY(-1px) scale(1.08)}
-@media(orientation:landscape){.app{flex-direction:row}.tabbar{flex-direction:column;height:100%;width:64px;border-top:none;border-right:1px solid var(--border);order:-1;justify-content:center;padding-bottom:0}.tab{flex:1;max-height:64px}}
-.bar{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;gap:8px}
-#r-filter{flex:1;min-width:0;width:auto;background:var(--card);border:1px solid var(--border);border-radius:10px;padding:8px 12px;font-size:13px;color:var(--fg);outline:none;font-family:inherit}
-#r-filter:focus{border-color:var(--blue)}
-.btn{background:var(--blue);color:#fff;padding:8px 14px;border-radius:999px;font-size:13px;font-weight:500;transition:transform .12s,opacity .12s}
-.btn:active{transform:scale(.94);opacity:.8}
-.btn-outline{background:none;color:var(--sub);border:1px solid var(--border);padding:8px 14px;border-radius:999px;font-size:14px}
+.badge{display:inline-block;padding:1px 8px;border-radius:999px;font-size:12px;font-weight:600;vertical-align:1px}
+.badge.ebpf{background:rgba(14,107,94,.1);color:var(--accent)}
+.badge.proc{background:rgba(92,98,107,.1);color:var(--ink2)}
+
+/* 核心分层：chip 也走明度梯度，和核带对得上 */
+.chip{display:inline-block;padding:1px 8px;border-radius:6px;font-size:11px;font-weight:600;font-family:var(--mono);
+max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;background:var(--line2);color:var(--ink2)}
+.chip.e{background:rgba(159,189,216,.3);color:#33546f}
+.chip.p{background:rgba(77,128,184,.16);color:#2c5a86}
+.chip.h{background:rgba(31,78,121,.14);color:var(--hp)}
+.chip.c{background:var(--line2);color:var(--ink2)}
+
+/* 分组设置单：组标题在卡外，组内一张连续卡 */
+.sec{margin:0 4px 7px;font-size:12px;font-weight:600;color:var(--ink2)}
+.item{padding:13px 16px;display:flex;align-items:flex-start;gap:14px}
+.item+.item{border-top:1px solid var(--line2)}
+.item .txt{flex:1;min-width:0}
+.item .t{font-size:15px}
+.item .d{font-size:12.5px;color:var(--ink3);margin-top:2px;line-height:1.5}
+.item .state{font-size:12px;color:var(--ink2);margin-top:5px;line-height:1.5;word-break:break-all}
+.item .ctl{flex-shrink:0;display:flex;align-items:center;padding-top:2px}
+.item.stack{display:block}
+.item.stack .ctl{margin-top:10px;display:block}
+.item.stack .state{margin-top:8px}
+.sub{padding:11px 16px 12px 16px;border-top:1px solid var(--line2);background:#fafbfb;
+box-shadow:inset 2px 0 0 var(--line);display:none}
+.sub.on{display:block}
+.sub .item{padding:0}
+.sub .item+.item{margin-top:10px;padding-top:10px;border-top:1px dashed var(--line)}
+
+/* 开关 */
+.sw{position:relative;width:46px;height:28px;flex-shrink:0}
+.sw button{position:absolute;inset:0;border-radius:999px;background:#d9dcdf;transition:background .2s}
+.sw button::after{content:'';position:absolute;top:3px;left:3px;width:22px;height:22px;border-radius:50%;background:#fff;
+box-shadow:0 1px 3px rgba(0,0,0,.22);transition:transform .2s cubic-bezier(.3,.9,.3,1)}
+.sw button.on{background:var(--accent)}
+.sw button.on::after{transform:translateX(18px)}
+.sw button:active::after{width:24px}
+
+/* 分段控件：只用于真的有多个离散状态的项 */
+.seg{display:flex;background:var(--line2);border-radius:9px;padding:2px;gap:2px}
+.seg button{flex:1;padding:7px 4px;border-radius:7px;font-size:13px;text-align:center;color:var(--ink2);transition:background .15s,color .15s}
+.seg button.on{background:#fff;color:var(--accent);font-weight:600;box-shadow:0 1px 2px rgba(20,22,26,.12)}
+
+/* 通用控件 */
+.btn{background:var(--accent);color:#fff;padding:8px 15px;border-radius:9px;font-size:14px;text-align:center;transition:opacity .12s}
+.btn:active{opacity:.75}
+.btn-outline{background:none;border:1px solid var(--line);color:var(--ink2);padding:8px 15px;border-radius:9px;font-size:14px;text-align:center}
 .btn-outline:active{opacity:.6}
-.grp{margin-bottom:10px;overflow:hidden}
-.grp-head{display:flex;align-items:center;gap:8px;padding:13px 14px;cursor:pointer;user-select:none;-webkit-user-select:none;transition:background .15s}
-.grp-head:active{background:rgba(0,0,0,.03)}
-.chev{width:16px;height:16px;stroke:var(--sub);fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;transition:transform .16s;flex-shrink:0}
+.entry{display:flex;width:100%;align-items:center;gap:8px;padding:13px 16px;font-size:15px}
+.entry+.entry{border-top:1px solid var(--line2)}
+.entry svg{margin-left:auto;width:14px;height:14px;stroke:var(--ink3);fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0}
+.entry:active{background:#fafbfb}
+
+/* 规则页 */
+.bar{display:flex;align-items:center;gap:8px;margin-bottom:12px}
+#r-filter{flex:1;min-width:0;background:var(--sheet);border:1px solid var(--line);border-radius:9px;padding:9px 12px;
+font-size:14px;color:var(--ink);outline:none;font-family:inherit}
+#r-filter:focus{border-color:var(--accent)}
+.grp{background:var(--sheet);border-radius:var(--r);box-shadow:var(--sh);margin-bottom:8px;overflow:hidden}
+.grp-head{display:flex;align-items:center;gap:7px;padding:13px 14px;cursor:pointer;user-select:none;-webkit-user-select:none}
+.grp-head:active{background:#fafbfb}
+.chev{width:14px;height:14px;stroke:var(--ink3);fill:none;stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round;transition:transform .16s;flex-shrink:0}
 .grp.open .chev{transform:rotate(90deg)}
-.grp-name{flex:1;min-width:0;word-break:break-all;font-weight:600;font-size:14px}
-.grp-count{font-size:11px;color:var(--sub);background:var(--bg);border-radius:999px;padding:2px 8px;flex-shrink:0}
+.grp-name{flex:1;min-width:0;word-break:break-all;font-size:14px;font-weight:600}
+.grp-count{font-size:11px;color:var(--ink3);background:var(--line2);border-radius:999px;padding:1px 8px;flex-shrink:0}
 .grp-body{display:grid;grid-template-rows:0fr;transition:grid-template-rows .16s ease}
 .grp.open .grp-body{grid-template-rows:1fr}
 .grp-inner{overflow:hidden}
-.rule-row{display:flex;align-items:center;gap:8px;padding:10px 14px;border-top:1px solid var(--border)}
-.rule-name{flex:1;min-width:0;word-break:break-all;font-size:13px}
-.rule-sub{color:var(--sub);font-size:12px}
-.rule-add{display:flex;align-items:center;justify-content:center;gap:4px;margin:10px 14px;padding:9px 0;border:1px dashed var(--border);border-radius:10px;color:var(--sub);font-size:13px;width:calc(100% - 28px)}
+.rule-row{display:flex;align-items:center;gap:8px;padding:10px 14px;border-top:1px solid var(--line2)}
+.rule-name{flex:1;min-width:0;word-break:break-all;font-size:13.5px}
+.rule-sub{color:var(--ink3);font-size:12px}
+.rule-add{display:flex;align-items:center;justify-content:center;gap:5px;margin:10px 14px;padding:9px 0;
+border:1px dashed var(--line);border-radius:9px;color:var(--ink3);font-size:13px;width:calc(100% - 28px)}
 .rule-add:active{opacity:.5}
 .rule-add svg{width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round}
-.icon-btn{padding:6px;border-radius:8px;color:var(--sub);display:flex;transition:transform .12s,background .12s}
-.icon-btn.danger{color:var(--red)}
-.icon-btn:active{transform:scale(.85);background:rgba(0,0,0,.06)}
+.icon-btn{padding:6px;border-radius:7px;color:var(--ink3);display:flex;transition:background .12s}
+.icon-btn.danger{color:var(--danger)}
+.icon-btn:active{background:rgba(20,22,26,.06)}
 .icon-btn svg{width:16px;height:16px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
-.rt-btn{font-size:11px;font-weight:600;letter-spacing:.4px;padding:3px 7px;border-radius:7px;background:var(--bg);color:var(--sub);flex-shrink:0;margin-left:2px}
-.rt-btn.on{background:rgba(255,149,0,.16);color:var(--orange)}
-.empty{padding:48px 20px;text-align:center;color:var(--sub);font-size:13px;line-height:1.8}
-.seg{display:flex;background:rgba(118,118,128,.12);border-radius:10px;padding:2px;gap:2px}
-.seg button{flex:1;padding:7px 0;border-radius:8px;font-size:13px;transition:all .15s}
-.seg button.on{background:#fff;box-shadow:0 1px 4px rgba(0,0,0,.12);font-weight:600;color:var(--blue)}
-.field{display:flex;gap:8px;align-items:center}
-.field input,.modal input{background:var(--bg);border:1px solid transparent;border-radius:10px;padding:9px 12px;font-size:14px;outline:none;font-family:inherit;color:var(--fg);transition:border-color .15s,background .15s}
-.adv summary{list-style:none;cursor:pointer;display:flex;align-items:center;justify-content:space-between;font-size:13px;color:var(--sub);user-select:none;-webkit-user-select:none}
-.adv summary::-webkit-details-marker{display:none}
-.adv summary::after{content:'';width:7px;height:7px;border-right:2px solid var(--sub);border-bottom:2px solid var(--sub);transform:rotate(45deg);transition:transform .15s;margin-right:3px}
-.adv[open] summary::after{transform:rotate(-135deg)}
-.adv-body{padding-top:14px}
-.adv-row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:7px 0}
-.adv-row>span{font-size:13px}
-.adv-row input,.rt-row input{background:var(--bg);border:1px solid transparent;border-radius:9px;padding:7px 9px;font-size:13px;outline:none;color:var(--fg);font-family:inherit;text-align:center}
-.adv-row input{width:84px}
-.adv-row select{background:var(--bg);border:1px solid transparent;border-radius:9px;padding:7px 9px;font-size:12px;outline:none;color:var(--fg);font-family:inherit}
-.adv-save{width:100%;margin-top:10px}
-.rt-row{padding:10px 0;border-top:1px solid var(--border)}
-.rt-main{display:flex;align-items:center;gap:8px}
-.rt-main .pkg{flex:1;min-width:0;word-break:break-all;font-size:12px}
-.rt-sub{display:flex;align-items:center;gap:8px;margin-top:6px}
-.rt-sub .mode{flex:1;min-width:0;font-size:10px;color:var(--sub);background:var(--bg);border-radius:6px;padding:3px 6px;word-break:break-all}
-.rt-sub label{font-size:11px;color:var(--sub);display:flex;align-items:center;gap:4px;flex-shrink:0}
-.rt-sub input{width:46px;padding:5px 6px;font-size:12px}
-.rt-sub input.rt-names{width:auto;flex:1;min-width:0;text-align:left}
-.field input{flex:1;min-width:0}
+.rt-btn{font-size:11px;font-weight:700;letter-spacing:.5px;padding:3px 7px;border-radius:6px;background:var(--line2);color:var(--ink3);flex-shrink:0}
+.rt-btn.on{background:rgba(163,90,0,.14);color:var(--warn)}
+.empty{padding:56px 24px;text-align:center;color:var(--ink3);font-size:13.5px;line-height:1.9}
+.tag{font-size:11px;padding:1px 6px;border-radius:5px;background:var(--line2);color:var(--ink2);flex-shrink:0}
+.tag.warn{background:rgba(163,90,0,.12);color:var(--warn)}
+.cand{padding:11px 14px;border-top:1px solid var(--line2)}
+.cand:first-of-type{border-top:none}
+.cand-h{display:flex;align-items:center;gap:8px}
+.cand-pkg{flex:1;min-width:0;font-size:12.5px;color:var(--ink3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cand-b{display:flex;align-items:center;gap:8px;margin-top:6px}
+.cand-th{flex:1;min-width:0;font-size:14px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.btn.sm{padding:5px 12px;font-size:13px;border-radius:7px}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.stat{background:var(--paper);border-radius:9px;padding:12px 8px;text-align:center}
+.stat .num{font-size:22px;font-weight:600}
+.stat .lbl{font-size:12px;color:var(--ink3);margin-top:1px}
+.field{display:flex;gap:8px;align-items:center;padding:13px 16px}
+.field input{flex:1;min-width:0;background:var(--paper);border:1px solid transparent;border-radius:9px;padding:9px 12px;
+font-size:14px;outline:none;font-family:inherit;color:var(--ink)}
+.field input:focus{border-color:var(--accent);background:#fff}
 .field .btn{flex-shrink:0}
-.hint{font-size:12px;color:var(--sub);margin-top:8px;line-height:1.5;word-break:break-all}
-.rt-row{border-top:1px solid var(--border);padding:10px 0}
+.hint{font-size:12.5px;color:var(--ink3);padding:0 16px 12px;line-height:1.55;word-break:break-all}
+.hint.first{padding-top:10px}
+.adv summary{list-style:none;cursor:pointer;display:flex;align-items:center;justify-content:space-between;
+font-size:15px;color:var(--ink);padding:13px 16px;user-select:none;-webkit-user-select:none}
+.adv summary::-webkit-details-marker{display:none}
+.adv summary::after{content:'';width:7px;height:7px;border-right:1.8px solid var(--ink3);border-bottom:1.8px solid var(--ink3);
+transform:rotate(45deg);transition:transform .15s;margin-right:3px}
+.adv[open] summary::after{transform:rotate(-135deg)}
+.adv-body{border-top:1px solid var(--line2)}
+.adv-row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:11px 16px}
+.adv-row+.adv-row{border-top:1px solid var(--line2)}
+.adv-row>span{font-size:14px}
+.adv-row input,.rt-sub input{background:var(--paper);border:1px solid transparent;border-radius:8px;padding:7px 9px;
+font-size:13px;outline:none;color:var(--ink);font-family:inherit;text-align:center}
+.adv-row input{width:88px}
+.adv-row input:focus,.rt-sub input:focus{border-color:var(--accent);background:#fff}
+.adv-row select{background:var(--paper);border:1px solid transparent;border-radius:8px;padding:7px 9px;font-size:13px;
+outline:none;color:var(--ink);font-family:inherit}
+.adv-save{display:block;width:calc(100% - 32px);margin:4px 16px 12px}
+.rt-row{padding:12px 16px;border-top:1px solid var(--line2)}
 .rt-row:first-child{border-top:none}
-.rt-top{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
-.rt-pkg{font-size:13px;font-weight:500;word-break:break-all}
-.rt-n{font-size:12px;color:var(--sub);flex-shrink:0;margin-left:8px}
-.rt-ctl{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
-.rt-ctl select,.rt-ctl input{background:var(--bg);border:1px solid transparent;border-radius:8px;padding:6px 8px;font-size:12px;font-family:inherit;color:var(--fg);outline:none}
-.rt-ctl input.rt-pat{flex:1;min-width:90px}
-.rt-ctl input.rt-max{width:46px;flex:none}
-.rt-ctl .btn{padding:6px 10px;font-size:12px}
+.rt-main{display:flex;align-items:center;gap:8px}
+.rt-main .pkg{flex:1;min-width:0;word-break:break-all;font-size:13px}
+.rt-sub{display:flex;align-items:center;gap:8px;margin-top:7px}
+.rt-sub .mode{flex-shrink:0;font-size:11px;color:var(--ink3);background:var(--line2);border-radius:6px;padding:3px 7px}
+.rt-sub label{font-size:12px;color:var(--ink3);display:flex;align-items:center;gap:5px;flex-shrink:0;margin-left:auto}
+.rt-sub input{width:48px;padding:5px 6px;font-size:12px}
+.rt-sub input.rt-names{width:auto;flex:1;min-width:0;text-align:left;font-size:12.5px}
+
+/* 诊断：每个指标一行，不再把五个指标挤成一句话 */
+.diag-h{font-size:12px;color:var(--ink3);padding:13px 16px 5px}
+.diag-h+.diag-h{padding-top:11px}
+.diag-l{font-size:13px;padding:0 16px 10px;color:var(--ink);line-height:1.55;word-break:break-all}
+.diag-l.dim{color:var(--ink3)}
+.diag-l b{font-weight:600}
+.diag-l .li{display:block;padding:2px 0}
+.diag-l .bad{color:var(--warn)}
+
+/* 弹窗与提示 */
 @keyframes fadeIn{from{opacity:0}to{opacity:1}}
-@keyframes popIn{from{opacity:0;transform:scale(.94) translateY(8px)}to{opacity:1;transform:none}}
-.modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.35);display:flex;align-items:center;justify-content:center;z-index:100;animation:fadeIn .12s}
-.modal{background:var(--card);border-radius:18px;padding:20px;width:90%;max-width:320px;max-height:88vh;overflow:auto;animation:popIn .16s cubic-bezier(.2,1.1,.4,1)}
+@keyframes popIn{from{opacity:0;transform:scale(.96) translateY(6px)}to{opacity:1;transform:none}}
+.modal-bg{position:fixed;inset:0;background:rgba(20,22,26,.42);display:flex;align-items:center;justify-content:center;
+z-index:100;padding:20px;animation:fadeIn .12s}
+.modal{background:var(--sheet);border-radius:16px;padding:20px;width:100%;max-width:330px;max-height:86vh;overflow:auto;
+animation:popIn .16s cubic-bezier(.2,1.1,.4,1)}
 .modal h3{font-size:16px;margin-bottom:14px;text-align:center}
-.modal input{width:100%;margin-bottom:10px}
-.modal input[readonly]{background:var(--card);color:var(--sub)}
-.field input:focus,.modal input:focus{border-color:var(--blue);background:#fff}
+.modal input{width:100%;box-sizing:border-box;margin-bottom:10px;background:var(--paper);border:1px solid transparent;
+border-radius:9px;padding:9px 12px;font-size:14px;outline:none;font-family:inherit;color:var(--ink)}
+.modal input:focus{border-color:var(--accent);background:#fff}
+.modal input[readonly]{background:var(--sheet);color:var(--ink3)}
 .modal-actions{display:flex;gap:8px;margin-top:6px}
-.modal-actions button{flex:1;padding:9px 0;border-radius:999px;font-size:14px}
+.modal-actions button{flex:1;padding:10px 0}
 .core-chips{display:flex;gap:6px;margin-bottom:10px;flex-wrap:wrap}
-.core-chips button{padding:7px 12px;border-radius:999px;font-size:12px;background:rgba(118,118,128,.12);transition:all .15s}
-.core-chips button.on{background:var(--blue);color:#fff;font-weight:600;transform:scale(1.05)}
+.core-chips button{padding:7px 12px;border-radius:8px;font-size:12px;background:var(--line2);transition:background .15s,color .15s;text-align:center}
+.core-chips button.on{background:var(--accent);color:#fff;font-weight:600}
 .sg-wrap{position:relative}
-.sg-box{position:absolute;left:0;right:0;top:calc(100% + 4px);background:var(--card);border-radius:10px;box-shadow:0 4px 16px rgba(0,0,0,.18);max-height:172px;overflow:auto;touch-action:pan-y;z-index:10;animation:fadeIn .1s}
+.sg-box{position:absolute;left:0;right:0;top:calc(100% + 4px);background:var(--sheet);border-radius:9px;
+box-shadow:0 6px 20px rgba(20,22,26,.18);max-height:172px;overflow:auto;touch-action:pan-y;z-index:10;animation:fadeIn .1s}
 .sg-item{padding:9px 12px;font-size:13px;word-break:break-all}
-.sg-item.hl,.sg-item:active{background:rgba(0,122,255,.08)}
+.sg-item.hl,.sg-item:active{background:rgba(14,107,94,.08)}
 .tree-row{margin-bottom:12px}
-.tree-row.branch{border-left:2px solid rgba(0,122,255,.25);padding-left:10px}
+.tree-row.branch{border-left:2px solid rgba(14,107,94,.22);padding-left:10px}
 .tr-head{display:flex;align-items:center;gap:6px;margin-bottom:6px}
 .tr-head input{flex:1;width:auto;min-width:0;margin-bottom:0}
-.tr-tag{font-size:12px;font-weight:600;color:var(--fg)}
-.tr-sub{font-size:11px;color:var(--sub)}
+.tr-tag{font-size:12px;font-weight:600}
+.tr-sub{font-size:11px;color:var(--ink3)}
 #mr-rows .core-chips{margin-bottom:6px}
 #mr-rows .rr-custom{margin-bottom:0}
 #mr-addrow{width:100%;margin:0 0 4px}
-#toast{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:rgba(0,0,0,.75);color:#fff;padding:10px 20px;border-radius:12px;font-size:14px;z-index:200;opacity:0;transition:opacity .15s;pointer-events:none;max-width:80vw;word-break:break-all}
+#toast{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:rgba(20,22,26,.86);color:#fff;
+padding:11px 20px;border-radius:10px;font-size:14px;z-index:200;opacity:0;transition:opacity .15s;pointer-events:none;
+max-width:80vw;word-break:break-all;text-align:center}
 #toast.show{opacity:1}
-.entry{display:flex;width:100%;align-items:center;gap:8px;padding:11px 0;font-size:14px}
-.entry svg{margin-left:auto;width:14px;height:14px;stroke:var(--sub);fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0}
-.entry:active{opacity:.5}
-.page{position:absolute;inset:0;background:var(--bg);z-index:50;display:flex;flex-direction:column;transform:translateX(100%);transition:transform .18s ease;pointer-events:none}
+
+/* 关于 / 支持 */
+.page{position:absolute;inset:0;background:var(--paper);z-index:50;display:flex;flex-direction:column;
+transform:translateX(100%);transition:transform .18s ease;pointer-events:none}
 .page.show{transform:none;pointer-events:auto}
-.navbar{display:flex;align-items:center;justify-content:center;position:relative;height:44px;flex-shrink:0;border-bottom:1px solid var(--border)}
+.navbar{display:flex;align-items:center;justify-content:center;position:relative;height:46px;flex-shrink:0;
+border-bottom:1px solid var(--line);background:rgba(255,255,255,.92);backdrop-filter:blur(16px)}
 .nav-title{font-size:16px;font-weight:600}
-.back{position:absolute;left:6px;top:0;height:100%;display:flex;align-items:center;gap:2px;color:var(--blue);font-size:15px;padding:0 8px}
+.back{position:absolute;left:6px;top:0;height:100%;display:flex;align-items:center;gap:2px;color:var(--accent);font-size:15px;padding:0 8px}
 .back svg{width:22px;height:22px;stroke:currentColor;fill:none;stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round}
 .back:active{opacity:.5}
 .page .panel{flex:1;overflow:auto}
-.hero{text-align:center;padding:24px 16px}
-.logo{width:72px;height:72px;border-radius:18px;background:linear-gradient(135deg,#EFFFFE,#0ABBB5);display:flex;align-items:center;justify-content:center;margin:0 auto 10px;box-shadow:0 8px 20px rgba(10,187,181,.3)}
-.logo svg{width:40px;height:40px;stroke:#fff;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
-.hero .name{font-size:20px;font-weight:700}
-.hero .ver{font-size:13px;color:var(--sub);margin-top:2px;font-family:var(--mono)}
-.text{font-size:13px;line-height:1.8;color:#3a3a3c;word-break:break-all}
-.text ol{padding-left:18px;display:grid;gap:4px}
+.hero{text-align:center;padding:26px 16px}
+.logo{width:66px;height:66px;border-radius:16px;background:var(--hp);display:flex;align-items:center;justify-content:center;
+margin:0 auto 12px}
+.logo svg{width:36px;height:36px;stroke:#fff;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+.hero .name{font-size:20px;font-weight:600}
+.hero .ver{font-size:12px;color:var(--ink3);margin-top:3px;font-family:var(--mono)}
+.text{font-size:14px;line-height:1.75;color:var(--ink2);padding:0 16px 16px;word-break:break-all}
+.text ol{padding-left:20px;display:grid;gap:5px}
 .qrs{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-.qr{display:grid;gap:8px}
+.qr{display:grid;gap:8px;padding:0 16px 16px}
 .qr>svg{width:100%;height:auto;display:block;border-radius:8px}
-.qr .btn{width:100%;padding:8px 0}
+.qr .btn{width:100%}
 .btn-wx{background:#07c160}
-#page-donate .logo{background:linear-gradient(135deg,#ff9a9e,#ff5e7e)}
+#page-donate .logo{background:#b3261e}
 #page-donate .logo svg{fill:#fff;stroke:none}
+
+/* tabbar */
+.tabbar{display:flex;height:56px;flex-shrink:0;padding-bottom:env(safe-area-inset-bottom);
+background:rgba(255,255,255,.92);backdrop-filter:blur(16px) saturate(1.5);-webkit-backdrop-filter:blur(16px);
+border-top:1px solid var(--line)}
+.tab{flex:1;color:var(--ink3);font-size:11px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px}
+.tab svg{width:23px;height:23px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+.tab.active{color:var(--accent);font-weight:600}
+@media(orientation:landscape){.app{flex-direction:row}.tabbar{flex-direction:column;height:100%;width:68px;
+border-top:none;border-right:1px solid var(--line);order:-1;justify-content:center;padding-bottom:0}
+.tab{flex:1;max-height:68px}}
+@media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 </style>
 </head>
 <body>
@@ -178,41 +290,40 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <main class="main">
 
 <section id="tab-status" class="panel">
+
+<div class="band">
+<div class="band-top">
+<span class="band-h">核心占用</span>
+<span class="band-n" id="band-note">正在采样</span>
+</div>
+<div class="bars" id="band-bars"></div>
+</div>
+
 <div class="card">
-<div class="card-title">运行状态</div>
-<div class="row"><span class="label">工作模式</span><span id="s-mode" class="badge proc">-</span></div>
-<div class="row"><span class="label">运行时长</span><span class="value" id="s-up">-</span></div>
-<div class="row"><span class="label">版本</span><span class="value" id="s-ver">-</span></div>
+<div class="rows">
+<div class="row"><span class="label">规则</span><span class="value"><b id="s-rules">0</b> 条 · <b id="s-pkgs">0</b> 个应用</span></div>
+<div class="row"><span class="label">正在管理</span><span class="value"><b id="s-hit">0</b> 个应用 · <b id="s-threads">0</b> 个线程</span></div>
+<div class="row"><span class="label">运行</span><span class="value"><span id="s-up">-</span> · <span id="s-mode" class="badge proc">-</span></span></div>
+<div class="row"><span class="label">版本</span><span class="value mono" id="s-ver">-</span></div>
 </div>
-<div class="card">
-<div class="card-title">规则</div>
-<div class="grid2">
-<div class="stat"><div class="num" id="s-rules">0</div><div class="lbl">规则数量</div></div>
-<div class="stat"><div class="num" id="s-pkgs">0</div><div class="lbl">覆盖应用</div></div>
 </div>
-<div class="hint" id="s-pf" hidden style="color:var(--orange)"></div>
-</div>
-<div class="card">
-<div class="card-title">进程</div>
-<div class="grid2">
-<div class="stat"><div class="num" id="s-hit">0</div><div class="lbl">命中应用</div></div>
-<div class="stat"><div class="num" id="s-threads">0</div><div class="lbl">绑定线程</div></div>
-<div class="stat"><div class="num" id="s-procs">0</div><div class="lbl">系统进程</div></div>
-<div class="stat"><div class="num" id="s-cores">0</div><div class="lbl">CPU 核心</div></div>
-</div>
-<div class="hint" id="s-drop" hidden style="color:var(--orange)"></div>
-</div>
+<div class="hint" id="s-pf" hidden style="color:var(--warn);padding:0 4px 12px"></div>
+<div class="hint" id="s-drop" hidden style="color:var(--warn);padding:0 4px 12px"></div>
+
 <div class="card" id="s-card-cores">
 <div class="card-title">核心分层</div>
-<div class="row"><span class="label">e-core 小核</span><span class="chip e" id="s-ecore">-</span></div>
-<div class="row" id="s-row-pcore"><span class="label">p-core 中核</span><span class="chip p" id="s-pcore">-</span></div>
-<div class="row"><span class="label">hp-core 大核</span><span class="chip h" id="s-hcore">-</span></div>
-<div class="row"><span class="label">全部核心</span><span class="chip c" id="s-all">-</span></div>
-<div class="row"><span class="label">分层依据</span><span class="value" id="s-topo-src">-</span></div>
-<div class="hint" id="s-topo-deg" hidden style="color:var(--orange)"></div>
+<div class="rows">
+<div class="row"><span class="label">小核</span><span class="chip e" id="s-ecore">-</span></div>
+<div class="row" id="s-row-pcore"><span class="label">中核</span><span class="chip p" id="s-pcore">-</span></div>
+<div class="row"><span class="label">大核</span><span class="chip h" id="s-hcore">-</span></div>
+<div class="row"><span class="label">核心 / 进程</span><span class="value"><span id="s-cores">0</span> 核 · <span id="s-procs">0</span> 进程</span></div>
 </div>
+<div class="hint" id="s-topo-deg" hidden style="color:var(--warn)"></div>
+<div class="hint" style="padding-bottom:14px">分层依据 <span id="s-topo-src">-</span><span class="mono" id="s-all" hidden></span></div>
+</div>
+
 <div class="card">
-<div class="card-title">支持</div>
+<button class="entry" id="s-diag">诊断信息<svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg></button>
 <button class="entry" id="s-donate">支持开发<svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg></button>
 </div>
 </section>
@@ -227,148 +338,155 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 </section>
 
 <section id="tab-settings" class="panel" hidden>
+
+<div class="sec">核心分配</div>
 <div class="card">
-<div class="card-title">工作模式</div>
-<div class="seg" id="seg-mode">
-<button data-mode="0">自动</button>
-<button data-mode="1">eBPF</button>
-<button data-mode="2">Proc</button>
+<div class="item stack">
+<div class="txt"><div class="t">自动挪到空闲核心</div>
+<div class="d">哪层核挤了，就把不着急的活挪到空的那层去。</div></div>
+<div class="ctl"><div class="seg" id="seg-sched">
+<button data-sched="off">关闭</button><button data-sched="shadow">只观察</button><button data-sched="on">开启</button>
+</div></div>
+<div class="state" id="c-sched-state">-</div>
 </div>
-<div class="hint" id="c-mode-active">当前生效: -</div>
-<div class="hint">看不懂就选「自动」，它会自己挑最快的办法。</div>
-<div class="hint" id="c-ebpf-hint" style="color:var(--orange)" hidden>这台设备不支持 eBPF，选了也会用普通扫描</div>
+<div class="item stack">
+<div class="txt"><div class="t">关键线程插队</div>
+<div class="d">画面和主循环优先跑。插队的太多会互相挤，建议 2 个以内。</div></div>
+<div class="ctl"><div class="seg" id="seg-rt">
+<button data-rt="off">关闭</button><button data-rt="global">全部应用</button><button data-rt="per_app">按规则</button>
+</div></div>
+<div class="state" id="c-rt-state">-</div>
 </div>
-<div class="card">
-<div class="card-title">扫描参数</div>
-<div class="field"><input id="c-interval" type="number" min="1" max="3600"><button class="btn" id="c-interval-save">保存</button></div>
-<div class="hint">多久看一眼有哪些线程（秒）。默认就好，调小反应快一点，但更费电。</div>
-<div class="hint">没写规则的线程：<span id="c-unmatched">-</span></div>
-<div class="hint">能在几层核之间挪的规则：<span id="c-cross">-</span></div>
-<div class="hint">优先跑（RT）：<span id="c-rt">-</span></div>
+<div class="item stack">
+<div class="txt"><div class="t">系统分组冲突时</div>
+<div class="d">系统把 App 分进没有大核的组时，让着它还是抢过来。</div></div>
+<div class="ctl"><div class="seg" id="seg-sysgroup">
+<button data-sysgroup="respect">让着它</button><button data-sysgroup="takeover">抢过来</button>
+</div></div>
+<div class="state" id="c-sysgroup-state">-</div>
 </div>
-<div class="card">
-<div class="card-title">S7 动态分配</div>
-<div class="seg" id="seg-sched">
-<button data-sched="off">关闭</button>
-<button data-sched="shadow">观察</button>
-<button data-sched="on">开启</button>
-</div>
-<div class="hint" id="c-sched-state">-</div>
-<div class="hint">哪层核挤了，就把不着急的活挪到空一点的层去。<b>观察</b>＝只记下打算怎么挪，不动手；<b>开启</b>＝真的挪。建议先用观察跑几天，觉得挪得有道理再开。</div>
-</div>
-<div class="card">
-<div class="card-title">息屏放松</div>
-<div class="seg" id="seg-screen">
-<button data-key="screen" data-val="off" data-on="0">关闭</button>
-<button data-key="screen" data-val="relax" data-on="1">开启</button>
-</div>
-<div class="hint" id="c-screen-state">-</div>
-<div class="hint">黑屏后少折腾：绑好的线程改成 60 秒看一次，省电。新开的 App 照样马上处理。分辨不出黑屏还是亮屏时，就当亮屏，等于没开。</div>
-</div>
-<div class="card">
-<div class="card-title">前后台降档</div>
-<div class="seg" id="seg-demote">
-<button data-key="foreground_demote" data-val="off" data-on="0">关闭</button>
-<button data-key="foreground_demote" data-val="on" data-on="1">开启</button>
-</div>
-<div class="hint" id="c-demote-state">-</div>
-<div class="hint">App 切到后台后，把它那些没单独指定核的线程挪到小核，省电。切回前台会马上搬回来。</div>
-</div>
-<div class="card">
-<div class="card-title">Auto Assign</div>
-<div class="seg" id="seg-auto">
-<button data-key="auto_assign" data-val="off" data-on="0">关闭</button>
-<button data-key="auto_assign" data-val="on" data-on="1">开启</button>
-</div>
-<div class="hint" id="c-auto-state">-</div>
-<div class="hint">先看看你的游戏都有哪些线程、各自像干什么的，然后给建议。<b>只建议，不替你改</b>：要到「规则」页点同意才生效。线程活满 1 分钟才出现，活满 5 分钟算「比较确定」；已经有规则管到的线程不再建议。</div>
-</div>
-<div class="card">
-<div class="card-title">线程忙闲观察</div>
-<div class="seg" id="seg-pmu">
-<button data-key="pmu" data-val="off" data-on="0">关闭</button>
-<button data-key="pmu" data-val="observe" data-on="1">观察</button>
-</div>
-<div class="hint" id="c-pmu-state">-</div>
-<div class="seg" id="seg-pmu-alloc">
-<button data-key="pmu_alloc" data-val="off" data-on="0">只看忙闲</button>
-<button data-key="pmu_alloc" data-val="shadow" data-on="1">配额估算</button>
-</div>
-<div class="hint" id="c-pmu-alloc-state">-</div>
-<div class="hint">看看游戏里每个线程有多忙，用来判断绑得合不合理。硬件计数器读不到时会自动改用 CPU 时间。<b>只看不改</b>。<br>配额估算：估算大核、中核、小核各该干多少活，再和实际比一比，告诉你哪层偏空。<b>只估算，不执行</b>。</div>
-</div>
-<div class="card">
-<div class="card-title">RT 实时调度</div>
-<div class="seg" id="seg-rt">
-<button data-rt="off">关闭</button>
-<button data-rt="global">全部应用</button>
-<button data-rt="per_app">按规则开启</button>
-</div>
-<div class="hint" id="c-rt-state">-</div>
-<div class="hint">让最关键的线程（画面、主循环）插队先跑。要限量：插队的太多会互相挤。到「规则」页点应用右边的 <b style="color:var(--orange)">RT</b> 就能给这个 App 开。名额、换人速度、点名线程都在下面的「进阶配置」里。全部关掉后会自动恢复正常。</div>
-</div>
-<div class="card">
-<div class="card-title">系统分组</div>
-<div class="seg" id="seg-sysgroup">
-<button data-sysgroup="respect">尊重</button>
-<button data-sysgroup="takeover">强制绑核</button>
-</div>
-<div class="hint" id="c-sysgroup-state">-</div>
-<div class="hint">系统有时会把 App 分进一个没有大核的组。<b>尊重</b>：不硬闯，等它自己出来，省电（默认）。<b>强制绑核</b>：把线程拉出来再绑上，能绑上，但后台 App 也会占大核，待机更费电。</div>
-</div>
-<div class="card">
-<div class="card-title">接管组归属</div>
-<div class="seg" id="seg-group">
-<button data-key="group" data-val="own" data-on="1">接管（默认）</button>
+<div class="item stack">
+<div class="txt"><div class="t">组归属</div>
+<div class="d">接管后系统不会把线程搬走；只写掩码是旧办法。</div></div>
+<div class="ctl"><div class="seg" id="seg-group">
+<button data-key="group" data-val="own" data-on="1">接管</button>
 <button data-key="group" data-val="mask" data-on="0">只写掩码</button>
+</div></div>
+<div class="state" id="c-group-state">-</div>
 </div>
-<div class="hint" id="c-group-state">-</div>
-<div class="hint"><b>接管</b>：把线程放进我们自己的组，系统就不会老是把它搬走（以前每分钟被改上百次就是这个原因）。<b>只写掩码</b>是旧办法，只用来排查问题，久了会被系统冲掉。</div>
 </div>
+
+<div class="sec">省电</div>
 <div class="card">
-<div class="card-title">cpuset</div>
+<div class="item">
+<div class="txt"><div class="t">黑屏后放慢复查</div>
+<div class="d">黑屏时改成 60 秒看一次。新开的 App 照样马上处理。</div>
+<div class="state" id="c-screen-state">-</div></div>
+<div class="ctl"><div class="sw" id="seg-screen"><button role="switch" data-key="screen" data-val="relax" data-on="1"></button></div></div>
+</div>
+<div class="item">
+<div class="txt"><div class="t">后台 App 只用小核</div>
+<div class="d">切到后台就把没单独指定核的线程挪到小核，切回来恢复。</div>
+<div class="state" id="c-demote-state">-</div></div>
+<div class="ctl"><div class="sw" id="seg-demote"><button role="switch" data-key="foreground_demote" data-val="on" data-on="1"></button></div></div>
+</div>
+</div>
+
+<div class="sec">观察与建议</div>
+<div class="card">
+<div class="item">
+<div class="txt"><div class="t">推荐线程规则</div>
+<div class="d">看看游戏有哪些线程，给建议。要你同意才生效。</div>
+<div class="state" id="c-auto-state">-</div></div>
+<div class="ctl"><div class="sw" id="seg-auto"><button role="switch" data-key="auto_assign" data-val="on" data-on="1"></button></div></div>
+</div>
+<div class="item">
+<div class="txt"><div class="t">查看线程忙闲</div>
+<div class="d">判断绑得合不合理。只看不改，不影响绑核结果。</div>
+<div class="state" id="c-pmu-state">-</div></div>
+<div class="ctl"><div class="sw" id="seg-pmu"><button role="switch" data-key="pmu" data-val="observe" data-on="1"></button></div></div>
+</div>
+<div class="sub" id="sub-alloc">
+<div class="item">
+<div class="txt"><div class="t">估算各层该干多少活</div>
+<div class="d">算算三层核各该干多少，比一比谁偏空。只估算，不执行。</div>
+<div class="state" id="c-pmu-alloc-state">-</div></div>
+<div class="ctl"><div class="sw" id="seg-pmu-alloc"><button role="switch" data-key="pmu_alloc" data-val="shadow" data-on="1"></button></div></div>
+</div>
+</div>
+</div>
+
+<div class="sec">运行方式</div>
+<div class="card">
+<div class="item stack">
+<div class="txt"><div class="t">扫描方式</div>
+<div class="d">自动会挑更省电的那种；不确定就选自动。</div></div>
+<div class="ctl"><div class="seg" id="seg-mode">
+<button data-mode="0">自动</button><button data-mode="1">事件</button><button data-mode="2">轮询</button>
+</div></div>
+<div class="state" id="c-mode-active">-</div>
+<div class="hint" id="c-ebpf-hint" style="color:var(--warn);padding:6px 0 0" hidden>这台设备不支持事件模式，选了也会用轮询</div>
+</div>
+<div class="item">
+<div class="txt"><div class="t">扫描间隔</div>
+<div class="d">多少秒看一眼线程。调小反应快，但更费电。</div></div>
+</div>
+<div class="field"><input id="c-interval" type="number" min="1" max="3600"><button class="btn" id="c-interval-save">保存</button></div>
+<div class="item">
+<div class="txt"><div class="t">组目录</div>
+<div class="d">我们自己的组放在哪。不懂别改，状态 <span id="c-cpuset-on">未知</span>。</div></div>
+</div>
 <div class="field"><input id="c-cpuset"><button class="btn" id="c-cpuset-save">保存</button></div>
-<div class="hint">我们自己的组放在哪个目录（当前 <span id="c-cpuset-on">未知</span>）。不懂别改，改完会重建并重新加载。</div>
+<div class="item">
+<div class="txt"><div class="t">规则文件</div>
+<div class="d">规则存在哪个文件。改完立刻生效，原文件会留着。</div></div>
 </div>
-<div class="card">
-<div class="card-title">规则配置文件</div>
 <div class="field"><input id="c-file"><button class="btn" id="c-file-save">保存</button></div>
-<div class="hint">规则存在哪个文件。改完马上生效，原文件会留着。</div>
 </div>
+
 <div class="card">
 <details class="adv" id="c-adv">
-<summary>进阶配置</summary>
+<summary>进阶</summary>
 <div class="adv-body">
-<div class="adv-row"><span>每个 App 最多几个线程优先跑</span><input id="a-rt-max" type="number" min="1" max="8"></div>
-<div class="adv-row"><span>优先跑的线程多久换一次人（毫秒）</span><input id="a-rt-ts" type="number" min="1" max="100"></div>
-<div class="adv-row"><span>未匹配线程</span><select id="a-unmatched"><option value="keep">不管它（保持原样）</option><option value="all">放开到所有核</option></select></div>
-<button class="btn adv-save" id="a-save">保存进阶参数</button>
-<div class="hint">名额只管自动挑的那些线程。换人速度是整个系统共用的，只在有 App 开着 RT 时生效，全关了就恢复原样。改这两项不会自己打开 RT。</div>
-<div class="card-title" style="margin-top:18px">逐应用 RT（<span id="a-rt-count">0</span>）</div>
+<div class="adv-row"><span>每个 App 最多几个线程插队</span><input id="a-rt-max" type="number" min="1" max="8"></div>
+<div class="adv-row"><span>插队线程多久换一次人（毫秒）</span><input id="a-rt-ts" type="number" min="1" max="100"></div>
+<div class="adv-row"><span>没写规则的线程</span><select id="a-unmatched"><option value="keep">保持原样</option><option value="all">放开到所有核</option></select></div>
+<button class="btn adv-save" id="a-save">保存</button>
+<div class="hint">名额只管自动挑的线程；换人速度是全系统共用的，全关掉 RT 就恢复原样。改这两项不会自己打开 RT。</div>
+<div class="adv-row"><span>能在几层核之间挪的规则</span><span class="rule-sub" id="c-cross">-</span></div>
+<div class="adv-row"><span>现在开着的 RT</span><span class="rule-sub" id="c-rt">-</span></div>
+<div class="adv-row"><span>没写规则的线程</span><span class="rule-sub" id="c-unmatched">-</span></div>
+<div class="card-title">逐应用 RT（<span id="a-rt-count">0</span>）</div>
 <div id="a-rt-apps"></div>
-<div class="hint">每个 App 单独设置。「自动」只挑最重要的几个线程；也可以在下面「点名」框里写线程名，支持 * 通配（如 <span class="mono">RHI*</span>）。</div>
+<div class="hint">每个 App 单独设置。留空＝自动挑最重要的几个线程；也可以点名，支持 * 通配（如 <span class="mono">RHI*</span>）。</div>
 </div>
 </details>
 </div>
+
 <div class="card">
 <details class="adv" id="c-diag">
 <summary>诊断</summary>
 <div class="adv-body">
-<div class="hint" id="d-aff">-</div>
-<div class="hint" id="d-s7">-</div>
-<div class="hint" id="d-jank">-</div>
-<div class="hint" id="d-pmu">-</div>
-<div class="hint" id="d-alloc">-</div>
-<div class="adv-row"><span>线程绑定状态</span><button class="btn" id="d-refresh">刷新</button></div>
-<div id="d-threads"><div class="hint">展开后自动加载</div></div>
-<div class="card-title" style="margin-top:14px">最近事件</div>
-<div id="d-events" class="mono" style="font-size:12px;line-height:1.6;color:var(--sub)">-</div>
-<div class="hint">失败原因分两类：EPERM 多半是权限或安全策略挡住，EINVAL 多半是目标核不在这个组里。线程表里「期望」是规则要的，「实际」是现在真正生效的。</div>
+<div class="diag-h">绑定</div>
+<div class="diag-l" id="d-aff">-</div>
+<div class="diag-h">动态分配</div>
+<div class="diag-l" id="d-s7">-</div>
+<div class="diag-h">卡顿信号</div>
+<div class="diag-l" id="d-jank">-</div>
+<div class="diag-h">线程忙闲</div>
+<div class="diag-l" id="d-pmu">-</div>
+<div class="diag-l dim" id="d-alloc">-</div>
+<div class="diag-h">线程绑定状态</div>
+<div class="diag-l" id="d-threads">-</div>
+<button class="btn-outline adv-save" id="d-refresh">刷新</button>
+<div class="diag-h">最近事件</div>
+<div class="diag-l dim mono" id="d-events" style="white-space:pre-line">-</div>
+<div class="hint">失败多半是两类：权限或安全策略挡住，或目标核不在当前组里。「期望」是规则要的，「实际」是现在生效的。</div>
 </div>
 </details>
 </div>
+
 <div class="card">
-<div class="card-title">关于</div>
 <button class="entry" id="c-about">关于 AppOpt<svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg></button>
 <button class="entry" id="c-donate">支持开发<svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg></button>
 </div>
@@ -407,7 +525,6 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 </ol></div>
 </div>
 <div class="card">
-<div class="card-title">作者</div>
 <div class="row"><span class="label">作者</span><span class="value">Suto</span></div>
 <div class="row"><span class="label">主页</span><span class="value mono">http://appopt.suto.top</span></div>
 </div>
@@ -580,17 +697,57 @@ async function api(path,body){
 function toast(m){const t=$('toast');t.textContent=m;t.classList.add('show');clearTimeout(t._tm);t._tm=setTimeout(()=>t.classList.remove('show'),1600)}
 
 let activeTab='status',statTimer=null;
-document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{
-  const t=b.dataset.tab;
+function switchTab(t){
   if(t===activeTab)return;
   activeTab=t;
-  document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('active',x===b));
+  document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('active',x.dataset.tab===t));
   ['status','rules','settings'].forEach(n=>$('tab-'+n).hidden=n!==t);
   if(t==='status')startStat();else stopStat();
   if(t==='rules')loadRules();
   if(t==='settings')loadCfg();
-});
+}
+document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>switchTab(b.dataset.tab));
+// 状态页的「诊断信息」：切到设置页并把诊断展开，省得用户自己找
+$('s-diag').onclick=()=>{switchTab('settings');$('c-diag').open=true;};
 
+/* 核带：三簇各一段，段宽按核数、柱高按占用率。
+   宽度用核数是为了让「4 小 + 3 中 + 1 大」的物理形状直接看得见；
+   柱高用占用率而不是线程数——线程数会随扫描抖动，占用率才是用户在意的 */
+function countCores(spec){
+  let n=0;
+  for(const part of String(spec||'').split(',')){
+    const t=part.trim();
+    if(!t)continue;
+    const m=t.match(/^(\d+)-(\d+)$/);
+    if(m)n+=Math.max(0,(+m[2])-(+m[1])+1);
+    else if(/^\d+$/.test(t))n++;
+  }
+  return n;
+}
+function renderBand(d){
+  const box=$('band-bars'),note=$('band-note');
+  const load=d.load||[-1,-1,-1];
+  const all=[{k:'e',n:'小核',spec:d.e_core,v:load[0]},
+             {k:'p',n:'中核',spec:d.p_core,v:load[1]},
+             {k:'hp',n:'大核',spec:d.hp_core,v:load[2]}];
+  // 降级拓扑里 p 可能与 e 或 hp 指向同一批核，只画真实存在的段
+  const vis=semanticVisible();
+  const segs=all.filter(x=>countCores(x.spec)>0
+    &&(x.k!=='p'||!vis.length||vis.includes('p-core')));
+  if(!segs.length){box.innerHTML='<div class="hint" style="padding:0">没有识别到核心分层</div>';note.textContent='';return}
+  box.innerHTML=segs.map(x=>{
+    const n=countCores(x.spec);
+    const unk=!(x.v>=0);
+    return `<div class="cl cl-${x.k}" style="flex:${n} 1 0">
+<div class="cl-v">${unk?'—':x.v+'%'}</div>
+<div class="cl-col ${unk?'unk':''}"><i style="height:${unk?0:x.v}%"></i></div>
+<div class="cl-n">${x.n}</div>
+</div>`;
+  }).join('');
+  if(segs.some(x=>!(x.v>=0))){note.textContent='正在采样';return}
+  const top=segs.reduce((a,b)=>b.v>a.v?b:a);
+  note.textContent=top.v<25?'三簇都很空':'最挤 '+top.n+' '+top.v+'%';
+}
 function startStat(){stopStat();refreshStat();statTimer=setInterval(refreshStat,3000)}
 function stopStat(){if(statTimer){clearInterval(statTimer);statTimer=null}}
 async function refreshStat(){
@@ -625,6 +782,7 @@ async function refreshStat(){
     const vis=semanticVisible();
     $('s-card-cores').hidden=!vis.length&&!d.topo_degraded;
     $('s-row-pcore').hidden=!vis.includes('p-core');
+    renderBand(d);
   }catch(e){}
 }
 
@@ -653,14 +811,16 @@ async function loadCandidates(){
   }catch(e){candData=[]}
   if(!candData.length){box.hidden=true;box.innerHTML='';return}
   box.hidden=false;
-  box.innerHTML=`<div class="card-title">Auto Assign 候选 · ${candData.length}</div>`+
+  const ROLE={Critical:'关键',Latency:'怕延迟',Worker:'后台算',Background:'后台'};
+  const CONF={high:'比较确定',medium:'仅供参考',low:'不太确定'};
+  box.innerHTML=`<div class="card-title">推荐规则 ${candData.length} 条</div>`+
     candData.map((c,i)=>`
-<div class="rule-row">
-<span class="rule-name">${esc(c.pkg)}${c.thread?' : '+esc(c.thread):' <span class="rule-sub">包级</span>'}</span>
-${chipHtml(c.cpus)}
-<span class="rule-sub">${esc(c.role)} · ${esc(c.confidence)}</span>
-<button class="btn" data-cand-ok="${i}">采纳</button>
-<button class="icon-btn danger" data-cand-no="${i}" title="忽略">${ICO_TRASH}</button>
+<div class="cand">
+<div class="cand-h"><span class="cand-pkg">${esc(c.pkg)}</span>${chipHtml(c.cpus)}</div>
+<div class="cand-b"><span class="cand-th">${c.thread?esc(c.thread):'整个 App'}</span>
+<span class="rule-sub">${esc(ROLE[c.role]||c.role)}${c.confidence?'，'+(CONF[c.confidence]||esc(c.confidence)):''}</span>
+<button class="btn sm" data-cand-ok="${i}">采纳</button>
+<button class="icon-btn danger" data-cand-no="${i}" title="忽略">${ICO_TRASH}</button></div>
 </div>`).join('');
 }
 $('r-cand').addEventListener('click',async e=>{
@@ -693,8 +853,8 @@ function grpInner(g,gi){
 <div class="grp-head">
 <svg class="chev" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg>
 <span class="grp-name">${esc(g.pkg)}</span>
-${g.bl?'<span class="rule-sub" style="color:var(--orange)">黑名单·不管理</span>':''}
-${g.ex?'<span class="rule-sub">豁免·不抢组</span>':''}
+${g.bl?'<span class="tag warn">黑名单</span>':''}
+${g.ex?'<span class="tag">不抢组</span>':''}
 <span class="grp-count">${g.items.length}</span>
 <button class="rt-btn ${g.rt?'on':''}" data-rtpkg="${gi}" title="${g.rt?'关掉优先跑':'给这个 App 的关键线程开优先跑'}">RT</button>
 <button class="icon-btn" data-editapp="${gi}" title="编辑应用">${ICO_EDIT}</button>
@@ -983,7 +1143,7 @@ async function loadCfg(){
   try{
     const d=await api('/api/config');
     document.querySelectorAll('#seg-mode button').forEach(b=>b.classList.toggle('on',+b.dataset.mode===d.mode));
-    $('c-mode-active').textContent='当前生效: '+modeLabel(d.mode_active);
+    $('c-mode-active').textContent='在用：'+modeLabel(d.mode_active);
     $('c-ebpf-hint').hidden=d.ebpf_available;
     $('c-interval').value=d.interval;
     $('c-cpuset').value=d.cpuset_name;
@@ -994,53 +1154,42 @@ async function loadCfg(){
     $('c-rt').textContent=d.rt||'off';
     const sc=d.screen==='relax'?'relax':'off';
     setSeg('seg-screen',sc);
-    $('c-screen-state').textContent=sc==='relax'
-      ?'当前：开启 · 黑屏后放慢复查，省电'
-      :'当前：关闭 · 亮屏黑屏一个节奏';
+    setState('c-screen-state', sc==='relax'?'已开启':'已关闭');
     const gp=d.group==='mask'?'mask':'own';
     setSeg('seg-group',gp);
-    $('c-group-state').textContent=gp==='own'
-      ?'当前：接管 · 线程放进我们自己的组，不会被系统搬走'
-      :'当前：只写掩码（旧办法）· 可能被系统反复冲掉';
+    setState('c-group-state', gp==='own'
+      ?'系统搬不走我们的线程'
+      :'可能被系统反复冲掉');
     const dm=d.demote?'on':'off';
     setSeg('seg-demote',dm);
-    $('c-demote-state').textContent=dm==='on'
-      ?'当前：开启 · 后台线程挪到小核，切回前台搬回来'
-      :'当前：关闭 · 前后台一样';
+    setState('c-demote-state', dm==='on'?'已开启':'已关闭');
     const aa=d.auto_assign?'on':'off';
     setSeg('seg-auto',aa);
-    $('c-auto-state').textContent=aa==='on'
-      ?'当前：观察中 · 建议存在 autocache 文件里，规则页可以采纳'
-      :'当前：关闭 · 不观察线程';
+    setState('c-auto-state', aa==='on'?'观察中，建议在规则页顶部':'已关闭');
     const pm=d.pmu?'observe':'off';
     setSeg('seg-pmu',pm);
-    $('c-pmu-state').textContent=pm==='observe'
-      ?'当前：观察中 · 只看不改'
-      :'当前：关闭 · 不读取计数器';
+    setState('c-pmu-state', pm==='observe'?'观察中':'已关闭');
     const pa=d.pmu_alloc?'shadow':'off';
     setSeg('seg-pmu-alloc',pa);
-    $('c-pmu-alloc-state').textContent=pa==='shadow'
-      ?'当前：估算中 · 只算不改'
-      :'当前：关闭（需先打开上面的观察）';
+    $('sub-alloc').classList.toggle('on',pm==='observe');
+    setState('c-pmu-alloc-state', pa==='shadow'
+      ?'估算中'
+      :'已关闭（需要先打开上面的观察）');
     const sg=d.sysgroup==='takeover'?'takeover':'respect';
     document.querySelectorAll('#seg-sysgroup button').forEach(b=>b.classList.toggle('on',b.dataset.sysgroup===sg));
-    $('c-sysgroup-state').textContent=sg==='takeover'
-      ?'当前：强制绑核 · 后台线程也会上大核，待机更费电'
-      :'当前：尊重系统分组 · 后台线程留在系统给的小核';
+    setState('c-sysgroup-state', sg==='takeover'
+      ?'后台线程也会上大核，待机更费电'
+      :'后台线程留在系统给的小核');
     const sm=['off','shadow','on'][d.sched_mode]||'off';
     document.querySelectorAll('#seg-sched button').forEach(b=>b.classList.toggle('on',b.dataset.sched===sm));
-    $('c-sched-state').textContent=(()=>{
+    setState('c-sched-state', (()=>{
       if(sm==='off')return '已关闭';
-      const load=(d.sched_load||[]).map(v=>v<0?'-':Math.round(v/10)+'%').join(' / ');
-      const st=sm==='shadow'?'观察中（只记录，不动手）':'已开启';
+      const st=sm==='shadow'?'观察中':'运行中';
       if(d.cluster_levels<2)return st+'，但只有 '+d.cluster_levels+' 层核，用不上';
-      return st+' · 可挪 '+d.sched_would+' · 已挪 '+d.sched_moved
-        +(d.sched_failed?' · 失败 '+d.sched_failed:'')
-        +(d.sched_bounced?' · 拦回弹 '+d.sched_bounced:'')
-        +(d.sched_frozen?' · 已冻结 '+d.sched_frozen:'')
-        +(d.sched_blocked?' · 受限 '+d.sched_blocked:'')
-        +' · 三簇 '+load+(d.sched_last?' · 最近 '+d.sched_last:'');
-    })();
+      // 只留「挪了几个 + 三簇现在多挤」，失败/回弹/冻结去诊断页看
+      const load=(d.sched_load||[]).map(v=>v<0?'-':Math.round(v/10)+'%').join(' / ');
+      return st+' · 已挪 '+d.sched_moved+' · 三簇 '+load;
+    })());
     $('a-rt-max').value=d.rt_max;
     $('a-rt-ts').value=d.rt_timeslice;
     $('a-unmatched').value=d.unmatched;
@@ -1061,8 +1210,20 @@ document.querySelectorAll('#seg-sysgroup button').forEach(b=>b.onclick=async()=>
 // 三个行为开关共用同一个接口，只有键名与提示语不同。
 // 统一用 data-key / data-val / data-on，避免 data-render-guard 这类
 // 带下划线的属性名在 dataset 里变成驼峰、取不到值
+// 「已开启 / 已关闭」开关本身就说明了，再写一行等于把同一句话说两遍
+function setState(id,txt){
+  const el=$(id);
+  if(!el)return;
+  el.textContent=txt;
+  el.hidden=(txt==='已开启'||txt==='已关闭');
+}
 function setSeg(id,val){
-  document.querySelectorAll('#'+id+' button').forEach(b=>b.classList.toggle('on',b.dataset.val===val));
+  document.querySelectorAll('#'+id+' button').forEach(b=>{
+    const on=b.dataset.val===val;
+    b.classList.toggle('on',on);
+    // 两态项渲染成开关，读屏要能报出状态；分段控件不必
+    if(b.getAttribute('role')==='switch')b.setAttribute('aria-checked',on?'true':'false');
+  });
 }
 function bindBehavior(id,onText,offText){
   document.querySelectorAll('#'+id+' button').forEach(b=>b.onclick=async()=>{
@@ -1093,63 +1254,77 @@ let diagTimer=null;
 async function loadDiag(){
   try{
     const d=await api('/api/diag');
+    // 一项一行。以前全用「 · 」串成一句，十几个数字连在一起根本读不进去
+    const li=arr=>arr.filter(Boolean).map(x=>`<span class="li">${x}</span>`).join('');
     const a=d.affinity||{};
-    $('d-aff').textContent='绑核 · 调用 '+a.calls+' · 真写 '+a.writes+' · 短路 '+a.noop
-      +' · 失败 '+a.failed+'（'+(a.errno_line||'无')+'） · 已退出 '+a.gone
-      +(a.clip||a.reset||a.shifted?' · 校验重绑：裁剪 '+a.clip+' / 重置 '+a.reset+' / 挪簇 '+a.shifted:'')
-      +(a.ineffective?' · 写入被裁剪 '+a.ineffective+'（暂停重绑 '+a.stuck+' 个）':'')
-      +(a.sysgroup_skip?' · 系统后台组跳过 '+a.sysgroup_skip:'')
-      +(a.unreachable?' · 目标与所在组无交集 '+a.unreachable:'')
-      +(a.cpuset_fail?' · cpuset 失败 '+a.cpuset_fail+(a.cpuset_paused?'（已暂停重试）':''):'');
+    $('d-aff').innerHTML=li([
+      `调用 ${a.calls} · 真写 ${a.writes} · 短路 ${a.noop}`,
+      `失败 ${a.failed}${a.errno_line?'（'+esc(a.errno_line)+'）':''} · 线程已退出 ${a.gone}`,
+      (a.clip||a.reset||a.shifted)
+        ?`校验重绑：裁剪 ${a.clip} · 重置 ${a.reset} · 挪簇 ${a.shifted}`:'',
+      a.ineffective?`写入被裁剪 ${a.ineffective}，已暂停重绑 ${a.stuck} 个`:'',
+      a.sysgroup_skip?`系统后台组跳过 ${a.sysgroup_skip}`:'',
+      a.unreachable?`目标与所在组没有交集 ${a.unreachable}`:'',
+      a.cpuset_fail?`cpuset 失败 ${a.cpuset_fail}${a.cpuset_paused?'（已暂停重试）':''}`:'',
+    ]);
     const s7=d.s7||{};
     const labels=s7.skip_labels||[];
     const skips=(s7.skip||[]).map((v,i)=>v?labels[i]+' '+v:'').filter(Boolean);
-    $('d-s7').textContent=(s7.mode===0?'S7 已关闭':'S7 '+s7.state
-      +' · 迁移 '+s7.moved+' · 失败 '+s7.failed+' · 拦回弹 '+s7.bounced+' · 冻结 '+s7.frozen)
-      +(skips.length?' · 跳过：'+skips.join('，'):'');
+    $('d-s7').innerHTML=s7.mode===0
+      ?'<span class="li dim">已关闭</span>'
+      :li([
+        `${esc(s7.state||'')} · 迁移 ${s7.moved} · 失败 ${s7.failed}`,
+        `拦回弹 ${s7.bounced} · 冻结 ${s7.frozen}`,
+        skips.length?'跳过：'+skips.map(esc).join('，'):'',
+      ]);
     const jank=d.jank||[];
-    $('d-jank').textContent=jank.length
-      ? '卡顿信号 · '+jank.map(j=>j.comm+' '+j.wait_ms+'ms（'+j.switches+' 次调度，affinity '+j.affinity
-          +'，最后 cpu '+j.cpu+'）').join(' / ')
-        +(d.pressure!=null?' · 系统 CPU 争用 '+d.pressure+'%':'')
-      : '卡顿信号 · 暂未发现渲染线程就绪等待超过 4ms'
-        +(d.pressure!=null?'（系统争用 '+d.pressure+'%）':'');
+    $('d-jank').innerHTML=jank.length
+      ?jank.map(j=>`<span class="li"><b>${esc(j.comm)}</b>　等待 ${j.wait_ms} ms，${j.switches} 次调度，`
+          +`affinity ${esc(String(j.affinity))}，最后在 cpu ${j.cpu}</span>`).join('')
+        +(d.pressure!=null?`<span class="li dim">系统 CPU 争用 ${d.pressure}%</span>`:'')
+      :`<span class="li dim">没有渲染线程就绪等待超过 4 ms`
+        +(d.pressure!=null?`（系统争用 ${d.pressure}%）`:'')+`</span>`;
     const p=d.pmu||{};
-    $('d-pmu').textContent=(()=>{
-      if(!p.state||p.state==='未启用')return 'PMU · 未启用（在设置里打开「PMU 观察」，或写 @pmu=observe）';
-      const head='PMU · '+p.state
-        +(p.active>0?' · 本窗口 '+p.active+' 个线程在跑':' · 没有线程在跑')
-        +' · '+p.mode;
-      // 三级退让：指令 → 周期 → CPU 占用。设备能不能给硬件计数不由我们决定，
-      // 但面板不能因此显示 0
-      const list=(p.samples||[]).slice(0,4).map(s=>s.comm+' '
-        +(s.inst>0? s.mips+' M/s（CPI '+s.cpi+'）'
-          : s.cycles>0? s.gcyc+' Gcyc/s'
-          : s.cpu_pct+'%')).join(' ｜ ');
-      return head+(list?' ｜ 最忙 '+list:'');
-    })();
-    const al=p.alloc;
-    $('d-alloc').textContent=al?(function(){
-      const names=['e-core','p-core','hp-core'];
-      const pct=v=>(v==null?'-':v+'%');
-      const idx=names.indexOf(al.starved);
-      const tail=idx>=0?' ｜ '+al.starved+' 偏空 '+Math.abs(al.gap[idx])+' 个点':'';
-      return '配额 · 重 '+al.heavy+' / 中 '+al.medium+' / 轻 '+al.light
-        +' ｜ 建议 e/p/hp '+al.want.map(pct).join('/')
-        +(al.got?' → 实际 '+al.got.map(pct).join('/')+'，匹配 '+al.fit+'%':' · 暂无对照数据')
-        +(al.got&&al.source?'（'+al.source+'）':'')
-        +tail
-        +(al.hints&&al.hints.length?' ｜ 可优先搬 '+al.hints.slice(0,2).join('、'):'');
-    })():'配额 · 暂无数据（需要先打开「观察」）';
+    if(!p.state||p.state==='未启用'){
+      $('d-pmu').innerHTML='<span class="li dim">未启用。打开上面的「查看线程忙闲」才会采样。</span>';
+      $('d-alloc').innerHTML='';
+    }else{
+      // 三级退让：指令 → 周期 → CPU 时间。设备给什么就用什么，不显示 0
+      const list=(p.samples||[]).slice(0,4).map(x=>{
+        const v=x.inst>0?`${x.mips} M/s，CPI ${x.cpi}`
+          :x.cycles>0?`${x.gcyc} Gcyc/s`
+          :`${x.cpu_pct}% CPU`;
+        return `<span class="li">${esc(x.comm)}　${v}</span>`;
+      }).join('');
+      $('d-pmu').innerHTML=li([
+        `${esc(p.state)} · ${esc(p.mode)}`
+          +(p.active>0?` · 本窗口 ${p.active} 个线程在跑`:' · 没有线程在跑'),
+      ])+list;
+      const al=p.alloc;
+      if(!al){
+        $('d-alloc').innerHTML='<span class="li dim">暂无估算数据。</span>';
+      }else{
+        const names=['e-core','p-core','hp-core'];
+        const pct=v=>(v==null?'—':v+'%');
+        const idx=names.indexOf(al.starved);
+        $('d-alloc').innerHTML=li([
+          `重 ${al.heavy} · 中 ${al.medium} · 轻 ${al.light}`,
+          `建议 e/p/hp　${al.want.map(pct).join(' / ')}`,
+          al.got?`实际　${al.got.map(pct).join(' / ')}，匹配 ${al.fit}%`
+            +(al.source?`（${esc(al.source)}）`:''):'暂无对照数据',
+          idx>=0?`${al.starved} 偏空 ${Math.abs(al.gap[idx])} 个点`:'',
+          al.hints&&al.hints.length?'可优先搬：'+al.hints.slice(0,2).map(esc).join('、'):'',
+        ]);
+      }
+    }
     const th=d.threads||[];
     const bad=th.filter(t=>!t.ok);
     const show=(bad.length?bad:th).slice(0,8);
     $('d-threads').innerHTML=show.length
-      ? show.map(t=>'<div class="hint" style="'+(t.ok?'':'color:var(--orange)')+'">'
-          +esc(t.comm||'?')+'('+t.tid+') · '+esc(t.pkg)+' · 期望 '+esc(t.expect)+' 实际 '+esc(t.actual)
-          +' · '+t.role+'</div>').join('')
-        +(bad.length?'<div class="hint">共 '+bad.length+' 个线程未落在期望集合</div>':'')
-      : '<div class="hint">当前没有被管理的线程</div>';
+      ?show.map(t=>`<span class="li${t.ok?'':' bad'}">${esc(t.comm||'?')}（${t.tid}）　`
+          +`期望 ${esc(t.expect)}　实际 ${esc(t.actual)}　${esc(t.role)}</span>`).join('')
+        +(bad.length?`<span class="li dim">共 ${bad.length} 个线程没落在期望集合里</span>`:'')
+      :'<span class="li dim">当前没有被管理的线程</span>';
     const ev=d.events||[];
     $('d-events').textContent=ev.length?ev.slice(-6).join('\n'):'—';
   }catch(e){toast(e.message)}
@@ -1166,11 +1341,11 @@ async function loadRt(){
   try{
     const d=await api('/api/rt');rtCache=d;
     document.querySelectorAll('#seg-rt button').forEach(b=>b.classList.toggle('on',b.dataset.rt===d.mode));
-    const cur=d.timeslice_current==null?'不可读':d.timeslice_current+' ms';
+    const cur=d.timeslice_current==null?'—':d.timeslice_current+' ms';
     const n=(d.apps||[]).filter(a=>a.enabled).length;
     const t=(d.threads||[]).length;
-    $('c-rt-state').textContent=(d.mode==='global'?'全部应用（手工配置） · ':'')
-      +'已开 '+n+' 个应用 · 正在优先跑 '+t+' 个线程 · 换人间隔 '+cur;
+    setState('c-rt-state', (d.mode==='global'?'全部应用（手工配置） · ':'')
+      +n+' 个应用 · '+t+' 个线程在插队 · 每 '+cur+' 换一次');
     renderRtApps(d);
   }catch(e){toast(e.message)}
 }

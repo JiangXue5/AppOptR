@@ -12,6 +12,7 @@ mod diag;
 mod diag_fmt;
 mod ebpf_mode;
 mod lifecycle;
+mod load;
 mod pmu;
 mod pmu_allocator;
 mod policy;
@@ -771,6 +772,8 @@ fn main() {
                 (None, Some(ps)) => cache_stats(&ps.cache),
                 _ => (0, 0),
             };
+            // 三簇占用：与 S7/PMU 都无关，任何配置下都能出数，状态页核带用它
+            let load = load::util(&cfg.topo);
             *lock_ignore_poison(&WEB_STATS) = Some(WebStats {
                 rules: cfg.rules.len(),
                 pkgs: cfg.pkgs.len(),
@@ -779,6 +782,7 @@ fn main() {
                 ebpf: ebpf_state.is_some(),
                 uptime: prog_start.elapsed().as_secs(),
                 dropped: DROPPED_TOTAL.load(Ordering::Relaxed),
+                load,
             });
         }
     }

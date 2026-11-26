@@ -71,6 +71,8 @@ pub struct WebStats {
     pub uptime: u64,
     /// 运行期累计的 RingBuf 丢弃事件数
     pub dropped: u64,
+    /// 三簇（e/p/hp）实时占用百分比，-1 = 尚未建立基线
+    pub load: [i8; 3],
 }
 
 /// 缓存统计
@@ -636,6 +638,7 @@ fn status_json() -> String {
         ebpf: false,
         uptime: 0,
         dropped: 0,
+        load: [-1; 3],
     });
     json!({
         "version": env!("CARGO_PKG_VERSION"),
@@ -657,6 +660,8 @@ fn status_json() -> String {
         "cpuset_enabled": topo.is_some_and(|t| t.cpuset_enabled),
         "topo_source": topo.map(|t| t.topo_source).unwrap_or(""),
         "topo_degraded": topo.is_some_and(|t| t.topo_degraded),
+        // 三簇实时占用，前端拿它画核带；-1 表示还没测出来
+        "load": s.load,
     })
     .to_string()
 }

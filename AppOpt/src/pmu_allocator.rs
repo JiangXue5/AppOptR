@@ -19,6 +19,7 @@
 use std::sync::Mutex;
 
 use crate::cpuset::{CPU_SETSIZE, CpuSet, CpuTopology, cpu_capacity};
+use crate::load::{ClusterTicks, cluster_busy, read_cpu_times};
 use crate::lock_ignore_poison;
 use crate::pmu::Sample;
 use crate::sched::SCHED_SNAPSHOT;
@@ -249,9 +250,6 @@ fn tier_capacity(set: &CpuSet) -> u64 {
     sum
 }
 
-/// 一簇的（忙 jiffies, 总 jiffies）。核全部不可读时为 None
-type ClusterTicks = Option<(u64, u64)>;
-
 /// 上一窗口的逐簇忙时基线
 static CPU_PREV: Mutex<Option<[ClusterTicks; 3]>> = Mutex::new(None);
 
@@ -286,61 +284,6 @@ fn self_measured(topo: &CpuTopology) -> Option<[f64; 3]> {
         return None;
     }
     Some([busy[0] / sum, busy[1] / sum, busy[2] / sum])
-}
-
-/// 一簇内所有核的（忙时, 总时）合计。忙时不含 idle 与 iowait
-fn cluster_busy(times: &[(u64, u64)], set: &CpuSet) -> ClusterTicks {
-    let mut busy = 0u64;
-    let mut total = 0u64;
-    let mut any = false;
-    for cpu in 0..CPU_SETSIZE {
-        if !set.is_set(cpu) {
-            continue;
-        }
-        if let Some(&(b, t)) = times.get(cpu) {
-            busy += b;
-            total += t;
-            any = true;
-        }
-    }
-    any.then_some((busy, total))
-}
-
-/// 解析 `/proc/stat`，返回按 CPU 号索引的（忙时, 总时）。只取前 8 个字段：
-/// guest/guest_nice 已经计入 user/nice，再加会重复
-fn read_cpu_times() -> Option<Vec<(u64, u64)>> {
-    let text = std::fs::read_to_string("/proc/stat").ok()?;
-    parse_cpu_times(&text)
-}
-
-fn parse_cpu_times(text: &str) -> Option<Vec<(u64, u64)>> {
-    let mut out: Vec<(u64, u64)> = Vec::new();
-    for line in text.lines() {
-        let Some(rest) = line.strip_prefix("cpu") else {
-            continue;
-        };
-        // 汇总行是 `cpu `（cpu 后直接空格），逐核行是 `cpu0`/`cpu10`
-        if rest.starts_with(' ') || rest.starts_with('\t') {
-            continue;
-        }
-        let mut it = rest.split_whitespace();
-        let Some(num) = it.next() else { continue };
-        // 汇总行是 `cpu `，没有编号
-        let Ok(idx) = num.parse::<usize>() else {
-            continue;
-        };
-        let vals: Vec<u64> = it.filter_map(|x| x.parse().ok()).collect();
-        if vals.len() < 5 {
-            continue;
-        }
-        let idle = vals[3] + vals[4];
-        let total: u64 = vals.iter().take(8).sum();
-        if idx >= out.len() {
-            out.resize(idx + 1, (0, 0));
-        }
-        out[idx] = (total.saturating_sub(idle), total);
-    }
-    (!out.is_empty()).then_some(out)
 }
 
 /// S7 的三簇千分比 → 比例。任一为 -1（不可用）或全 0 时返回 None：
@@ -402,12 +345,20 @@ mod tests {
                 std::hint::black_box(n);
             }
         });
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        let got = self_measured(&topo);
+        // 烧线程落在哪个核由调度器决定，固定睡 300ms 可能一个 tick 都没落在
+        // cpu0 上。重试到出现推进为止，最多 2 秒
+        let mut got = None;
+        for _ in 0..20 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if let Some(g) = self_measured(&topo) {
+                got = Some(g);
+                break;
+            }
+        }
         stop.store(true, Ordering::Relaxed);
         worker.join().unwrap();
 
-        let g = got.expect("两次采样之间必然有 tick 推进");
+        let g = got.expect("2 秒内必然出现 tick 推进");
         assert!((g.iter().sum::<f64>() - 1.0).abs() < 1e-9);
         assert_eq!(g[2], 0.0, "hp 簇为空时占比必须是 0");
     }
@@ -498,20 +449,5 @@ mod tests {
             Some([0.1, 0.1, 0.8]),
         );
         assert_eq!(plan.heavy, 1);
-    }
-
-    /// `/proc/stat`：汇总行要跳过，guest 不能重复计
-    #[test]
-    fn parse_stat_skips_summary_row() {
-        let text = "\
-cpu  100 0 50 1000 10 0 0 0 0 0
-cpu0 50 0 25 500 5 0 0 0 0 0
-cpu1 50 0 25 500 5 0 0 0 0 0
-intr 12345
-";
-        let v = parse_cpu_times(text).unwrap();
-        assert_eq!(v.len(), 2, "汇总行不能进数组");
-        // busy = 50+25 = 75；total = 50+25+500+5 = 580
-        assert_eq!(v[0], (75, 580));
     }
 }

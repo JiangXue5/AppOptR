@@ -23,6 +23,7 @@ http://appopt.suto.top
 | `policy.rs` | 目标解析纯函数（规则 → S7 落点 → 降档 → 组裁剪 → 最终集合） |
 | `background.rs` | 前后台判定（系统组优先，`oom_score_adj` 兜底） |
 | `auto_assign.rs` | Auto Assign 候选采集（只写 `AppOpt.autocache.conf`） |
+| `load.rs` | 三簇实时占用（`/proc/stat` 逐核忙时按拓扑归簇；不需要 S7 / PMU / root） |
 | `pmu.rs` | PMU 观察（Instructions / Cycles / CPI；硬件计数不可用时退到 CPU 时间，只采样不迁移） |
 | `pmu_allocator.rs` | PMU Shadow 配额（重/中/轻分档 + 按 capacity 算各簇建议承载，只算不执行） |
 | `rt.rs` | RT 实时调度（`SCHED_RR` + `RESET_ON_FORK`，含时间片备份与恢复） |
