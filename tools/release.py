@@ -127,7 +127,11 @@ def release_gitee(version: str, token: str, files: list[str], dry: bool) -> str:
     tag = f"v{version}"
     api = f"https://gitee.com/api/v5/repos/{GITEE_REPO}/releases"
     r = requests.get(f"{api}/tags/{tag}", params={"access_token": token}, timeout=30)
-    if r.status_code == 404:
+    # Gitee 对不存在的 tag 返回 200 + null，不是 404；只看状态码会在 r.json() 上崩
+    exists = r.status_code == 200 and r.json() is not None
+    if not exists and r.status_code not in (200, 404):
+        sys.exit(f"Gitee 查 Release 失败：{r.status_code} {r.text[:200]}")
+    if not exists:
         if dry:
             print(f"[dry] 新建 Gitee Release {tag}")
             return f"https://gitee.com/{GITEE_REPO}/releases/tag/{tag}"
@@ -146,10 +150,10 @@ def release_gitee(version: str, token: str, files: list[str], dry: bool) -> str:
         )
         if r.status_code >= 300:
             sys.exit(f"Gitee 建 Release 失败：{r.status_code} {r.text[:200]}")
-    elif r.status_code >= 300:
-        sys.exit(f"Gitee 查 Release 失败：{r.status_code} {r.text[:200]}")
 
     rel = r.json()
+    if rel is None:
+        sys.exit("Gitee 返回了空 Release 对象")
     have = {a.get("name") for a in rel.get("assets") or []}
     for path in files:
         name = os.path.basename(path)
