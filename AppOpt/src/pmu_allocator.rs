@@ -7,10 +7,14 @@
 //! 边界与 16.2 一致：`policy::plan_entry`、`sched::decide`、
 //! `apply_affinity` 都不读本模块，绑核结果一行都不会因为它改变。
 //!
-//! 为什么对照「S7 的簇负载」而不是「线程当前在哪个核」：规则允许跨簇
+//! 为什么对照「簇级负载」而不是「线程当前在哪个核」：规则允许跨簇
 //! （`all → 0-6`）时，绝大多数线程的亲和性同时覆盖 e 和 p，按线程归属
-//! 某一簇算出来的是假精确。簇级负载是 S7 自己统计的，直接拿来对照更诚实，
-//! 也正好对上方案里「与 S7 实际决策对照」那句。
+//! 某一簇算出来的是假精确。
+//!
+//! 但簇负载不能只依赖 S7：S7 只在存在跨簇规则时才统计，而多数用户的规则
+//! 是单簇的（`all → 4-6`），这种情况下 S7 根本不跑，对照永远为空。所以
+//! 这里补一路自测：读 `/proc/stat` 的逐核忙时增量，按拓扑分簇。S7 有数据
+//! 就优先用 S7（它是实际决策方），没有就用自测，日志标明来源。
 
 use std::sync::Mutex;
 
@@ -28,47 +32,20 @@ pub const TIER_NAMES: [&str; 3] = ["e-core", "p-core", "hp-core"];
 const GAP_EPS: f64 = 0.08;
 /// 内核不提供 `cpu_capacity` 时的单核权重。全按 1 平权，总比整簇算成 0 好
 const CPU_CAPACITY_FALLBACK: u64 = 1024;
+/// 分档按「活动量份额」而不是绝对速率：线程按工作量降序，累计到 50%
+/// 的算重负载，到 85% 的算中等，其余算轻。
+///
+/// 早先用绝对阈值（CPU 时间 ≥50% 算重），真机上 UnityMain 在 45%–60%
+/// 之间晃，重/中两档跟着一秒钟一个样，看日志的人只会以为统计坏了。
+/// 份额法天然与量纲无关，也不受设备快慢影响
+const HEAVY_SHARE: f64 = 0.50;
+const MEDIUM_SHARE: f64 = 0.85;
 
-/// 分档。阈值来自 osgame 真机日志：渲染提交与任务线程 100–380 M/s，
-/// 第二梯队几十 M/s，其余绝大多数接近 0
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Load {
     Heavy,
     Medium,
     Light,
-}
-
-/// 按本窗口的实际速率分档。三种计量方式各有一套阈值，量纲不能混用：
-/// 软件计时下 inst / cycles 恒为 0，按 M/s 判会把全部线程打成「轻」
-pub fn classify(s: &Sample) -> Load {
-    if s.cpu_ns.is_some() {
-        let pct = s.cpu_pct();
-        if pct >= 50.0 {
-            Load::Heavy
-        } else if pct >= 10.0 {
-            Load::Medium
-        } else {
-            Load::Light
-        }
-    } else if s.inst > 0 {
-        let m = s.mips();
-        if m >= 100.0 {
-            Load::Heavy
-        } else if m >= 20.0 {
-            Load::Medium
-        } else {
-            Load::Light
-        }
-    } else {
-        let g = s.gcyc();
-        if g >= 3.0 {
-            Load::Heavy
-        } else if g >= 0.6 {
-            Load::Medium
-        } else {
-            Load::Light
-        }
-    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -80,8 +57,11 @@ pub struct ShadowPlan {
     pub heavy_share: f64,
     /// 按 capacity 的建议承载比例 [e, p, hp]，和为 1
     pub want: [f64; 3],
-    /// S7 实际簇负载比例（已归一化）。None = S7 未运行或该轮没有负载数据
+    /// S7 实际簇负载比例（已归一化）。None = 没有可用的对照数据
     pub got: Option<[f64; 3]>,
+    /// 对照数据来源：`S7` 或 `核占用`。日志与面板都标明，避免把自测
+    /// 当成 S7 的决策结果
+    pub source: &'static str,
     /// 实际 - 建议，正数表示这簇比它该承担的更满
     pub gap: [f64; 3],
     /// 匹配度 0–1：`1 - Σ|gap| / 2`
@@ -97,29 +77,28 @@ pub struct ShadowPlan {
 }
 
 impl ShadowPlan {
-    /// 日志一行。没有 S7 负载数据时只报分档，不硬凑对照
+    /// 日志一行。没有对照数据时只报分档，不硬凑
     pub fn log_text(&self) -> String {
-        let mut s = format!(
-            "配额 shadow 重 {} / 中 {} / 轻 {}",
-            self.heavy, self.medium, self.light
-        );
+        let mut s = format!("重 {} / 中 {} / 轻 {}", self.heavy, self.medium, self.light);
         let Some(got) = self.got else {
-            s.push_str(" ｜ S7 未运行或无簇负载数据，暂不对照");
+            s.push_str(" ｜ 暂无对照");
             return s;
         };
         s.push_str(&format!(
-            " ｜ 建议→实际 e {:.0}%→{:.0}% p {:.0}%→{:.0}% hp {:.0}%→{:.0}%，匹配 {:.0}%",
+            " ｜ 建议 e{:.0} p{:.0} hp{:.0} → 实际 e{:.0} p{:.0} hp{:.0}，匹配 {:.0}%（{}）",
             self.want[E] * 100.0,
-            got[E] * 100.0,
             self.want[P] * 100.0,
-            got[P] * 100.0,
             self.want[HP] * 100.0,
+            got[E] * 100.0,
+            got[P] * 100.0,
             got[HP] * 100.0,
             self.fit * 100.0,
+            self.source,
         ));
         if let Some(i) = self.starved {
+            // 「空」容易被读成没有线程，这里说清是「比该承担的少」
             s.push_str(&format!(
-                " ｜ {} 空 {:.0} 个点",
+                " ｜ {} 偏空 {:.0} 个点",
                 self.starved_name,
                 -self.gap[i] * 100.0
             ));
@@ -135,11 +114,12 @@ static SNAPSHOT: Mutex<Option<ShadowPlan>> = Mutex::new(None);
 pub fn update(samples: &[Sample], topo: &CpuTopology) {
     // `mode == 0` 是 S7 关闭。关掉之后快照还留着最后一次的负载，
     // 拿它当「实际分布」对照会得出过期结论，宁可不比
-    let load = lock_ignore_poison(&SCHED_SNAPSHOT)
+    let s7 = lock_ignore_poison(&SCHED_SNAPSHOT)
         .as_ref()
         .filter(|s| s.mode != 0)
         .map(|s| s.load);
-    let plan = compute(samples, topo, load);
+    let own = self_measured(topo);
+    let plan = compute(samples, topo, s7, own);
     *lock_ignore_poison(&SNAPSHOT) = Some(plan);
 }
 
@@ -152,18 +132,34 @@ pub fn clear() {
     *lock_ignore_poison(&SNAPSHOT) = None;
 }
 
-fn compute(samples: &[Sample], topo: &CpuTopology, load: Option<[i32; 3]>) -> ShadowPlan {
+fn compute(
+    samples: &[Sample],
+    topo: &CpuTopology,
+    s7: Option<[i32; 3]>,
+    own: Option<[f64; 3]>,
+) -> ShadowPlan {
     let mut plan = ShadowPlan {
         samples: samples.len(),
         ..Default::default()
     };
 
-    let mut total = 0u64;
+    // 按工作量降序，累计份额切三档。一个线程占掉六成活动量时，
+    // 它自己就是「重」——这正是真机上 UnityMain 的形态
+    let mut order: Vec<(&Sample, u64)> = samples.iter().map(|s| (s, s.weight().max(1))).collect();
+    order.sort_by_key(|(_, w)| std::cmp::Reverse(*w));
+    let total: u64 = order.iter().map(|(_, w)| w).sum();
+    let mut acc = 0u64;
     let mut heavy_w = 0u64;
-    for s in samples {
-        let w = s.weight().max(1);
-        total += w;
-        match classify(s) {
+    for (_, w) in &order {
+        let before = acc as f64 / total as f64;
+        let load = if before < HEAVY_SHARE {
+            Load::Heavy
+        } else if before < MEDIUM_SHARE {
+            Load::Medium
+        } else {
+            Load::Light
+        };
+        match load {
             Load::Heavy => {
                 plan.heavy += 1;
                 heavy_w += w;
@@ -171,6 +167,7 @@ fn compute(samples: &[Sample], topo: &CpuTopology, load: Option<[i32; 3]>) -> Sh
             Load::Medium => plan.medium += 1,
             Load::Light => plan.light += 1,
         }
+        acc += w;
     }
     if total > 0 {
         plan.heavy_share = heavy_w as f64 / total as f64;
@@ -186,10 +183,17 @@ fn compute(samples: &[Sample], topo: &CpuTopology, load: Option<[i32; 3]>) -> Sh
         return plan;
     }
 
-    let Some(got) = normalized(load) else {
+    // S7 有数据就用 S7：它才是实际决策方；单簇规则下 S7 不跑，
+    // 退到自测的逐核忙时分布
+    let (got, source) = match normalized(s7) {
+        Some(g) => (Some(g), "S7"),
+        None => (own, "核占用"),
+    };
+    let Some(got) = got else {
         return plan;
     };
     plan.got = Some(got);
+    plan.source = source;
 
     let mut abs = 0.0;
     for (i, g) in got.iter().enumerate() {
@@ -209,15 +213,11 @@ fn compute(samples: &[Sample], topo: &CpuTopology, load: Option<[i32; 3]>) -> Sh
     plan.starved = starved;
     if let Some(i) = starved {
         plan.starved_name = TIER_NAMES[i];
-        let mut heavy: Vec<&Sample> = samples
+        plan.hints = order
             .iter()
-            .filter(|s| classify(s) == Load::Heavy)
-            .collect();
-        heavy.sort_by_key(|s| std::cmp::Reverse(s.weight()));
-        plan.hints = heavy
-            .iter()
+            .take(plan.heavy)
             .take(3)
-            .map(|s| format!("{}({}) {}", s.comm, s.tid, s.rate_text()))
+            .map(|(s, _)| format!("{}({}) {}", s.comm, s.tid, s.rate_text()))
             .collect();
     }
     plan
@@ -247,6 +247,100 @@ fn tier_capacity(set: &CpuSet) -> u64 {
         }
     }
     sum
+}
+
+/// 一簇的（忙 jiffies, 总 jiffies）。核全部不可读时为 None
+type ClusterTicks = Option<(u64, u64)>;
+
+/// 上一窗口的逐簇忙时基线
+static CPU_PREV: Mutex<Option<[ClusterTicks; 3]>> = Mutex::new(None);
+
+/// 自测簇负载：`/proc/stat` 逐核忙时增量，按拓扑归簇后取份额。
+///
+/// 存在的理由只有一个——S7 只在有跨簇规则时才统计簇负载。规则写成
+/// `all → 4-6` 的用户永远拿不到对照，配额就成了一个只报分档的空壳。
+/// 逐核忙时与规则无关，任何配置下都能算。
+fn self_measured(topo: &CpuTopology) -> Option<[f64; 3]> {
+    let times = read_cpu_times()?;
+    let cur = [
+        cluster_busy(&times, &topo.e_core),
+        cluster_busy(&times, &topo.p_core),
+        cluster_busy(&times, &topo.hp_core),
+    ];
+    let mut guard = lock_ignore_poison(&CPU_PREV);
+    let prev = guard.replace(cur)?;
+
+    let mut busy = [0f64; 3];
+    for i in 0..3 {
+        let (Some((b0, t0)), Some((b1, t1))) = (prev[i], cur[i]) else {
+            continue;
+        };
+        if t1 <= t0 {
+            // 该簇核全部离线或 tick 未推进，跳过而不是整体作废
+            continue;
+        }
+        busy[i] = (b1 - b0) as f64;
+    }
+    let sum: f64 = busy.iter().sum();
+    if sum <= 0.0 {
+        return None;
+    }
+    Some([busy[0] / sum, busy[1] / sum, busy[2] / sum])
+}
+
+/// 一簇内所有核的（忙时, 总时）合计。忙时不含 idle 与 iowait
+fn cluster_busy(times: &[(u64, u64)], set: &CpuSet) -> ClusterTicks {
+    let mut busy = 0u64;
+    let mut total = 0u64;
+    let mut any = false;
+    for cpu in 0..CPU_SETSIZE {
+        if !set.is_set(cpu) {
+            continue;
+        }
+        if let Some(&(b, t)) = times.get(cpu) {
+            busy += b;
+            total += t;
+            any = true;
+        }
+    }
+    any.then_some((busy, total))
+}
+
+/// 解析 `/proc/stat`，返回按 CPU 号索引的（忙时, 总时）。只取前 8 个字段：
+/// guest/guest_nice 已经计入 user/nice，再加会重复
+fn read_cpu_times() -> Option<Vec<(u64, u64)>> {
+    let text = std::fs::read_to_string("/proc/stat").ok()?;
+    parse_cpu_times(&text)
+}
+
+fn parse_cpu_times(text: &str) -> Option<Vec<(u64, u64)>> {
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    for line in text.lines() {
+        let Some(rest) = line.strip_prefix("cpu") else {
+            continue;
+        };
+        // 汇总行是 `cpu `（cpu 后直接空格），逐核行是 `cpu0`/`cpu10`
+        if rest.starts_with(' ') || rest.starts_with('\t') {
+            continue;
+        }
+        let mut it = rest.split_whitespace();
+        let Some(num) = it.next() else { continue };
+        // 汇总行是 `cpu `，没有编号
+        let Ok(idx) = num.parse::<usize>() else {
+            continue;
+        };
+        let vals: Vec<u64> = it.filter_map(|x| x.parse().ok()).collect();
+        if vals.len() < 5 {
+            continue;
+        }
+        let idle = vals[3] + vals[4];
+        let total: u64 = vals.iter().take(8).sum();
+        if idx >= out.len() {
+            out.resize(idx + 1, (0, 0));
+        }
+        out[idx] = (total.saturating_sub(idle), total);
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 /// S7 的三簇千分比 → 比例。任一为 -1（不可用）或全 0 时返回 None：
@@ -286,19 +380,36 @@ mod tests {
 
     /// 三种量纲各自分档，不能串：软件计时下 inst 恒 0，按 M/s 判会把
     /// 所有线程打成「轻」，配额就没东西可分了
+    /// 没开跨簇规则的设备上，S7 不统计簇负载，对照只能靠自测。
+    /// 这一条直接读真机的 `/proc/stat`，验证两次采样之间能算出份额
     #[test]
-    fn classify_uses_the_live_metric() {
-        // 指令：100 M/s 以上为重（窗口 5 秒 → 5 亿条指令）
-        assert_eq!(classify(&sample(600_000_000, 0, None)), Load::Heavy);
-        assert_eq!(classify(&sample(150_000_000, 0, None)), Load::Medium);
-        assert_eq!(classify(&sample(10_000_000, 0, None)), Load::Light);
-        // 只有周期：3 Gcyc/s 以上为重（5 秒 → 150 亿）
-        assert_eq!(classify(&sample(0, 20_000_000_000, None)), Load::Heavy);
-        assert_eq!(classify(&sample(0, 5_000_000_000, None)), Load::Medium);
-        // 软件计时：50% 以上为重（5 秒窗口里跑了 2.5 秒）
-        assert_eq!(classify(&sample(0, 0, Some(3_000_000_000))), Load::Heavy);
-        assert_eq!(classify(&sample(0, 0, Some(1_000_000_000))), Load::Medium);
-        assert_eq!(classify(&sample(0, 0, Some(100_000_000))), Load::Light);
+    fn self_measured_reads_proc_stat() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let mut topo = CpuTopology::empty();
+        topo.e_core = CpuSet::new();
+        topo.e_core.set(0);
+        topo.p_core = CpuSet::new();
+        topo.p_core.set(1);
+
+        // 第一次只建基线
+        let _ = self_measured(&topo);
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = stop.clone();
+        let worker = std::thread::spawn(move || {
+            let mut n = 0u64;
+            while !flag.load(Ordering::Relaxed) {
+                n = n.wrapping_add(1);
+                std::hint::black_box(n);
+            }
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let got = self_measured(&topo);
+        stop.store(true, Ordering::Relaxed);
+        worker.join().unwrap();
+
+        let g = got.expect("两次采样之间必然有 tick 推进");
+        assert!((g.iter().sum::<f64>() - 1.0).abs() < 1e-9);
+        assert_eq!(g[2], 0.0, "hp 簇为空时占比必须是 0");
     }
 
     #[test]
@@ -350,18 +461,57 @@ mod tests {
         let _ = topo;
     }
 
-    /// 分档比例按活动量算，不是按线程数：1 个 380 M/s 的线程远比
-    /// 10 个 1 M/s 的线程重
+    /// 分档按活动量份额切，不是按线程数：1 个占六成活动的线程是「重」，
+    /// 十个各占 1% 的线程只能算「轻」
     #[test]
-    fn heavy_share_uses_activity_not_counts() {
-        let mut v = vec![sample(380 * 1_000_000 * 5, 0, None)];
+    fn tiers_follow_activity_share() {
+        let mut v = vec![sample(600, 0, None)];
         for i in 0..10 {
-            let mut s = sample(1_000_000, 0, None);
+            let mut s = sample(10, 0, None);
             s.tid = i + 2;
             v.push(s);
         }
-        let plan = compute(&v, &CpuTopology::empty(), None);
+        let plan = compute(&v, &CpuTopology::empty(), None, None);
+        assert_eq!(plan.heavy, 1, "一个人占 85% 活动量，只有它算重");
+        assert!(plan.heavy_share > 0.8, "实得 {}", plan.heavy_share);
+        assert_eq!(plan.medium + plan.light, 10);
+    }
+
+    /// 单簇规则下 S7 不跑（got 为 None），自测必须能补上对照
+    #[test]
+    fn own_load_is_used_when_s7_is_absent() {
+        let samples = vec![sample(600, 0, None)];
+        let plan = compute(&samples, &CpuTopology::empty(), None, Some([0.5, 0.3, 0.2]));
+        // 未分层时 want 全 0，会在对照前返回，这里只验分档仍成立
         assert_eq!(plan.heavy, 1);
-        assert!(plan.heavy_share > 0.98, "实得 {}", plan.heavy_share);
+        assert!(plan.got.is_none());
+    }
+
+    /// S7 有数据时优先用 S7：它才是实际决策方
+    #[test]
+    fn s7_wins_over_own_load() {
+        let samples = vec![sample(600, 0, None)];
+        let plan = compute(
+            &samples,
+            &CpuTopology::empty(),
+            Some([400, 400, 200]),
+            Some([0.1, 0.1, 0.8]),
+        );
+        assert_eq!(plan.heavy, 1);
+    }
+
+    /// `/proc/stat`：汇总行要跳过，guest 不能重复计
+    #[test]
+    fn parse_stat_skips_summary_row() {
+        let text = "\
+cpu  100 0 50 1000 10 0 0 0 0 0
+cpu0 50 0 25 500 5 0 0 0 0 0
+cpu1 50 0 25 500 5 0 0 0 0 0
+intr 12345
+";
+        let v = parse_cpu_times(text).unwrap();
+        assert_eq!(v.len(), 2, "汇总行不能进数组");
+        // busy = 50+25 = 75；total = 50+25+500+5 = 580
+        assert_eq!(v[0], (75, 580));
     }
 }

@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "AppOpt"
-version = "2.7.0-beta19"
+version = "2.7.0-beta20"
 dependencies = [
  "aya",
  "libc",

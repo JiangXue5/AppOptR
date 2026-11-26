@@ -1327,9 +1327,9 @@ pub fn load_config(
         extra.push("Auto Assign=on（只写候选文件）".to_string());
     }
     if pmu_observe {
-        extra.push("PMU 观察=on（只采样，不迁移）".to_string());
+        extra.push("PMU 观察=on".to_string());
         if pmu_alloc {
-            extra.push("PMU 配额=shadow（只算不执行）".to_string());
+            extra.push("PMU 配额=on".to_string());
         }
     }
     if !blacklist.is_empty() {

@@ -282,18 +282,18 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div class="hint">观察受管应用的线程，按角色给建议（Critical→<span class="mono">hp-core</span>、Latency→<span class="mono">p-core</span>、Worker→<span class="mono">e-core</span>），写入同目录 <span class="mono">AppOpt.autocache.conf</span>，30 天过期。<b>只观察、不改规则</b>：候选在「规则」页顶部，逐条采纳才会写进主配置。线程存活满 60 秒才出现，满 5 分钟标为高置信度；已有同名或通配规则覆盖的线程不再建议。</div>
 </div>
 <div class="card">
-<div class="card-title">PMU 观察</div>
+<div class="card-title">线程忙闲观察</div>
 <div class="seg" id="seg-pmu">
 <button data-key="pmu" data-val="off" data-on="0">关闭</button>
 <button data-key="pmu" data-val="observe" data-on="1">观察</button>
 </div>
 <div class="hint" id="c-pmu-state">-</div>
 <div class="seg" id="seg-pmu-alloc">
-<button data-key="pmu_alloc" data-val="off" data-on="0">只看采样</button>
-<button data-key="pmu_alloc" data-val="shadow" data-on="1">配额 shadow</button>
+<button data-key="pmu_alloc" data-val="off" data-on="0">只看忙闲</button>
+<button data-key="pmu_alloc" data-val="shadow" data-on="1">配额估算</button>
 </div>
 <div class="hint" id="c-pmu-alloc-state">-</div>
-<div class="hint">读取硬件计数器（instructions / cycles / cache-misses），在诊断页显示受管线程的 CPI 与指令速率，用于评估 S7 的迁移是否真的划算。硬件计数器打不开、或能打开但读数恒为 0（部分厂商锁了 PMU）时，自动退到软件计时，按 <span class="mono">CPU 时间</span>显示线程占用，不再当成故障。<b>只采样、不迁移</b>：执行路径不会因为本开关改变任何一个核。需要内核允许 <span class="mono">perf_event_open</span>；权限不足时自动关闭，原因写在诊断页。max 128 线程、按 <span class="mono">RLIMIT_NOFILE</span> 预算自动收缩。</div>
+<div class="hint">看看游戏里每个线程有多忙，用来判断绑核是否合理。硬件计数器用不了时会自动改用 CPU 时间统计。<b>只看不改</b>：不会影响任何绑核结果。<br>配额估算：按忙闲程度估算大核、中核、小核各该承担多少活，再和实际占用对比，告诉你哪一档偏空。<b>只估算，不执行</b>。</div>
 </div>
 <div class="card">
 <div class="card-title">RT 实时调度</div>
@@ -1013,13 +1013,13 @@ async function loadCfg(){
     const pm=d.pmu?'observe':'off';
     setSeg('seg-pmu',pm);
     $('c-pmu-state').textContent=pm==='observe'
-      ?'当前：观察中 · 只采样，不迁移；数据见诊断页'
-      :'当前：关闭 · 不产生 perf 系统调用';
+      ?'当前：观察中 · 只看不改'
+      :'当前：关闭 · 不读取计数器';
     const pa=d.pmu_alloc?'shadow':'off';
     setSeg('seg-pmu-alloc',pa);
     $('c-pmu-alloc-state').textContent=pa==='shadow'
-      ?'当前：开启 · 按活动量分重/中/轻，给各簇建议承载与缺口；只算不执行，绑核结果不受影响'
-      :'当前：关闭 · 只输出采样，不计算配额（需要先开「PMU 观察」）';
+      ?'当前：估算中 · 只算不改'
+      :'当前：关闭（需先打开上面的观察）';
     const sg=d.sysgroup==='takeover'?'takeover':'respect';
     document.querySelectorAll('#seg-sysgroup button').forEach(b=>b.classList.toggle('on',b.dataset.sysgroup===sg));
     $('c-sysgroup-state').textContent=sg==='takeover'
@@ -1076,8 +1076,8 @@ bindBehavior('seg-screen','已开启息屏放松','已关闭息屏放松');
 bindBehavior('seg-group','已改为接管组归属','已改为只写掩码（退回 2.6.1）');
 bindBehavior('seg-demote','已开启前后台降档','已关闭前后台降档');
 bindBehavior('seg-auto','已开启 Auto Assign 观察','已关闭 Auto Assign 观察');
-bindBehavior('seg-pmu','已开启 PMU 观察（只采样）','已关闭 PMU 观察');
-bindBehavior('seg-pmu-alloc','已开启配额 shadow（只算不执行）','已关闭配额 shadow');
+bindBehavior('seg-pmu','已开启线程观察（只看不改）','已关闭线程观察');
+bindBehavior('seg-pmu-alloc','已开启配额估算（只算不改）','已关闭配额估算');
 
 async function saveField(body){
   try{await api('/api/config',body);toast('已保存');loadCfg()}
@@ -1115,30 +1115,30 @@ async function loadDiag(){
     const p=d.pmu||{};
     $('d-pmu').textContent=(()=>{
       if(!p.state||p.state==='未启用')return 'PMU · 未启用（在设置里打开「PMU 观察」，或写 @pmu=observe）';
-      const head='PMU · '+p.state+' · 采样 '+p.threads+' 线程 · FD '+p.fds+'（上限 '+p.budget+' 线程）· 第 '+p.windows+' 轮'
-        +' · '+p.mode
-        +(p.active>0?' · 本窗口 '+p.active+' 个在跑':'')
-        +(p.miss_ok||p.mode!=='指令计数'?'':' · cache-miss 不可用');
+      const head='PMU · '+p.state
+        +(p.active>0?' · 本窗口 '+p.active+' 个线程在跑':' · 没有线程在跑')
+        +' · '+p.mode;
       // 三级退让：指令 → 周期 → CPU 占用。设备能不能给硬件计数不由我们决定，
       // 但面板不能因此显示 0
-      const list=(p.samples||[]).slice(0,4).map(s=>s.comm+'('+s.tid+') '
-        +(s.inst>0? s.mips+'M/s CPI '+s.cpi
-          : s.cycles>0? s.gcyc+'Gcyc/s'
-          : s.cpu_pct+'% CPU')).join(' / ');
-      return head+(list?' · '+list:'');
+      const list=(p.samples||[]).slice(0,4).map(s=>s.comm+' '
+        +(s.inst>0? s.mips+' M/s（CPI '+s.cpi+'）'
+          : s.cycles>0? s.gcyc+' Gcyc/s'
+          : s.cpu_pct+'%')).join(' ｜ ');
+      return head+(list?' ｜ 最忙 '+list:'');
     })();
     const al=p.alloc;
     $('d-alloc').textContent=al?(function(){
       const names=['e-core','p-core','hp-core'];
       const pct=v=>(v==null?'-':v+'%');
       const idx=names.indexOf(al.starved);
-      const tail=idx>=0?' ｜ '+al.starved+' 空 '+Math.abs(al.gap[idx])+' 个点':'';
-      return '配额 shadow · 重 '+al.heavy+' / 中 '+al.medium+' / 轻 '+al.light
-        +' · 建议 e/p/hp '+al.want.map(pct).join('/')
-        +(al.got?' · 实际 '+al.got.map(pct).join('/')+' · 匹配 '+al.fit+'%':' · S7 未运行，暂不对照')
+      const tail=idx>=0?' ｜ '+al.starved+' 偏空 '+Math.abs(al.gap[idx])+' 个点':'';
+      return '配额 · 重 '+al.heavy+' / 中 '+al.medium+' / 轻 '+al.light
+        +' ｜ 建议 e/p/hp '+al.want.map(pct).join('/')
+        +(al.got?' → 实际 '+al.got.map(pct).join('/')+'，匹配 '+al.fit+'%':' · 暂无对照数据')
+        +(al.got&&al.source?'（'+al.source+'）':'')
         +tail
-        +(al.hints&&al.hints.length?' · 优先搬 '+al.hints.slice(0,2).join('、'):'');
-    })():'配额 shadow · 暂无数据（需要「PMU 观察」与「配额 shadow」同时开启）';
+        +(al.hints&&al.hints.length?' ｜ 可优先搬 '+al.hints.slice(0,2).join('、'):'');
+    })():'配额 · 暂无数据（需要先打开「观察」）';
     const th=d.threads||[];
     const bad=th.filter(t=>!t.ok);
     const show=(bad.length?bad:th).slice(0,8);

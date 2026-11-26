@@ -1250,6 +1250,7 @@ fn diag_json() -> String {
                 "gap": a.gap.iter().map(|x| (x * 1000.0).round() / 10.0).collect::<Vec<_>>(),
                 "fit": (a.fit * 1000.0).round() / 10.0,
                 "starved": a.starved_name,
+                "source": a.source,
                 "hints": a.hints,
                 "samples": a.samples,
             })),

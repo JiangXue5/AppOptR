@@ -197,6 +197,9 @@ struct Seen {
     rule_hit: HashSet<String>,
     /// 本窗口是否已打过「其余规则命中不再列出」
     rule_hit_capped: bool,
+    /// 本周期逐条打了几条「外部写入」。厂商 HAL 一次能把整批线程拉回去，
+    /// 十五条一模一样的行除了变长没有信息量，明细在「改写明细」里
+    reset_lines: u8,
     /// 本窗口打过几条「目标来源变化」，用于限流
     target_shift: u64,
     /// 本窗口是否已打过「其余目标变化不再列出」
@@ -252,6 +255,11 @@ struct Sink {
     /// 自启动以来是否成功接管过线程。用来区分「游戏还没开」与「进程退出了」，
     /// 两者的处理动作相反
     ever_bound: bool,
+    /// 「此刻没有受管线程」这条已经连续打了几个周期。游戏没开时它一字不变，
+    /// 每 60 秒重复一次要连说十几遍，把真正变化的行挤出视野
+    empty_repeat: u32,
+    /// 上一次打过的空转文案。文案变化（比如首次接管过又全部退出）要立刻打
+    last_empty: Option<&'static str>,
     /// tid → (所属包, 是否进程主线程)。线程名常常和包名毫无关系
     /// （`HWC release`、`dns-work-0`），只印线程名时用户无法判断模块有没有
     /// 管到规则外的进程；主线程的 comm 会被内核截到 15 字节，日志里
@@ -281,6 +289,8 @@ fn sink() -> std::sync::MutexGuard<'static, Option<Sink>> {
         tally: None,
         blocked_note: None,
         ever_bound: false,
+        empty_repeat: 0,
+        last_empty: None,
         thread_pkg: HashMap::new(),
     });
     guard
@@ -778,14 +788,21 @@ pub fn note_drift(tid: i32, comm: &str, expect: &CpuSet, actual: &CpuSet) {
                 delta_desc(&sample.expect, &sample.actual),
                 sample.cpuset
             );
-            line.push_str(if first {
-                " ｜ 外部写入（AppOpt 只写规则集合或其子集）：常见来源是厂商性能 HAL、\
-                 游戏自身 boost、系统恢复默认集合；下一轮按规则重绑，写不进去会另打一行「失败」"
-            } else {
-                " ｜ 外部写入；下一轮按规则重绑（失败会另打一行「失败」）"
-            });
-            tag("改写", &line);
-            push_event(s, line);
+            if first {
+                // 来源说明只给一次，重复十五遍不会让人更信
+                line.push_str(" ｜ 外部写入，已按规则改回");
+            }
+            if s.seen.reset_lines < 3 {
+                s.seen.reset_lines += 1;
+                tag("改写", &line);
+                push_event(s, line);
+            } else if s.seen.reset_lines == 3 {
+                s.seen.reset_lines += 1;
+                tag(
+                    "改写",
+                    "同批其余线程也被外部改了，不再逐条列出（总数见「改写明细」）",
+                );
+            }
         }
     }
 }
@@ -1056,7 +1073,10 @@ pub fn note_target_shift(label: &str, from: &str, to: &str, cpus: &str, reason: 
         );
     } else if !s.seen.target_shift_capped {
         s.seen.target_shift_capped = true;
-        tag("目标", "本窗口其余线程的目标来源变化不再逐条列出（绑定结果不受影响）");
+        tag(
+            "目标",
+            "本窗口其余线程的目标来源变化不再逐条列出（绑定结果不受影响）",
+        );
     }
 }
 
@@ -1283,6 +1303,7 @@ pub fn periodic_summary(current: &SchedSnapshot) {
     s.seen.rule_hit_capped = false;
     // 省略提示跟着窗口走：下一窗口前 3 条又能逐条打出来
     s.seen.group_fix_capped = false;
+    s.seen.reset_lines = 0;
     s.seen.target_shift = 0;
     s.seen.target_shift_capped = false;
     let tally = s.tally.take();
@@ -1359,9 +1380,20 @@ pub fn periodic_summary(current: &SchedSnapshot) {
             if group_read > 0 {
                 line.push_str(&format!(" ｜ 组归属回读 {}", group_read));
             }
+            s.empty_repeat = 0;
+            s.last_empty = None;
             tag("周期", &line);
         }
-        None => tag("周期", empty_state_hint(tally, s.ever_bound)),
+        None => {
+            let hint = empty_state_hint(tally, s.ever_bound);
+            let changed = s.last_empty != Some(hint);
+            s.empty_repeat = if changed { 0 } else { s.empty_repeat + 1 };
+            s.last_empty = Some(hint);
+            // 首次、文案变化、以及每 10 分钟各打一次
+            if changed || s.empty_repeat % 10 == 0 {
+                tag("周期", hint);
+            }
+        }
     }
 
     // ── 持续对抗：同一个线程被反复改写 ────────────────────────

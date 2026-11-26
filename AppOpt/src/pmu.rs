@@ -190,20 +190,22 @@ impl Sample {
         self.cycles
     }
 
-    /// 日志里的速率描述：有指令说指令速率，只有周期说周期速率，
-    /// 都没有就说 CPU 占用
+    /// 日志里的速率描述：只给一个数，不放 CPI 和毫秒明细。
+    /// 日志一行最多放三个线程，带全每个线程的分子分母会直接冲出终端宽度；
+    /// 要看 CPI 去诊断页，那里有完整的结构化数据
     pub fn rate_text(&self) -> String {
         if self.inst > 0 {
-            format!("{:.0} M/s CPI {:.2}", self.mips(), self.cpi())
+            // 小于 0.5 M/s 时不显示成「0 M/s」——那会被读成没在跑
+            let m = self.mips();
+            if m < 0.5 {
+                "<1 M/s".to_string()
+            } else {
+                format!("{m:.0} M/s")
+            }
         } else if self.cycles > 0 {
             format!("{:.2} Gcyc/s", self.gcyc())
         } else if self.cpu_ns.is_some() {
-            format!(
-                "{:.0}% CPU（{:.0} ms/{} ms）",
-                self.cpu_pct(),
-                self.cpu_ms(),
-                self.window_ms
-            )
+            format!("{:.0}%", self.cpu_pct())
         } else {
             "0".to_string()
         }
@@ -561,15 +563,13 @@ pub fn tick(cfg: &AppConfig, cache: &ProcCache) {
             // TASK_CLOCK 至少还能回答「谁在吃 CPU」，而这是第二阶段
             // 分重/中/轻真正要的输入
             let why = if p.starved {
-                "计数器从未被调度（PMU 被厂商独占）"
+                "PMU 被厂商独占"
             } else {
-                "instructions/cycles 读数恒为 0（内核未向用户态开放 PMU）"
+                "读数恒为 0"
             };
             crate::diag::tag(
                 "PMU",
-                &format!(
-                    "硬件计数器不可用：{why}；改用软件计时（CPU 时间）继续观察，绑核结果不受影响"
-                ),
+                &format!("硬件计数器不可用（{why}）→ 改用 CPU 时间统计，绑核不受影响"),
             );
             switch_to_sw(p, p.exclude_kernel);
             publish(p, "运行中（CPU 时间）".to_string());
@@ -618,7 +618,7 @@ pub fn tick(cfg: &AppConfig, cache: &ProcCache) {
             if perm && p.mode == Mode::Hw {
                 crate::diag::tag(
                     "PMU",
-                    &format!("{reason}；硬件计数器不可用，改用软件计时（只计用户态）继续观察"),
+                    &format!("硬件计数器打不开（{reason}）→ 改用 CPU 时间统计（只计用户态）"),
                 );
                 switch_to_sw(p, true);
                 publish(p, "运行中（CPU 时间）".to_string());
@@ -808,24 +808,13 @@ fn log_line(p: &Pmu, cfg: &AppConfig) {
         // 前者正常，后者说明计数器没工作。日志混成一句会把故障说成正常
         let threads = p.open_threads();
         let text = if threads > 0 {
-            format!(
-                "采样 {} 轮，{} 个线程的 FD 已打开但本窗口计数没有增长（上限 {} 线程）",
-                p.windows, threads, p.budget
-            )
+            format!("无读数：{threads} 个线程的计数器没涨（可能被厂商独占）")
         } else if !p.slots.is_empty() {
             // 有受管线程但都在睡：这是最常态的一行，不能写成「没有线程」，
             // 否则用户会以为扫描没找到进程
-            format!(
-                "采样 {} 轮，{} 个受管线程本轮没有消耗 CPU（未开 FD，上限 {} 线程）",
-                p.windows,
-                p.slots.len(),
-                p.budget
-            )
+            format!("空闲：{} 个受管线程本轮没消耗 CPU", p.slots.len())
         } else {
-            format!(
-                "采样 {} 轮，没有受管线程（FD 未占用，上限 {} 线程）",
-                p.windows, p.budget
-            )
+            "等待游戏启动（没有受管线程）".to_string()
         };
         crate::diag::tag("PMU", &text);
         return;
@@ -834,33 +823,19 @@ fn log_line(p: &Pmu, cfg: &AppConfig) {
         .samples
         .iter()
         .take(LOG_SAMPLES)
-        .map(|s| format!("{}({}) {}", s.comm, s.tid, s.rate_text()))
+        .map(|s| format!("{} {}", s.comm, s.rate_text()))
         .collect::<Vec<_>>()
         .join("、");
-    let miss = if p.mode == Mode::Sw {
-        " ｜ 硬件计数器不可用，按 CPU 时间统计".to_string()
-    } else if p.miss_ok {
-        let m: u64 = p.samples.iter().filter_map(|s| s.misses).sum();
-        format!(" ｜ cache-miss {}", m)
+    let how = if p.mode == Mode::Sw {
+        "CPU 时间"
     } else {
-        " ｜ cache-miss 不可用".to_string()
+        "硬件计数"
     };
-    let window = p
-        .samples
-        .first()
-        .map(|s| s.window_ms)
-        .unwrap_or(SAMPLE_WINDOW.as_millis() as u64);
     crate::diag::tag(
         "PMU",
         &format!(
-            "采样 {} 个线程在跑（FD {}，{} 线程）｜ 第 {} 轮 / {} ms ｜ 最忙：{}{}",
-            p.active.max(p.samples.len()),
-            p.open_fds(),
-            p.open_threads(),
-            p.windows,
-            window,
-            top,
-            miss
+            "{} 线程在跑 ｜ 最忙 {top} ｜ {how}",
+            p.active.max(p.samples.len())
         ),
     );
     // 配额单独一行：和采样行挤在一起会超过终端宽度，也看不清对照关系
@@ -1198,7 +1173,7 @@ mod tests {
         assert!(s.is_active(), "只有 CPU 时间的样本不能丢");
         assert!((s.cpu_ms() - 3_000.0).abs() < 1e-6);
         assert!((s.cpu_pct() - 50.0).abs() < 1e-6, "3s/6s 应是 50%");
-        assert!(s.rate_text().contains("% CPU"));
+        assert!(s.rate_text().contains("50%"), "实得 {}", s.rate_text());
         let idle = sample(0, 0);
         assert!(!idle.is_active(), "cpu_ns 为 None 且计数为 0 才是空闲");
     }
