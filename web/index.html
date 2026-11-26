@@ -434,7 +434,7 @@ border-top:none;border-right:1px solid var(--line);order:-1;justify-content:cent
 <div class="field"><input id="c-interval" type="number" min="1" max="3600"><button class="btn" id="c-interval-save">保存</button></div>
 <div class="item">
 <div class="txt"><div class="t">组目录</div>
-<div class="d">本模块使用的 cpuset 组目录，非必要不要修改。状态 <span id="c-cpuset-on">未知</span>。</div></div>
+<div class="d">本模块使用的 cpuset 组目录，非必要不要修改。当前状态：<span id="c-cpuset-on">未知</span></div></div>
 </div>
 <div class="field"><input id="c-cpuset"><button class="btn" id="c-cpuset-save">保存</button></div>
 <div class="item">
@@ -1251,6 +1251,8 @@ $('c-cpuset-save').onclick=()=>saveField({cpuset_name:$('c-cpuset').value.trim()
 $('c-file-save').onclick=()=>saveField({config_file:$('c-file').value.trim()});
 
 let diagTimer=null;
+const ROLE_CN={Critical:'关键',Latency:'延迟敏感',Worker:'计算',Background:'后台'};
+function roleCn(r){return ROLE_CN[r]||r||''}
 async function loadDiag(){
   try{
     const d=await api('/api/diag');
@@ -1261,7 +1263,7 @@ async function loadDiag(){
       `调用 ${a.calls} · 真写 ${a.writes} · 短路 ${a.noop}`,
       `失败 ${a.failed}${a.errno_line?'（'+esc(a.errno_line)+'）':''} · 线程已退出 ${a.gone}`,
       (a.clip||a.reset||a.shifted)
-        ?`校验重绑：裁剪 ${a.clip} · 重置 ${a.reset} · 挪簇 ${a.shifted}`:'',
+        ?`校验重绑：裁剪 ${a.clip} · 重置 ${a.reset} · 改簇 ${a.shifted}`:'',
       a.ineffective?`写入被裁剪 ${a.ineffective}，已暂停重绑 ${a.stuck} 个`:'',
       a.sysgroup_skip?`系统后台组跳过 ${a.sysgroup_skip}`:'',
       a.unreachable?`目标与所在组没有交集 ${a.unreachable}`:'',
@@ -1274,7 +1276,7 @@ async function loadDiag(){
       ?'<span class="li dim">已关闭</span>'
       :li([
         `${esc(s7.state||'')} · 迁移 ${s7.moved} · 失败 ${s7.failed}`,
-        `拦回弹 ${s7.bounced} · 冻结 ${s7.frozen}`,
+        `拦回迁 ${s7.bounced} · 冻结 ${s7.frozen}`,
         skips.length?'跳过：'+skips.map(esc).join('，'):'',
       ]);
     const jank=d.jank||[];
@@ -1305,14 +1307,15 @@ async function loadDiag(){
         $('d-alloc').innerHTML='<span class="li dim">暂无估算数据。</span>';
       }else{
         const names=['e-core','p-core','hp-core'];
+        const cn=['小核','中核','大核'];
         const pct=v=>(v==null?'—':v+'%');
         const idx=names.indexOf(al.starved);
         $('d-alloc').innerHTML=li([
           `重 ${al.heavy} · 中 ${al.medium} · 轻 ${al.light}`,
-          `建议 e/p/hp　${al.want.map(pct).join(' / ')}`,
+          `建议　小/中/大　${al.want.map(pct).join(' / ')}`,
           al.got?`实际　${al.got.map(pct).join(' / ')}，匹配 ${al.fit}%`
-            +(al.source?`（${esc(al.source)}）`:''):'暂无对照数据',
-          idx>=0?`${al.starved} 低于建议 ${Math.abs(al.gap[idx])} 个百分点`:'',
+            +(al.source?`（按${esc(al.source)}）`:''):'暂无对照数据',
+          idx>=0?`${cn[idx]}低于建议 ${Math.abs(al.gap[idx])} 个百分点`:'',
           al.hints&&al.hints.length?'可优先迁移：'+al.hints.slice(0,2).map(esc).join('、'):'',
         ]);
       }
@@ -1322,7 +1325,7 @@ async function loadDiag(){
     const show=(bad.length?bad:th).slice(0,8);
     $('d-threads').innerHTML=show.length
       ?show.map(t=>`<span class="li${t.ok?'':' bad'}">${esc(t.comm||'?')}（${t.tid}）　`
-          +`期望 ${esc(t.expect)}　实际 ${esc(t.actual)}　${esc(t.role)}</span>`).join('')
+          +`期望 ${esc(t.expect)}　实际 ${esc(t.actual)}　${esc(roleCn(t.role))}</span>`).join('')
         +(bad.length?`<span class="li dim">有 ${bad.length} 个线程未落在期望集合内</span>`:'')
       :'<span class="li dim">当前没有被管理的线程</span>';
     const ev=d.events||[];

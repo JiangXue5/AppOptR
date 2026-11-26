@@ -218,7 +218,7 @@ fn compute(
             .iter()
             .take(plan.heavy)
             .take(3)
-            .map(|(s, _)| format!("{}({}) {}", s.comm, s.tid, s.rate_text()))
+            .map(|(s, _)| format!("{}({})", s.comm, s.tid))
             .collect();
     }
     plan
