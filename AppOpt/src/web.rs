@@ -1205,6 +1205,8 @@ fn diag_json() -> String {
             "sched": d.aff.sched,
             "line": diag::affinity_line(&d.aff),
             "errno_line": d.aff.errno_line(),
+            // 0 未尝试（/proc 模式）、1 已挂 kprobe、2 不可用
+            "affinity_probe": crate::ebpf_mode::AFFINITY_PROBE.load(std::sync::atomic::Ordering::Relaxed),
         },
         "s7": {
             "mode": snap.mode,

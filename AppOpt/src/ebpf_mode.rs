@@ -2,12 +2,14 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::fs;
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use aya::maps::{Array as AyaArray, HashMap as AyaHashMap, Map, PerCpuArray as AyaPerCpuArray};
-use aya::{Ebpf, EbpfLoader, Pod, programs::TracePoint as AyaTracePoint};
+use aya::programs::{KProbe as AyaKProbe, TracePoint as AyaTracePoint};
+use aya::{Ebpf, EbpfLoader, Pod};
 
 use crate::apply_affinity::{
     AffinityOutcome, ApplyReason, affinity_apply, proc_walk, task_tids, tid_comm,
@@ -31,9 +33,14 @@ pub const EBPF_EVENT_FORK: u32 = 1;
 pub const EBPF_EVENT_EXEC: u32 = 2;
 pub const EBPF_EVENT_RENAME: u32 = 3;
 pub const EBPF_EVENT_EXIT: u32 = 4;
+/// 受管线程的亲和性被外部改写，用户态立刻重绑
+pub const EBPF_EVENT_AFFINITY: u32 = 5;
 
 /// 运行期累计的 RingBuf 丢弃事件数，供 Web 状态展示
 pub static DROPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// kprobe 改写监听的状态，供 Web 诊断展示：0 未尝试、1 已挂上、2 不可用
+pub static AFFINITY_PROBE: AtomicU8 = AtomicU8::new(0);
 
 /// 用户态注入内核的 tracepoint 字段偏移，布局需与内核态 TracepointOffsets 一致
 #[repr(C)]
@@ -45,6 +52,28 @@ struct EbpfOffsets {
 }
 
 unsafe impl Pod for EbpfOffsets {}
+
+/// 与内核态 `RegsOff` 对应：`sched_setaffinity` 的参数在 `pt_regs` 里的偏移。
+/// 一份 bpfel 字节码同时给 arm64 与 x86_64 用，只能在运行时注入。
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RegsOff {
+    ready: u32,
+    regs: u32,
+    pid: u32,
+    mask: u32,
+}
+
+unsafe impl Pod for RegsOff {}
+
+/// 同一线程被连续改写时的最小重绑间隔。HAL 有的会几十毫秒写一次，
+/// 每条事件都跟着重绑会把一个核打满；跳过的那些由周期校验兜底。
+const FIX_MIN_GAP: Duration = Duration::from_millis(100);
+
+/// 距上次重绑是否已经超过节流窗口
+fn fix_allowed(last: Option<Instant>, now: Instant) -> bool {
+    last.is_none_or(|t| now.duration_since(t) >= FIX_MIN_GAP)
+}
 
 /// 将内核 comm 截断于首个 NUL 并 trim 尾部空白
 fn comm_str(comm: &[u8; 16]) -> &str {
@@ -65,6 +94,8 @@ pub struct EbpfState {
     pub cfg_policy_sig: u64,
     /// 上一轮读到的内核累计丢弃数，用于差分求新增丢弃
     pub drop_seen: u64,
+    /// 每个受管线程最近一次「被改写后重绑」的时间，用于节流
+    pub last_fix: HashMap<i32, Instant>,
 }
 
 impl Drop for EbpfState {
@@ -291,6 +322,79 @@ fn offsets_inject(bpf: &mut Ebpf) -> bool {
     true
 }
 
+/// 挂 `sched_setaffinity` 探针。
+///
+/// 参数的寄存器位置随架构不同，同一份字节码要在两种架构上跑，只能在运行时
+/// 注入偏移。挂不上不算失败：内核没开 kprobe、syscall wrapper 符号被裁掉、
+/// 或 SELinux 拦下 perf_event_open，都会走到这里返回 false，
+/// 退回到原来的周期校验。
+fn attach_affinity_probe(bpf: &mut Ebpf) -> bool {
+    // arm64: pt_regs.regs[0] 存参数块指针，参数块里 regs[0]=pid、regs[2]=mask
+    // x86_64: pt_regs.di(112) 存参数块指针，参数块里 di(112)=pid、dx(96)=mask
+    let (regs, pid, mask) = match std::env::consts::ARCH {
+        "aarch64" => (0u32, 0u32, 16u32),
+        "x86_64" => (112u32, 112u32, 96u32),
+        other => {
+            crate::diag_warn!(
+                "kprobe 改写监听不支持 {} 架构，改写仍按周期校验回改",
+                other
+            );
+            return false;
+        }
+    };
+    {
+        let Some(map) = bpf.map_mut("REGS_OFF") else {
+            crate::diag_warn!("eBPF 未找到 REGS_OFF map，跳过改写监听");
+            return false;
+        };
+        let Ok(mut arr) = AyaArray::<_, RegsOff>::try_from(map) else {
+            crate::diag_warn!("eBPF REGS_OFF map 类型不符，跳过改写监听");
+            return false;
+        };
+        if let Err(e) = arr.set(
+            0,
+            RegsOff {
+                ready: 1,
+                regs,
+                pid,
+                mask,
+            },
+            0,
+        ) {
+            crate::diag_warn!("eBPF 注入 pt_regs 偏移失败 ({})，跳过改写监听", e);
+            return false;
+        }
+    }
+
+    let Some(prog) = bpf.program_mut("setaffinity") else {
+        crate::diag_warn!("eBPF 未找到 setaffinity 程序，跳过改写监听");
+        return false;
+    };
+    let Ok(kp): Result<&mut AyaKProbe, _> = prog.try_into() else {
+        crate::diag_warn!("eBPF setaffinity 程序类型不符，跳过改写监听");
+        return false;
+    };
+    // 符号名随内核版本变：Android 走 __arm64_sys_/__x64_sys_ 包装，
+    // 更老的内核直接导出 sys_sched_setaffinity
+    for sym in [
+        "__arm64_sys_sched_setaffinity",
+        "__x64_sys_sched_setaffinity",
+        "sys_sched_setaffinity",
+    ] {
+        match kp.attach(sym, 0) {
+            Ok(_) => {
+                AFFINITY_PROBE.store(1, Ordering::Relaxed);
+                crate::diag_say!("eBPF 已监听 {}，外部改写立刻改回", sym);
+                return true;
+            }
+            Err(e) => crate::diag_warn!("kprobe {} 挂载失败 ({})", sym, e),
+        }
+    }
+    AFFINITY_PROBE.store(2, Ordering::Relaxed);
+    crate::diag_warn!("kprobe 改写监听不可用（符号缺失或被策略拦截），仍按周期校验回改");
+    false
+}
+
 /// 初始化 eBPF，加载程序 attach tracepoint 创建 RingBuf 线程，失败回退 /proc
 pub fn ebpf_init() -> Option<EbpfState> {
     if !ebpf_probe() {
@@ -415,6 +519,9 @@ pub fn ebpf_init() -> Option<EbpfState> {
         }
     };
 
+    // 可选能力：挂不上只影响「被改写后多久改回」，绑核本身照常
+    attach_affinity_probe(&mut bpf);
+
     let (tx, rx) = mpsc::channel::<EbpfProcEvent>();
     let wakeup_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
     if wakeup_fd < 0 {
@@ -437,6 +544,7 @@ pub fn ebpf_init() -> Option<EbpfState> {
         cfg_sig: HashMap::new(),
         cfg_policy_sig: 0,
         drop_seen: 0,
+        last_fix: HashMap::new(),
     })
 }
 
@@ -632,6 +740,7 @@ pub fn event_dispatch(event: &EbpfProcEvent, cfg: &AppConfig, state: &mut EbpfSt
         EBPF_EVENT_EXIT => {
             // 内核态已在 sched_process_exit 里删除 APPLIED_MAP[tid]，此处不再重复删除
             state.cache.task_gone(tid);
+            state.last_fix.remove(&tid);
             rt::forget(tid);
         }
 
@@ -648,6 +757,16 @@ pub fn event_dispatch(event: &EbpfProcEvent, cfg: &AppConfig, state: &mut EbpfSt
 
         EBPF_EVENT_RENAME => {
             event_apply(&mut state.cache, &mut state.bpf, tid, pid, comm, cfg);
+        }
+
+        EBPF_EVENT_AFFINITY => {
+            // 内核侧已比较过掩码，这里只做节流：同一个线程被连续改写时，
+            // 100ms 内只重绑一次，剩下的由周期校验收尾
+            let now = Instant::now();
+            if fix_allowed(state.last_fix.get(&tid).copied(), now) {
+                state.last_fix.insert(tid, now);
+                rebind_known(state, tid, cfg);
+            }
         }
 
         _ => {}
@@ -677,6 +796,25 @@ fn event_apply(
     ok
 }
 
+/// 探针报来的外部改写：按缓存里已有的包名重绑。
+///
+/// 不能用 `event_apply`：那里的 comm 是改写方（HAL 线程）的名字，
+/// 拿它去查包名必然查不到，只能靠 `cache.tasks` 里记着的那条。
+fn rebind_known(state: &mut EbpfState, tid: i32, cfg: &AppConfig) {
+    let Some((pkg, comm, pid)) = state
+        .cache
+        .tasks
+        .get(&tid)
+        .map(|e| (e.pkg.clone(), e.comm.clone(), e.pid))
+    else {
+        return;
+    };
+    let bpf = &mut state.bpf;
+    state.cache.task_apply(tid, pid, &pkg, &comm, cfg, |t, c, d, r, v| {
+        affinity_apply_task(t, c, d, cfg, bpf, &comm, r, v)
+    });
+}
+
 /// 定期纠正 affinity_sync 清死亡 tid
 pub fn affinity_check(state: &mut EbpfState, cfg: &AppConfig) {
     let dead_tids = state
@@ -693,6 +831,7 @@ pub fn affinity_check(state: &mut EbpfState, cfg: &AppConfig) {
 /// 启动或配置更新时全量扫描 /proc
 pub fn full_scan(cfg: &AppConfig, state: &mut EbpfState) {
     state.cache.clear();
+    state.last_fix.clear();
     applied_clear(&mut state.bpf);
 
     proc_walk(
@@ -937,6 +1076,21 @@ mod tests {
         // 缺省值与显式 keep 等价，不应触发全量重建
         assert_eq!(a.policy_sig, b.policy_sig);
         assert_eq!(a.pkg_sig, b.pkg_sig);
+    }
+
+    #[test]
+    fn affinity_event_number_stays_stable() {
+        // 与 AppOpt-ebpf 的 EVENT_AFFINITY 必须一致，改一处就是 ABI 变更
+        assert_eq!(EBPF_EVENT_AFFINITY, 5);
+        assert_eq!(std::mem::size_of::<RegsOff>(), 16);
+    }
+
+    #[test]
+    fn throttle_lets_one_fix_per_window() {
+        let t0 = Instant::now();
+        assert!(fix_allowed(None, t0));
+        assert!(!fix_allowed(Some(t0), t0 + Duration::from_millis(99)));
+        assert!(fix_allowed(Some(t0), t0 + Duration::from_millis(100)));
     }
 
     #[test]

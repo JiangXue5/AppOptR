@@ -1268,6 +1268,8 @@ async function loadDiag(){
       a.sysgroup_skip?`系统后台组跳过 ${a.sysgroup_skip}`:'',
       a.unreachable?`目标与所在组没有交集 ${a.unreachable}`:'',
       a.cpuset_fail?`cpuset 失败 ${a.cpuset_fail}${a.cpuset_paused?'（已暂停重试）':''}`:'',
+      a.affinity_probe===1?'改写监听：已开启，被改后立刻回绑'
+        :a.affinity_probe===2?'改写监听：不可用，仍按周期校验回绑':'',
     ]);
     const s7=d.s7||{};
     const labels=s7.skip_labels||[];

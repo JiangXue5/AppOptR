@@ -4,10 +4,11 @@
 #![allow(dead_code)]
 
 use aya_ebpf::{
-    helpers::{bpf_get_current_comm, bpf_get_current_pid_tgid},
-    macros::{map, tracepoint},
+    EbpfContext,
+    helpers::{bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_probe_read},
+    macros::{kprobe, map, tracepoint},
     maps::{Array, HashMap, LruHashMap, PerCpuArray, RingBuf},
-    programs::TracePointContext,
+    programs::{ProbeContext, TracePointContext},
 };
 
 /// 事件类型与用户态 EbpfProcEvent.event_type 一致
@@ -16,6 +17,27 @@ const EVENT_FORK: u32 = 1;
 const EVENT_EXEC: u32 = 2;
 const EVENT_RENAME: u32 = 3;
 const EVENT_EXIT: u32 = 4;
+/// 受管线程的亲和性被别人改写，用户态需要立刻按规则改回
+const EVENT_AFFINITY: u32 = 5;
+
+/// `sched_setaffinity` 的参数在 `pt_regs` 里的偏移，随架构不同：
+/// arm64 的 `__arm64_sys_*` 把 `regs` 指针放在 `regs[0]`（0），
+/// x86_64 的 `__x64_sys_*` 放在 `di`（112）。
+///
+/// 一份 bpfel 字节码同时给两个架构用，编译期选不了，只能由用户态注入。
+/// 偏移不对时读出来的是垃圾，`APPLIED_MAP` 查不到就自然不出事件——
+/// 错得很安静，所以 `ready` 必须由用户态显式置 1。
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RegsOff {
+    ready: u32,
+    /// 从 `pt_regs` 里取「参数块指针」（`regs` 实参）的位置
+    regs: u32,
+    /// 参数块里 `pid` 的位置
+    pid: u32,
+    /// 参数块里 `user_mask_ptr` 的位置
+    mask: u32,
+}
 
 /// 4 类 tracepoint 字段布局：fork 读 child_pid/child_comm，exec/exit 用 bpf_get_current_pid_tgid，rename 读 newcomm
 /// 用户态解析 format 文件注入的字段偏移，因内核版本设备而异禁止硬编码
@@ -53,6 +75,10 @@ static EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 /// 用户态注入的 tracepoint 字段偏移单条 Array 索引 0
 #[map]
 static OFFSETS_MAP: Array<TracepointOffsets> = Array::with_max_entries(1, 0);
+
+/// 用户态注入的 pt_regs 偏移，索引 0；`ready=0` 表示探针参数还不认识，程序直接返回
+#[map]
+static REGS_OFF: Array<RegsOff> = Array::with_max_entries(1, 0);
 
 /// RingBuf 满导致的事件丢弃计数。per-CPU 槽位：每个 CPU 只写自己的槽位，
 /// 不需要原子指令，也不会因为多核并发更新丢计数；用户态读取时按 CPU 求和并做差分
@@ -215,8 +241,7 @@ fn task_rename(ctx: TracePointContext) -> u32 {
 
 /// 捕获线程退出，已管理线程清理 APPLIED_MAP
 #[tracepoint(name = "sched_process_exit", category = "sched")]
-fn sched_process_exit(_ctx: TracePointContext) -> u32 {
-    let pid_tgid = bpf_get_current_pid_tgid();
+fn sched_process_exit(_ctx: TracePointContext) -> u32 {    let pid_tgid = bpf_get_current_pid_tgid();
     let tid = (pid_tgid & 0xFFFFFFFF) as u32;
     let tgid = (pid_tgid >> 32) as u32;
 
@@ -231,6 +256,92 @@ fn sched_process_exit(_ctx: TracePointContext) -> u32 {
         tid: tid as i32,
         comm: [0u8; 16],
         event_type: EVENT_EXIT,
+    });
+    0
+}
+
+/// 本模块自己的进程名。自己改自己不算「被别人改写」，否则每次绑核都会
+/// 回环成一条事件，全量扫描时几百条一起涌进来
+const SELF_COMM: &[u8; 6] = b"AppOpt";
+
+#[inline(always)]
+fn is_self(comm: &[u8; 16]) -> bool {
+    &comm[..6] == SELF_COMM
+}
+
+/// 读取并校验注入偏移；未注入（ready=0）时返回 None
+#[inline(always)]
+fn regs_off() -> Option<RegsOff> {
+    REGS_OFF.get(0).copied().filter(|o| o.ready != 0)
+}
+
+/// `sched_setaffinity` 探针：别人把受管线程的掩码改掉时立刻通知用户态。
+///
+/// 判定完全在内核侧做完，用户态只负责重绑：
+/// 1. 跳过本模块自己的写入（comm 为 AppOpt）；
+/// 2. 线程不在 `APPLIED_MAP` 里 → 不是我们管的，不管；
+/// 3. 新掩码与 `APPLIED_MAP` 里记的期望值相同 → 没有变化，不报。
+///
+/// 第 3 条同时挡住「用户态写成功、内核侧事件后到」的顺序问题：事件到达时
+/// map 里已经是新值，比较相等，自然安静。
+#[kprobe(function = "sched_setaffinity")]
+fn setaffinity(ctx: ProbeContext) -> u32 {
+    let Some(off) = regs_off() else {
+        return 0;
+    };
+    let caller = bpf_get_current_comm().unwrap_or_default();
+    if is_self(&caller) {
+        return 0;
+    }
+
+    // 参数块指针：kprobe 的 ctx 是 pt_regs，syscall wrapper 的第一个参数
+    // 就存在 pt_regs 的固定位置上
+    let base = ctx.as_ptr() as usize;
+    let Ok(regs) = (unsafe { bpf_probe_read::<u64>((base + off.regs as usize) as *const u64) })
+    else {
+        return 0;
+    };
+    // 参数块本身还是 pt_regs，pid 与 mask 指针各在固定偏移
+    let Ok(tid_arg) =
+        (unsafe { bpf_probe_read::<i32>((regs as usize + off.pid as usize) as *const i32) })
+    else {
+        return 0;
+    };
+    let Ok(mask_ptr) =
+        (unsafe { bpf_probe_read::<u64>((regs as usize + off.mask as usize) as *const u64) })
+    else {
+        return 0;
+    };
+
+    let pid_tgid = bpf_get_current_pid_tgid();
+    // pid=0 表示「改自己」，目标就是调用者线程
+    let tid = if tid_arg > 0 {
+        tid_arg as u32
+    } else {
+        (pid_tgid & 0xFFFF_FFFF) as u32
+    };
+    if tid == 0 {
+        return 0;
+    }
+
+    let Some(want) = (unsafe { APPLIED_MAP.get(tid) }).copied() else {
+        return 0;
+    };
+    // 用户缓冲区至少 cpumask_size（64 位上是 8 字节），手机核数远小于 64，
+    // 读一个 u64 足够；长度参数小于 8 时可能读到相邻栈数据，最多多报一次，
+    // 用户态发现掩码已一致就短路了
+    let Ok(new_mask) = (unsafe { bpf_probe_read::<u64>(mask_ptr as *const u64) }) else {
+        return 0;
+    };
+    if new_mask == want {
+        return 0;
+    }
+
+    submit_event(ProcEvent {
+        pid: (pid_tgid >> 32) as i32,
+        tid: tid as i32,
+        comm: caller,
+        event_type: EVENT_AFFINITY,
     });
     0
 }
