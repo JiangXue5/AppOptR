@@ -96,6 +96,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 .rt-sub .mode{flex:1;min-width:0;font-size:10px;color:var(--sub);background:var(--bg);border-radius:6px;padding:3px 6px;word-break:break-all}
 .rt-sub label{font-size:11px;color:var(--sub);display:flex;align-items:center;gap:4px;flex-shrink:0}
 .rt-sub input{width:46px;padding:5px 6px;font-size:12px}
+.rt-sub input.rt-names{width:auto;flex:1;min-width:0;text-align:left}
 .field input{flex:1;min-width:0}
 .field .btn{flex-shrink:0}
 .hint{font-size:12px;color:var(--sub);margin-top:8px;line-height:1.5;word-break:break-all}
@@ -168,7 +169,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div id="tok-gate" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:99;align-items:center;justify-content:center;padding:24px">
 <div class="modal" style="max-width:340px">
 <h3>需要访问令牌</h3>
-<p class="hint">本机接口只对持有令牌的请求开放，避免其它应用借用 root 权限。令牌保存在模块目录的 <code>web.token</code>，模块日志的启动行里也有。</p>
+<p class="hint">这个页面只认带令牌的请求，免得别的 App 借 root 权限乱改。令牌在模块目录的 <code>web.token</code> 里。</p>
 <input id="tok-input" placeholder="32 位十六进制令牌" autocomplete="off" spellcheck="false" style="width:100%;margin:12px 0;box-sizing:border-box">
 <div class="modal-actions"><button class="btn" id="tok-ok">确定</button></div>
 </div>
@@ -234,15 +235,16 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <button data-mode="2">Proc</button>
 </div>
 <div class="hint" id="c-mode-active">当前生效: -</div>
-<div class="hint" id="c-ebpf-hint" style="color:var(--orange)" hidden>此设备内核不支持 eBPF，强制 eBPF 时将保持 Proc 轮询</div>
+<div class="hint">看不懂就选「自动」，它会自己挑最快的办法。</div>
+<div class="hint" id="c-ebpf-hint" style="color:var(--orange)" hidden>这台设备不支持 eBPF，选了也会用普通扫描</div>
 </div>
 <div class="card">
 <div class="card-title">扫描参数</div>
 <div class="field"><input id="c-interval" type="number" min="1" max="3600"><button class="btn" id="c-interval-save">保存</button></div>
-<div class="hint">检查间隔（秒），影响 /proc 扫描与配置轮询频率</div>
-<div class="hint">未匹配线程：<span id="c-unmatched">-</span></div>
-<div class="hint">可跨簇调度的规则：<span id="c-cross">-</span></div>
-<div class="hint">RT 调度：<span id="c-rt">-</span></div>
+<div class="hint">多久看一眼有哪些线程（秒）。默认就好，调小反应快一点，但更费电。</div>
+<div class="hint">没写规则的线程：<span id="c-unmatched">-</span></div>
+<div class="hint">能在几层核之间挪的规则：<span id="c-cross">-</span></div>
+<div class="hint">优先跑（RT）：<span id="c-rt">-</span></div>
 </div>
 <div class="card">
 <div class="card-title">S7 动态分配</div>
@@ -252,7 +254,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <button data-sched="on">开启</button>
 </div>
 <div class="hint" id="c-sched-state">-</div>
-<div class="hint">按三个核心层的实时负载，把跨簇规则里的 Worker 线程挪到空闲层。<b>观察</b>完整走判定但只记日志、不改亲和性，建议先跑几天确认候选合理再开<b>开启</b>。仅在规则允许 ≥2 个核心层、且线程为 Worker/Background 时生效。</div>
+<div class="hint">哪层核挤了，就把不着急的活挪到空一点的层去。<b>观察</b>＝只记下打算怎么挪，不动手；<b>开启</b>＝真的挪。建议先用观察跑几天，觉得挪得有道理再开。</div>
 </div>
 <div class="card">
 <div class="card-title">息屏放松</div>
@@ -261,7 +263,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <button data-key="screen" data-val="relax" data-on="1">开启</button>
 </div>
 <div class="hint" id="c-screen-state">-</div>
-<div class="hint">屏幕熄灭后，把已绑定线程的复查间隔从几秒拉长到 60 秒，并暂停 S7 采样与卡顿统计，省电。<b>新启动的应用照样立刻绑定</b>，不受影响。判据依次读 <span class="mono">screen_state</span>、背光实际亮度、背光设定亮度、<span class="mono">dpms</span>；四级都读不到时按亮屏处理，等于本开关不生效。</div>
+<div class="hint">黑屏后少折腾：绑好的线程改成 60 秒看一次，省电。新开的 App 照样马上处理。分辨不出黑屏还是亮屏时，就当亮屏，等于没开。</div>
 </div>
 <div class="card">
 <div class="card-title">前后台降档</div>
@@ -270,7 +272,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <button data-key="foreground_demote" data-val="on" data-on="1">开启</button>
 </div>
 <div class="hint" id="c-demote-state">-</div>
-<div class="hint">应用切到后台时，把<b>没有显式线程规则</b>的线程压到 <span class="mono">e-core</span>，省电。判据优先看系统调度组；组已被我们接管时按 <span class="mono">oom_score_adj ≥ 900</span> 兜底。降档优先于 S7 落点——这类线程不参与 S7 迁簇，避免「降档—迁回大核—再降档」两轮抖动。切回前台后按规则原值重算，不会停在降档值上。</div>
+<div class="hint">App 切到后台后，把它那些没单独指定核的线程挪到小核，省电。切回前台会马上搬回来。</div>
 </div>
 <div class="card">
 <div class="card-title">Auto Assign</div>
@@ -279,7 +281,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <button data-key="auto_assign" data-val="on" data-on="1">开启</button>
 </div>
 <div class="hint" id="c-auto-state">-</div>
-<div class="hint">观察受管应用的线程，按角色给建议（Critical→<span class="mono">hp-core</span>、Latency→<span class="mono">p-core</span>、Worker→<span class="mono">e-core</span>），写入同目录 <span class="mono">AppOpt.autocache.conf</span>，30 天过期。<b>只观察、不改规则</b>：候选在「规则」页顶部，逐条采纳才会写进主配置。线程存活满 60 秒才出现，满 5 分钟标为高置信度；已有同名或通配规则覆盖的线程不再建议。</div>
+<div class="hint">先看看你的游戏都有哪些线程、各自像干什么的，然后给建议。<b>只建议，不替你改</b>：要到「规则」页点同意才生效。线程活满 1 分钟才出现，活满 5 分钟算「比较确定」；已经有规则管到的线程不再建议。</div>
 </div>
 <div class="card">
 <div class="card-title">线程忙闲观察</div>
@@ -293,7 +295,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <button data-key="pmu_alloc" data-val="shadow" data-on="1">配额估算</button>
 </div>
 <div class="hint" id="c-pmu-alloc-state">-</div>
-<div class="hint">看看游戏里每个线程有多忙，用来判断绑核是否合理。硬件计数器用不了时会自动改用 CPU 时间统计。<b>只看不改</b>：不会影响任何绑核结果。<br>配额估算：按忙闲程度估算大核、中核、小核各该承担多少活，再和实际占用对比，告诉你哪一档偏空。<b>只估算，不执行</b>。</div>
+<div class="hint">看看游戏里每个线程有多忙，用来判断绑得合不合理。硬件计数器读不到时会自动改用 CPU 时间。<b>只看不改</b>。<br>配额估算：估算大核、中核、小核各该干多少活，再和实际比一比，告诉你哪层偏空。<b>只估算，不执行</b>。</div>
 </div>
 <div class="card">
 <div class="card-title">RT 实时调度</div>
@@ -303,7 +305,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <button data-rt="per_app">按规则开启</button>
 </div>
 <div class="hint" id="c-rt-state">-</div>
-<div class="hint">在「规则」页点应用右侧的 <b style="color:var(--orange)">RT</b> 按钮即可开启，参数固定为 AsoulOpt 默认：自动挑选 Critical 线程、每应用最多 2 个、RR 时间片 3 ms。全部关闭后内核时间片自动还原。RT 只在该应用的允许核心不超过 2 个时生效。</div>
+<div class="hint">让最关键的线程（画面、主循环）插队先跑。要限量：插队的太多会互相挤。到「规则」页点应用右边的 <b style="color:var(--orange)">RT</b> 就能给这个 App 开。名额、换人速度、点名线程都在下面的「进阶配置」里。全部关掉后会自动恢复正常。</div>
 </div>
 <div class="card">
 <div class="card-title">系统分组</div>
@@ -312,7 +314,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <button data-sysgroup="takeover">强制绑核</button>
 </div>
 <div class="hint" id="c-sysgroup-state">-</div>
-<div class="hint">系统会把应用线程划进 <b>background</b> 等组，该组可用核心不含规则要的大核，此时迁组和绑核都会被内核拒绝（日志记「系统分组」）。<b>尊重</b>：跳过并保留系统限制，省电（默认）。<b>强制绑核</b>（<span class="mono">@sysgroup=takeover</span>）：把线程拉出系统组再绑到目标核，能绑上，但后台应用也会占用大核，待机功耗会上升。</div>
+<div class="hint">系统有时会把 App 分进一个没有大核的组。<b>尊重</b>：不硬闯，等它自己出来，省电（默认）。<b>强制绑核</b>：把线程拉出来再绑上，能绑上，但后台 App 也会占大核，待机更费电。</div>
 </div>
 <div class="card">
 <div class="card-title">接管组归属</div>
@@ -321,30 +323,30 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <button data-key="group" data-val="mask" data-on="0">只写掩码</button>
 </div>
 <div class="hint" id="c-group-state">-</div>
-<div class="hint"><b>接管</b>：首次绑定或规则变更时把线程迁进 <span class="mono">AppOpt/&lt;集合&gt;</span> 组，系统就不会再把亲和性收敛回 <span class="mono">top-app</span>——这是「每分钟被改写上百次」的成因。<b>只写掩码</b>是 2.6.1 的行为，只用于对照排查，长期使用会反复被系统冲掉。</div>
+<div class="hint"><b>接管</b>：把线程放进我们自己的组，系统就不会老是把它搬走（以前每分钟被改上百次就是这个原因）。<b>只写掩码</b>是旧办法，只用来排查问题，久了会被系统冲掉。</div>
 </div>
 <div class="card">
 <div class="card-title">cpuset</div>
 <div class="field"><input id="c-cpuset"><button class="btn" id="c-cpuset-save">保存</button></div>
-<div class="hint">BASE_CPUSET 目录名（当前<span id="c-cpuset-on">未知</span>），修改后规则将重建亲和性目录并重新加载</div>
+<div class="hint">我们自己的组放在哪个目录（当前 <span id="c-cpuset-on">未知</span>）。不懂别改，改完会重建并重新加载。</div>
 </div>
 <div class="card">
 <div class="card-title">规则配置文件</div>
 <div class="field"><input id="c-file"><button class="btn" id="c-file-save">保存</button></div>
-<div class="hint">修改后立即迁移监听并加载新文件，原文件保留</div>
+<div class="hint">规则存在哪个文件。改完马上生效，原文件会留着。</div>
 </div>
 <div class="card">
 <details class="adv" id="c-adv">
 <summary>进阶配置</summary>
 <div class="adv-body">
-<div class="adv-row"><span>每应用 RT 线程上限</span><input id="a-rt-max" type="number" min="1" max="8"></div>
-<div class="adv-row"><span>RR 时间片（ms）</span><input id="a-rt-ts" type="number" min="1" max="100"></div>
-<div class="adv-row"><span>未匹配线程</span><select id="a-unmatched"><option value="keep">keep · 保持原亲和性</option><option value="all">all · 设为全部核心</option></select></div>
+<div class="adv-row"><span>每个 App 最多几个线程优先跑</span><input id="a-rt-max" type="number" min="1" max="8"></div>
+<div class="adv-row"><span>优先跑的线程多久换一次人（毫秒）</span><input id="a-rt-ts" type="number" min="1" max="100"></div>
+<div class="adv-row"><span>未匹配线程</span><select id="a-unmatched"><option value="keep">不管它（保持原样）</option><option value="all">放开到所有核</option></select></div>
 <button class="btn adv-save" id="a-save">保存进阶参数</button>
-<div class="hint">上限只约束自动挑选的线程数；时间片是内核全局参数，仅在至少一个应用启用 RT 时写入，全部关闭后还原。改动这两项不会自动开启 RT。</div>
+<div class="hint">名额只管自动挑的那些线程。换人速度是整个系统共用的，只在有 App 开着 RT 时生效，全关了就恢复原样。改这两项不会自己打开 RT。</div>
 <div class="card-title" style="margin-top:18px">逐应用 RT（<span id="a-rt-count">0</span>）</div>
 <div id="a-rt-apps"></div>
-<div class="hint">对应 <span class="mono">@rt.app=</span>。auto 只挑 Critical 线程；自定义模式按线程名通配（如 <span class="mono">RHI*</span>）。</div>
+<div class="hint">每个 App 单独设置。「自动」只挑最重要的几个线程；也可以在下面「点名」框里写线程名，支持 * 通配（如 <span class="mono">RHI*</span>）。</div>
 </div>
 </details>
 </div>
@@ -361,7 +363,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div id="d-threads"><div class="hint">展开后自动加载</div></div>
 <div class="card-title" style="margin-top:14px">最近事件</div>
 <div id="d-events" class="mono" style="font-size:12px;line-height:1.6;color:var(--sub)">-</div>
-<div class="hint">失败按 errno 分桶：EPERM 多为权限或 SELinux，EINVAL 多为目标集合与 cpuset 无交集。线程表里「期望」是规则结果，「实际」是内核当前值。</div>
+<div class="hint">失败原因分两类：EPERM 多半是权限或安全策略挡住，EINVAL 多半是目标核不在这个组里。线程表里「期望」是规则要的，「实际」是现在真正生效的。</div>
 </div>
 </details>
 </div>
@@ -393,7 +395,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 </div>
 <div class="card">
 <div class="card-title">简介</div>
-<p class="text">AppOpt 是一款 Android 应用 CPU 亲和性管理工具。基于规则配置文件，将指定应用的进程与线程绑定到合适的 CPU 核心（小核省电、大核高性能），配置保存后即时热加载，无需重启应用。</p>
+<p class="text">AppOpt 帮你把 App 的线程放到合适的核心上：小核省电，大核跑得快。规则写在配置文件里，改完立刻生效，不用重启 App。</p>
 </div>
 <div class="card">
 <div class="card-title">使用说明</div>
@@ -682,7 +684,7 @@ async function toggleRt(gi){
   const g=rulesData[gi];if(!g)return;
   try{
     await api('/api/rt/toggle',{pkg:g.pkg,enabled:!g.rt});
-    toast(g.rt?'已关闭 RT':'已开启 RT：自动 · 2 线程 · 3 ms');
+    toast(g.rt?'已关掉优先跑':'已开启优先跑：自动挑 2 个线程，3 ms 换人');
     loadRules();loadCfg();
   }catch(e){toast(e.message)}
 }
@@ -694,7 +696,7 @@ function grpInner(g,gi){
 ${g.bl?'<span class="rule-sub" style="color:var(--orange)">黑名单·不管理</span>':''}
 ${g.ex?'<span class="rule-sub">豁免·不抢组</span>':''}
 <span class="grp-count">${g.items.length}</span>
-<button class="rt-btn ${g.rt?'on':''}" data-rtpkg="${gi}" title="${g.rt?'关闭 RT':'为该应用开启 RT（自动挑选 Critical 线程，最多 2 个）'}">RT</button>
+<button class="rt-btn ${g.rt?'on':''}" data-rtpkg="${gi}" title="${g.rt?'关掉优先跑':'给这个 App 的关键线程开优先跑'}">RT</button>
 <button class="icon-btn" data-editapp="${gi}" title="编辑应用">${ICO_EDIT}</button>
 <button class="icon-btn danger" data-delpkg="${gi}" title="删除该应用全部规则">${ICO_TRASH}</button>
 </div>
@@ -987,28 +989,28 @@ async function loadCfg(){
     $('c-cpuset').value=d.cpuset_name;
     $('c-file').value=d.config_file;
     $('c-cpuset-on').textContent=d.cpuset_enabled?'已启用':'不可用';
-    $('c-unmatched').textContent=d.unmatched==='all'?'all（未命中规则的线程设为全部核心）':'keep（未命中规则的线程保持原亲和性）';
+    $('c-unmatched').textContent=d.unmatched==='all'?'放开到所有核（没写规则的线程）':'保持原样（没写规则的线程）';
     $('c-cross').textContent=d.cluster_levels<2?'不适用（当前识别为 '+d.cluster_levels+' 个核心层）':d.cross_rules+' / '+d.rules_total+' 条，'+d.cross_pkgs+' 个包';
     $('c-rt').textContent=d.rt||'off';
     const sc=d.screen==='relax'?'relax':'off';
     setSeg('seg-screen',sc);
     $('c-screen-state').textContent=sc==='relax'
-      ?'当前：开启 · 息屏后复查降到 60 秒，S7 与卡顿采样暂停'
-      :'当前：关闭 · 息屏与亮屏按同一节奏复核';
+      ?'当前：开启 · 黑屏后放慢复查，省电'
+      :'当前：关闭 · 亮屏黑屏一个节奏';
     const gp=d.group==='mask'?'mask':'own';
     setSeg('seg-group',gp);
     $('c-group-state').textContent=gp==='own'
-      ?'当前：接管组归属 · 迁入 AppOpt 组后不再被系统收敛'
-      :'当前：只写掩码 · 2.6.1 行为，可能被系统反复冲掉';
+      ?'当前：接管 · 线程放进我们自己的组，不会被系统搬走'
+      :'当前：只写掩码（旧办法）· 可能被系统反复冲掉';
     const dm=d.demote?'on':'off';
     setSeg('seg-demote',dm);
     $('c-demote-state').textContent=dm==='on'
-      ?'当前：开启 · 后台线程压到 e-core，切回前台按规则恢复'
-      :'当前：关闭 · 前后台使用同一套规则';
+      ?'当前：开启 · 后台线程挪到小核，切回前台搬回来'
+      :'当前：关闭 · 前后台一样';
     const aa=d.auto_assign?'on':'off';
     setSeg('seg-auto',aa);
     $('c-auto-state').textContent=aa==='on'
-      ?'当前：开启 · 候选写入 AppOpt.autocache.conf，规则页可采纳'
+      ?'当前：观察中 · 建议存在 autocache 文件里，规则页可以采纳'
       :'当前：关闭 · 不观察线程';
     const pm=d.pmu?'observe':'off';
     setSeg('seg-pmu',pm);
@@ -1023,16 +1025,16 @@ async function loadCfg(){
     const sg=d.sysgroup==='takeover'?'takeover':'respect';
     document.querySelectorAll('#seg-sysgroup button').forEach(b=>b.classList.toggle('on',b.dataset.sysgroup===sg));
     $('c-sysgroup-state').textContent=sg==='takeover'
-      ?'当前：强制绑核 · 后台线程也会被拉上大核，待机功耗可能上升'
-      :'当前：尊重系统分组 · 后台线程留在系统给定的小核';
+      ?'当前：强制绑核 · 后台线程也会上大核，待机更费电'
+      :'当前：尊重系统分组 · 后台线程留在系统给的小核';
     const sm=['off','shadow','on'][d.sched_mode]||'off';
     document.querySelectorAll('#seg-sched button').forEach(b=>b.classList.toggle('on',b.dataset.sched===sm));
     $('c-sched-state').textContent=(()=>{
-      if(sm==='off')return '已关闭 · 不采样、不产生系统调用';
+      if(sm==='off')return '已关闭';
       const load=(d.sched_load||[]).map(v=>v<0?'-':Math.round(v/10)+'%').join(' / ');
-      const st=sm==='shadow'?'观察中（只记录，不改亲和性）':'已开启';
-      if(d.cluster_levels<2)return st+'，但核心层仅 '+d.cluster_levels+' 个，不会生效';
-      return st+' · 采样 '+d.sched_ticks+' 轮 · 本可迁移 '+d.sched_would+' · 已迁移 '+d.sched_moved
+      const st=sm==='shadow'?'观察中（只记录，不动手）':'已开启';
+      if(d.cluster_levels<2)return st+'，但只有 '+d.cluster_levels+' 层核，用不上';
+      return st+' · 可挪 '+d.sched_would+' · 已挪 '+d.sched_moved
         +(d.sched_failed?' · 失败 '+d.sched_failed:'')
         +(d.sched_bounced?' · 拦回弹 '+d.sched_bounced:'')
         +(d.sched_frozen?' · 已冻结 '+d.sched_frozen:'')
@@ -1167,9 +1169,8 @@ async function loadRt(){
     const cur=d.timeslice_current==null?'不可读':d.timeslice_current+' ms';
     const n=(d.apps||[]).filter(a=>a.enabled).length;
     const t=(d.threads||[]).length;
-    $('c-rt-state').textContent=(d.mode==='global'?'全部应用模式（来自手工配置） · ':'')
-      +'已开启 '+n+' 个应用 · 当前 RT 线程 '+t+' · 内核时间片 '+cur
-      +(d.timeslice_applied==null?'（未改写）':'（已改写为 '+d.timeslice_applied+' ms）');
+    $('c-rt-state').textContent=(d.mode==='global'?'全部应用（手工配置） · ':'')
+      +'已开 '+n+' 个应用 · 正在优先跑 '+t+' 个线程 · 换人间隔 '+cur;
     renderRtApps(d);
   }catch(e){toast(e.message)}
 }
@@ -1192,8 +1193,11 @@ function renderRtApps(d){
 <button class="icon-btn danger" data-rtdel="${esc(a.pkg)}" title="删除该条目">${ICO_TRASH}</button>
 </div>
 <div class="rt-sub">
-<span class="mode">${esc(m)}</span>
-<label>上限<input type="number" min="1" max="8" value="${a.max}" data-rtmax="${esc(a.pkg)}"></label>
+<span class="mode">${a.mode==='auto'?'自动挑最重要的线程':'按名字点名'}</span>
+<label>名额<input type="number" min="1" max="8" value="${a.max}" data-rtmax="${esc(a.pkg)}"></label>
+</div>
+<div class="rt-sub">
+<input class="rt-names" data-rtnames="${esc(a.pkg)}" placeholder="点名线程：留空=自动，多个用逗号，支持 *，如 RenderThread,RHI*" value="${a.mode==='names'?esc((a.patterns||[]).join(',')):''}">
 </div>
 </div>`;
   }).join('');
@@ -1211,10 +1215,20 @@ $('a-rt-apps').addEventListener('click',e=>{
   if(del)putRt(del.dataset.rtdel,{delete:true});
 });
 $('a-rt-apps').addEventListener('change',e=>{
+  const nm=e.target.closest('[data-rtnames]');
+  if(nm){
+    const raw=nm.value.trim();
+    const pats=raw?raw.split(/[,，\s]+/).filter(Boolean):[];
+    const cur=(rtCache&&rtCache.apps||[]).find(x=>x.pkg===nm.dataset.rtnames)||{};
+    // 留空且本来就是自动：不发请求，免得每次失焦都写一遍配置
+    if(!pats.length&&cur.mode==='auto')return;
+    if(pats.some(x=>x.length>64)){toast('线程名太长');return loadCfg()}
+    return putRt(nm.dataset.rtnames, pats.length?{mode:'names',patterns:pats}:{mode:'auto',patterns:[]});
+  }
   const inp=e.target.closest('[data-rtmax]');
   if(!inp)return;
   const n=+inp.value;
-  if(!(n>=1&&n<=8)){toast('上限需在 1-8 之间');return loadCfg()}
+  if(!(n>=1&&n<=8)){toast('名额需在 1-8 之间');return loadCfg()}
   putRt(inp.dataset.rtmax,{max:n});
 });
 document.querySelectorAll('#seg-sched button').forEach(b=>b.onclick=async()=>{
