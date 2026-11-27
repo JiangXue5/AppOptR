@@ -226,11 +226,14 @@ mod tests {
         let pid = child.id() as i32;
         let got = comm_to_pkg(pid, "com.test.applic", &cfg);
         if got.is_none() {
-            // 这条在本地一直过、CI 上挂过一次。失败时把判据摊开，省得下次
-            // 只看到 None 又去猜：是 cmdline 读不到、属主校验拦了，还是配置里没这个包
+            // 这条在本地一直过、CI 上挂过两次。失败时把判据摊开，省得下次
+            // 只看到 None 又去猜：是进程已经没了、cmdline 读不到、
+            // 属主校验拦了，还是配置里根本没这个包
+            let alive = child.try_wait().ok().flatten();
             eprintln!(
-                "诊断 pid={} comm={:?} cmdline={:?} uid={:?} pkgs={:?}",
+                "诊断 pid={} 已退出={:?} comm={:?} cmdline={:?} uid={:?} pkgs={:?}",
                 pid,
+                alive,
                 crate::apply_affinity::tid_comm(pid),
                 crate::apply_affinity::read_cmdline(pid),
                 crate::apply_affinity::proc_uid(pid),

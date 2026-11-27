@@ -1453,14 +1453,14 @@ mod tests {
     fn shadow_never_touches_real_affinity() {
         let (handle, tid) = spawn_named("Thread-7");
         let t = topo();
+        // 这条会真的调 sched_setaffinity，掩码必须是本机存在的核：
+        // 假拓扑里的 4-7 在 4 核 CI 机器上不存在，内核直接 EINVAL。
+        // 取前 8 个里真实在线的核，本地 8 核以上与原值一致
         let mut allowed = CpuSet::new();
-        allowed.or(&t.p_core);
-        allowed.or(&t.hp_core);
-        if allowed.count() == 0 {
-            // 4 核的 CI 机器只有一个簇，没有 p-core / hp-core 之分。
-            // 这条测的是「shadow 只判定、不动真实亲和性」，与核的档位无关，
-            // 退化成全部核照样成立；本地 8 核以上仍按原样走
-            allowed.or(&t.present_cpus);
+        for c in 0..8 {
+            if crate::cpuset::cpu_is_online(c) {
+                allowed.set(c);
+            }
         }
         let conf = format!("com.test.game={}\n", allowed.to_range_string());
         assert_eq!(
