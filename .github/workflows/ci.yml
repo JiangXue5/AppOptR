@@ -120,14 +120,18 @@ jobs:
 
   release:
     name: 发布
-    # 只有 tag 才发版；PR 与普通 push 到这一步就结束
-    if: startsWith(github.ref, 'refs/tags/v')
+    # 只有正式版才发 Release。测试版（tag 里带 -beta）只出构建产物，
+    # 去 Actions 页面下载——Release 列表留给能长期用的版本
+    if: ${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-beta') }}
     needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          # 浅克隆推不到 Gitee：对方会以 shallow update not allowed 拒掉
+          fetch-depth: 0
 
       - name: 取回产物
         uses: actions/download-artifact@v4
@@ -153,10 +157,14 @@ jobs:
             echo "未配置 GITEE_TOKEN，跳过"
             exit 0
           fi
-          # Gitee 建 Release 要求 tag 已存在。这里只推 tag，不碰分支：
-          # 分支上是历史提交，自动覆盖容易和手动提交打架
-          git push "https://oauth2:${GITEE_TOKEN}@gitee.com/JiangXue_2004/AppOptR.git" \
-            "HEAD:refs/tags/${GITHUB_REF_NAME}"
+          remote="https://oauth2:${GITEE_TOKEN}@gitee.com/JiangXue_2004/AppOptR.git"
+          # 手动推过就在了，重复推会被 non-fast-forward 拒掉；先问一声
+          if git ls-remote --tags "$remote" "refs/tags/${GITHUB_REF_NAME}" | grep -q .; then
+            echo "Gitee 已有 ${GITHUB_REF_NAME}，无需再推"
+            exit 0
+          fi
+          # 只推 tag，不碰分支：分支上是历史提交，自动覆盖容易和手动提交打架
+          git push "$remote" "HEAD:refs/tags/${GITHUB_REF_NAME}"
 
       - name: 发布
         env:

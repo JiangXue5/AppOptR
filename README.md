@@ -59,8 +59,11 @@ http://appopt.suto.top
 | 触发 | 做什么 | 产物 |
 |------|--------|------|
 | push 到 `experimental` | 格式、clippy、单测，再构建两个架构 | Actions 页面 → 该次运行 → Artifacts，保留 14 天 |
-| push tag `v*` | 同上，并自动发版到 GitHub / Gitee | Release 附件 |
+| 测试版 tag（`v*-beta*`） | 同上，不发 Release | Artifacts |
+| 正式版 tag（如 `v2.7.0`） | 同上，再发版到 GitHub / Gitee | Release 附件 |
 | PR / 手动触发 | 只做检查与构建，不发版 | Artifacts |
+
+Release 列表只留正式版；测试版的包都在 Actions 的 Artifacts 里，14 天后自动清理。
 
 `master` 是 2.6.x 稳定线，暂未带这套工作流；2.7 的改动都在 `experimental` 上。
 
@@ -71,13 +74,13 @@ git commit -am "fix: ..." && git push github HEAD
 # 等 CI 绿了，去 Actions 页面下载 AppOpt-<sha> 里的 zip 装机验证
 ```
 
-发版就打 tag，两个平台一起出包：
+要发正式版才打 tag：
 
 ```sh
 # 1. 改三处版本号（AppOpt/Cargo.toml、AppOpt/Cargo.lock、module/module.prop）
 #    再在 CHANGELOG.md 写一节 ## <版本>（日期），CI 会拿它当 Release 正文
-# 2. 推 tag，剩下交给 CI
-git tag -a v2.7.0-beta31 -m "2.7.0-beta31: ..." && git push github v2.7.0-beta31
+# 2. 打不带 -beta 的 tag，剩下交给 CI
+git tag -a v2.8.0 -m "2.8.0: ..." && git push github v2.8.0
 ```
 
 CI 在发版前会核对三件事，不一致就直接失败，不会发出一个版本号对不上的包：

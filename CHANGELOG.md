@@ -10,10 +10,11 @@
 - 加 GitHub Actions（`.github/workflows/ci.yml`）：推 `master` / `experimental`
   自动跑格式、clippy、单测，再构建 `arm64-v8a` 与 `x86_64` 两个包，产物挂在
   Actions 页面的 Artifacts 里，保留 14 天
-- 推 `v*` tag 自动发版：构建完先核对三件事——tag 与 `module.prop` 版本一致、
-  `CHANGELOG` 有这一节、两个包里都带着对应 ABI 的 `AppOpt-ebpf`——再建
-  GitHub / Gitee Release 并传包，顺手把 tag 推到 Gitee（Gitee 建 Release
-  要求 tag 已存在）
+- 推**正式版** tag（不带 `-beta`）自动发版：构建完先核对三件事——tag 与
+  `module.prop` 版本一致、`CHANGELOG` 有这一节、两个包里都带着对应 ABI 的
+  `AppOpt-ebpf`——再建 GitHub / Gitee Release 并传包，顺手把 tag 推到 Gitee
+  （Gitee 建 Release 要求 tag 已存在）。测试版 tag 与前缀相同的普通 push
+  只出构建产物，去 Actions 的 Artifacts 下载，不占 Release 列表
 - `tools/release.py` 的令牌改为环境变量优先（`GITHUB_TOKEN` / `GITEE_TOKEN`），
   读不到再回落 `~/.git-credentials`。CI 里没有凭证文件，顺序反了就只能把令牌塞进仓库
 - 构建机用 bpf-linker 的预编译包（静态链接 LLVM），省掉十几分钟源码编译；
