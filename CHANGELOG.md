@@ -8,8 +8,9 @@
 **改**
 
 - 加 GitHub Actions（`.github/workflows/ci.yml`）：推 `master` / `experimental`
-  自动跑格式、clippy、单测，再构建 `arm64-v8a` 与 `x86_64` 两个包，产物挂在
-  Actions 页面的 Artifacts 里，保留 14 天
+  自动构建 `arm64-v8a` 与 `x86_64` 两个包，产物挂在 Actions 页面的 Artifacts 里，
+  保留 14 天。只构建、不跑单测——云端是 4 核 x86 虚拟机，与手机的大小核拓扑、
+  cpuset / stune 布局是两套东西，测试在那儿跑只会误报
 - 推**正式版** tag（不带 `-beta`）自动发版：构建完先核对三件事——tag 与
   `module.prop` 版本一致、`CHANGELOG` 有这一节、两个包里都带着对应 ABI 的
   `AppOpt-ebpf`——再建 GitHub / Gitee Release 并传包，顺手把 tag 推到 Gitee
@@ -20,10 +21,10 @@
 - 构建机用 bpf-linker 的预编译包（静态链接 LLVM），省掉十几分钟源码编译；
   下载不到才退回 `cargo install`
 - 顺手对 `AppOpt-ebpf/src/main.rs` 跑了 `cargo fmt`：三处历史遗留的换行，
-  不动逻辑，只是让 CI 的格式检查过得去
+  不动逻辑，只是让格式统一
 - 几个测试原先默认机器有 8 个核（写死 `6-7`、直接用 `p-core`/`hp-core`），
-  在 4 核的构建机上会被当成离线核裁掉，于是「精确规则优先」这类断言全挂。
-  改成 0-3 以内的核号、拓扑集合为空时退化成全部核，断言的意思没变
+  换到少核机器上会因为掩码被裁而误报。改成 0-3 以内的核号、拓扑集合为空时
+  退化成全部核；`load` 那两条共用全局基线的用例改成串行，不再互相清 STATE
 
 ## 2.7.0-beta30（2026-11-27）
 

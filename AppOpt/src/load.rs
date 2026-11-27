@@ -152,10 +152,15 @@ intr 12345
         assert_eq!(v[0], (75, 580));
     }
 
+    /// `STATE` 是进程级全局量：两条用例并行时，一条在两次采样之间被
+    /// 另一条清掉基线，第二次读到的就是「首次采样」的 -1。串行执行
+    static STATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// 首次调用只有基线，必须返回「未知」而不是 0——
     /// 面板把 0 画成空簇，等于把「还没测」说成「没人用」
     #[test]
     fn first_call_is_unknown() {
+        let _serial = lock_ignore_poison(&STATE_TEST_LOCK);
         *lock_ignore_poison(&STATE) = None;
         let topo = CpuTopology::empty();
         assert_eq!(util(&topo), [-1; 3]);
@@ -164,6 +169,7 @@ intr 12345
     /// 真机形态：两次采样之间烧 CPU，util 必须落在合理区间且不超过 100
     #[test]
     fn util_tracks_real_activity() {
+        let _serial = lock_ignore_poison(&STATE_TEST_LOCK);
         *lock_ignore_poison(&STATE) = None;
         let mut topo = CpuTopology::empty();
         topo.e_core = CpuSet::new();

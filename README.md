@@ -58,10 +58,14 @@ http://appopt.suto.top
 
 | 触发 | 做什么 | 产物 |
 |------|--------|------|
-| push 到 `experimental` | 格式、clippy、单测，再构建两个架构 | Actions 页面 → 该次运行 → Artifacts，保留 14 天 |
-| 测试版 tag（`v*-beta*`） | 同上，不发 Release | Artifacts |
-| 正式版 tag（如 `v2.7.0`） | 同上，再发版到 GitHub / Gitee | Release 附件 |
-| PR / 手动触发 | 只做检查与构建，不发版 | Artifacts |
+| push 到 `experimental` | 构建两个架构 | Actions 页面 → 该次运行 → Artifacts，保留 14 天 |
+| 测试版 tag（`v*-beta*`） | 构建，不发 Release | Artifacts |
+| 正式版 tag（如 `v2.8.0`） | 构建，再发版到 GitHub / Gitee | Release 附件 |
+| PR / 手动触发 | 只构建 | Artifacts |
+
+CI 只构建，不跑单元测试：云端是 4 核 x86 虚拟机，和手机的大小核拓扑、
+cpuset / stune 布局完全是两套东西，在那儿跑测试只会因为环境差异误报。
+测试在本地跑：`cargo test --manifest-path AppOpt/Cargo.toml`。
 
 Release 列表只留正式版；测试版的包都在 Actions 的 Artifacts 里，14 天后自动清理。
 

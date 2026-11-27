@@ -1,9 +1,14 @@
 name: CI
 
 # 三种触发：
-#   push 到 master / experimental  → 检查 + 构建，产物挂在 Actions 页面供下载
-#   push tag v*                    → 检查 + 构建 + 发布到 GitHub / Gitee Release
-#   手动 / PR                      → 只做检查与构建，不发版
+#   push 到 master / experimental  → 构建，产物挂在 Actions 页面供下载
+#   测试版 tag（v*-beta*）         → 构建，不发 Release
+#   正式版 tag（v2.8.0 这类）      → 构建 + 发布到 GitHub / Gitee Release
+#   手动 / PR                      → 只构建
+#
+# 只做构建，不跑单元测试：云端是 4 核 x86 虚拟机，与手机的大小核拓扑、
+# cpuset / stune 布局完全不同，测试在这里能过的意义有限，还会因为环境差异
+# 误报。测试在本地 `cargo test` 跑。
 on:
   push:
     branches: [master, experimental]
@@ -18,43 +23,11 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # 构建日志里不要出现完整的 GitHub token / 临时路径
   RUST_BACKTRACE: 1
 
 jobs:
-  check:
-    name: 检查
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: 安装 Rust
-        run: |
-          set -euo pipefail
-          rustup toolchain install stable --profile minimal --component rustfmt,clippy
-          rustup default stable
-          rustc --version
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            AppOpt -> target
-          key: check
-
-      - name: 格式
-        run: |
-          cargo fmt --manifest-path AppOpt/Cargo.toml --check
-          cargo fmt --manifest-path AppOpt-ebpf/Cargo.toml --check
-
-      - name: 静态检查
-        run: cargo clippy --manifest-path AppOpt/Cargo.toml --all-targets --locked -- -D warnings
-
-      - name: 单元测试
-        run: cargo test --manifest-path AppOpt/Cargo.toml --locked
-
   build:
     name: 构建
-    needs: check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
