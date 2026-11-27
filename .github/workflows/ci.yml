@@ -2,8 +2,8 @@ name: CI
 
 # 三种触发：
 #   push 到 master / experimental  → 构建，产物挂在 Actions 页面供下载
-#   测试版 tag（v*-beta*）         → 构建，不发 Release
-#   正式版 tag（v2.8.0 这类）      → 构建 + 发布到 GitHub / Gitee Release
+#   测试版 tag（v*-beta*）         → 构建 + 发 GitHub / Gitee Release（预发布）
+#   正式版 tag（v2.8.0 这类）      → 构建 + 发 GitHub / Gitee Release
 #   手动 / PR                      → 只构建
 #
 # 只做构建，不跑单元测试：云端是 4 核 x86 虚拟机，与手机的大小核拓扑、
@@ -95,9 +95,9 @@ jobs:
 
   release:
     name: 发布
-    # 只有正式版才发 Release。测试版（tag 里带 -beta）只出构建产物，
-    # 去 Actions 页面下载——Release 列表留给能长期用的版本
-    if: ${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-beta') }}
+    # 正式版和测试版都发：测试版标 prerelease（版本号带连字符时由
+    # tools/release.py 自动判断），Release 列表里一眼能分开
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
     needs: build
     runs-on: ubuntu-latest
     permissions:

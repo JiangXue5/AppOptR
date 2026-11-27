@@ -23,7 +23,11 @@ use crate::rule_match::{comm_to_pkg, thread_affinity};
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct TaskIdentity {
     pub tid: i32,
-    pub pid: i32,
+    /// 线程组 ID，也就是进程的 PID。`/proc/<tid>/stat` 的第一列给的是
+    /// 线程自己的号（TGID 只有主线程才等于它），所以这里单独从
+    /// `/proc/<tid>/status` 的 `Tgid:` 取。0 表示没读——热路径只读 stat，
+    /// 多一次 open 只为清账不合算
+    pub tgid: i32,
     pub start_time: u64,
 }
 
@@ -102,6 +106,23 @@ pub fn identity_of(tid: i32) -> Option<TaskIdentity> {
     parse_stat(tid, &raw)
 }
 
+/// 连 TGID 一起读。多一次 open，只给「登记账本」「启动对账」这类
+/// 一次性路径用；每轮校验只要 starttime，用 `identity_of` 就够
+fn identity_full(tid: i32) -> Option<TaskIdentity> {
+    let mut id = identity_of(tid)?;
+    id.tgid = read_tgid(tid).unwrap_or(0);
+    Some(id)
+}
+
+/// `/proc/<tid>/status` 的 `Tgid:` 一行
+fn read_tgid(tid: i32) -> Option<i32> {
+    let raw = fs::read_to_string(format!("/proc/{}/status", tid)).ok()?;
+    raw.lines().find_map(|l| {
+        l.strip_prefix("Tgid:")
+            .and_then(|v| v.trim().parse::<i32>().ok())
+    })
+}
+
 fn parse_stat(tid: i32, raw: &str) -> Option<TaskIdentity> {
     let open = raw.find('(')?;
     let close = raw.rfind(')')?;
@@ -109,12 +130,19 @@ fn parse_stat(tid: i32, raw: &str) -> Option<TaskIdentity> {
         return None;
     }
     let pid: i32 = raw.get(..open)?.trim().parse().ok()?;
+    // 第一列是线程自己的号。和请求的号不一致说明中途被复用/退出了，
+    // 拿这份数据去对账会把新线程当成旧线程
+    if pid != tid {
+        return None;
+    }
     let rest = raw.get(close + 1..)?;
     // `)` 之后第一个字段是 state（第 3 列），starttime 是第 22 列 → nth(19)
     let start_time: u64 = rest.split_whitespace().nth(19)?.parse().ok()?;
     Some(TaskIdentity {
         tid,
-        pid,
+        // stat 里没有 TGID，只有线程自己的号。调用方要 TGID 时用
+        // `identity_full` 补，这里留 0 表示未知
+        tgid: 0,
         start_time,
     })
 }
@@ -131,7 +159,7 @@ pub fn note_managed(
     applied: &CpuSet,
     cpuset_dir: &str,
 ) {
-    let Some(identity) = identity_of(tid) else {
+    let Some(identity) = identity_full(tid) else {
         return;
     };
     with_ledger(|l| {
@@ -186,10 +214,14 @@ pub fn forget(tid: i32) {
 }
 
 /// 进程退出：它名下的线程全都不会再回来，按 tgid 一并清掉。
-/// 只删 tid 不够：进程退出事件的时机可能早于线程退出事件被消费
+/// 只删 tid 不够：进程退出事件的时机可能早于线程退出事件被消费。
+///
+/// 账本里存的是线程自己的号（TID），不是进程号，所以必须比 `tgid`：
+/// 以前比的是从 stat 第一列读出的「pid」，那其实还是 TID，一个进程只有
+/// 主线程能匹配上，其余线程的账要等下一轮扫描才发现线程没了
 pub fn forget_pid(pid: i32) {
     with_ledger(|l| {
-        l.retain(|_, m| m.identity.pid != pid);
+        l.retain(|_, m| m.identity.tgid != pid && m.identity.tid != pid);
     });
 }
 
@@ -199,7 +231,7 @@ pub fn managed_count() -> usize {
 }
 
 /// 处于 RecoveryRequired 的线程数
-fn recovery_required() -> usize {
+pub fn recovery_required() -> usize {
     with_ledger(|l| {
         l.values()
             .filter(|m| m.state == ManagedState::RecoveryRequired)
@@ -233,15 +265,24 @@ fn judge(
     let Some(id) = now else {
         return Verdict::Drop("线程已退出");
     };
-    // starttime 与 tgid 都要对：只比 tid 会把复用的号当成同一线程
-    if id.start_time != rec.identity.start_time || id.pid != rec.identity.pid {
+    // starttime 是同一性判据：tid 由账本键保证已相同，只有它能把
+    // 「同一个号」区分成「同一个线程」
+    if id.start_time != rec.identity.start_time {
         return Verdict::Drop("tid 已被复用");
     }
     if still_managed && !force {
         return Verdict::Keep;
     }
+    // 之前恢复失败的记录不参与「什么都没留下」的判定：组和亲和性都不在
+    // 我们手里，只能说明系统在这期间改写过，不能说明原值不用还原了。
+    // 按 Drop 处理等于把恢复依据连同记录一起扔掉，线程永远停在限制里
+    let recovering = rec.state == ManagedState::RecoveryRequired;
     let Some(path) = cgroup else {
-        return Verdict::Drop("读不到 cgroup");
+        return if recovering {
+            Verdict::Hold("读不到 cgroup，稍后重试")
+        } else {
+            Verdict::Drop("读不到 cgroup")
+        };
     };
     let in_own = classify_group(path) == SysGroup::Own;
     // `ours` 只用来判断「我们有没有在这条线程上留下痕迹」，不再作为
@@ -249,7 +290,7 @@ fn judge(
     // 亲和性是常态（切后台收敛、热插拔、厂商 HAL）。留下的限制一律撤销
     let ours = affinity.is_none_or(|cur| cur == rec.last_applied_affinity);
     // 组与亲和性都不在我们手里：没留下任何限制，连记录一起清掉
-    if !in_own && !ours {
+    if !in_own && !ours && !recovering {
         return Verdict::Drop("组与亲和性都不在我们手里");
     }
     if in_own {
@@ -313,9 +354,26 @@ fn restore(rec: &ManagedTask, in_own: bool) -> Result<(), (i32, &'static str)> {
     }
     // 原亲和性读不到（空集合）就交给系统按组重新给，不猜一个集合写进去。
     // 读到就写：不管当前值是不是我们留下的，都按原值覆盖——系统改写过的
-    // 掩码同样要还原，这是「删除规则即解除限制」的一部分
+    // 掩码同样要还原，这是「删除规则即解除限制」的一部分。
+    //
+    // 写失败必须往上抛：以前这里是 `let _ =`，写不进去也返回成功，外层
+    // 随即删掉账本，这条线程就再也回不到接管前的集合了。线程已退出
+    // （ESRCH）不算失败，下一轮身份检查会把它清掉
     if rec.original_affinity.count() > 0 {
-        let _ = rec.original_affinity.set_affinity(rec.identity.tid);
+        rec.original_affinity
+            .set_affinity(rec.identity.tid)
+            .map_err(|e| {
+                let errno = e.raw_os_error().unwrap_or(0);
+                if errno == libc::ESRCH {
+                    (errno, "线程已退出")
+                } else if errno == libc::EINVAL {
+                    (errno, "原集合与当前可用核没有交集")
+                } else if errno == libc::EPERM || errno == libc::EACCES {
+                    (errno, "恢复亲和性被拒（权限）")
+                } else {
+                    (errno, "恢复亲和性失败")
+                }
+            })?;
     }
     Ok(())
 }
@@ -444,6 +502,20 @@ fn note_why(list: &mut Vec<(&'static str, usize)>, reason: &'static str) {
     }
 }
 
+/// 上一次打过的失败/待恢复签名。待恢复记录按周期重试，同一个失败会反复
+/// 走到这里；日志只在「状态变了」时打一行，否则 30 秒一条会盖住别的事件
+static LAST_WARN: Mutex<Option<String>> = Mutex::new(None);
+
+/// 签名与上次不同才返回 true，并记下这一次
+fn first_time(key: String) -> bool {
+    let mut g = lock_ignore_poison(&LAST_WARN);
+    if g.as_deref() == Some(key.as_str()) {
+        return false;
+    }
+    *g = Some(key);
+    true
+}
+
 fn report(
     rep: &ReleaseReport,
     samples: Vec<String>,
@@ -452,6 +524,8 @@ fn report(
     force: bool,
 ) {
     if rep.released > 0 {
+        // 有线程真正还回去了，说明状态在好转：清掉签名，下次再失败要重新报
+        *lock_ignore_poison(&LAST_WARN) = None;
         crate::diag::tag(
             "事件",
             &format!(
@@ -472,16 +546,19 @@ fn report(
         );
     }
     if rep.failed > 0 {
-        crate::diag::tag(
-            "警告",
-            &format!(
-                "{} 个线程无法安全释放（账本共 {} 条），保持现状不猜原组：{}{}",
-                rep.failed,
-                managed_count(),
-                held.join("、"),
-                if rep.failed > held.len() { " 等" } else { "" }
-            ),
-        );
+        let key = format!("f:{}:{}", rep.failed, held.join("、"));
+        if first_time(key) {
+            crate::diag::tag(
+                "警告",
+                &format!(
+                    "{} 个线程无法安全释放（账本共 {} 条），保持现状留待重试：{}{}",
+                    rep.failed,
+                    managed_count(),
+                    held.join("、"),
+                    if rep.failed > held.len() { " 等" } else { "" }
+                ),
+            );
+        }
     }
     if rep.dropped > 0 {
         let detail = why
@@ -495,7 +572,7 @@ fn report(
         );
     }
     let pending = recovery_required();
-    if pending > 0 && rep.failed == 0 {
+    if pending > 0 && rep.failed == 0 && first_time(format!("p:{}", pending)) {
         crate::diag::tag(
             "警告",
             &format!(
@@ -540,16 +617,19 @@ pub fn sweep_orphans(cfg: &AppConfig) -> OrphanReport {
             };
             // 内核在任务退出时会把 tid 从 tasks 里摘掉，读到不存在的号说明
             // 是两次读之间的窗口，跳过即可
-            let Some(id) = identity_of(tid) else {
+            let Some(id) = identity_full(tid) else {
                 continue;
             };
             rep.found += 1;
             let comm = tid_comm(tid).unwrap_or_default();
             // 主线程的 comm 会被内核截到 15 字节，直接和包名比会漏掉长包名；
-            // `comm_to_pkg` 带截断键与属主校验，是现成的正确判据
-            let pkg = read_cmdline(id.pid)
+            // `comm_to_pkg` 带截断键与属主校验，是现成的正确判据。
+            // cmdline 属于进程，必须用 TGID 读：拿 TID 去读工作线程，
+            // 内核给的是空的，长包名就永远认不出来
+            let owner = if id.tgid > 0 { id.tgid } else { id.tid };
+            let pkg = read_cmdline(owner)
                 .filter(|p| cfg.pkgs.contains(p))
-                .or_else(|| comm_to_pkg(id.pid, &comm, cfg));
+                .or_else(|| comm_to_pkg(owner, &comm, cfg));
             let still = pkg
                 .as_ref()
                 .is_some_and(|p| thread_affinity(p, &comm, cfg).is_some());
@@ -626,11 +706,27 @@ mod tests {
         parse_cpu_ranges(spec, None)
     }
 
+    /// 起一条常住线程，返回它的 tid。恢复失败要靠真实线程才能触发
+    /// （`sched_setaffinity` 只认真实存在的号）
+    fn spawn_named(name: &str) -> (std::thread::JoinHandle<()>, i32) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::Builder::new()
+            .name(name.to_string())
+            .spawn(move || {
+                let tid = unsafe { libc::syscall(libc::SYS_gettid) as i32 };
+                tx.send(tid).expect("回传 tid");
+                std::thread::park();
+            })
+            .expect("起线程");
+        let tid = rx.recv().expect("拿 tid");
+        (handle, tid)
+    }
+
     fn rec(orig: Option<&str>, applied: &str, aff: &CpuSet) -> ManagedTask {
         ManagedTask {
             identity: TaskIdentity {
                 tid: 42,
-                pid: 42,
+                tgid: 42,
                 start_time: 9_000,
             },
             comm: "UnityMain".to_string(),
@@ -648,7 +744,6 @@ mod tests {
     fn stat_parses_comm_with_spaces_and_parens() {
         let raw = "1234 (Web Content (x)) S 1 1234 1234 0 -1 4194560 100 0 0 0 10 20 0 0 20 0 1 0 987654 0 0";
         let id = parse_stat(1234, raw).expect("应能解析");
-        assert_eq!(id.pid, 1234);
         assert_eq!(id.start_time, 987_654);
         assert_eq!(id.tid, 1234);
     }
@@ -667,9 +762,9 @@ mod tests {
         let tid = unsafe { libc::syscall(libc::SYS_gettid) as i32 };
         let id = identity_of(tid).expect("读自身 stat 失败");
         assert_eq!(id.tid, tid);
-        // 只有主线程 tgid == tid；测试线程并行执行时两者不同，不能直接比
-        assert!(id.pid > 0);
         assert!(id.start_time > 0);
+        // identity_of 只读 stat，TGID 留空；要 TGID 的路径用 identity_full
+        assert_eq!(id.tgid, 0);
     }
 
     /// tid 被复用：只删记录，绝不按旧账去动新线程
@@ -678,7 +773,7 @@ mod tests {
         let r = rec(Some("/top-app"), "4-6", &set("4-6"));
         let fresh = TaskIdentity {
             tid: 42,
-            pid: 42,
+            tgid: 42,
             start_time: 9_001,
         };
         assert!(matches!(
@@ -744,6 +839,67 @@ mod tests {
             ),
             Verdict::Release(true)
         );
+    }
+
+    /// 之前恢复失败的记录，不能因为「组与亲和性都不在我们手里」被判死。
+    /// 那只说明系统在这期间改写过，不说明原值不用还原了；按 Drop 处理
+    /// 等于把恢复依据连同记录一起扔掉
+    #[test]
+    fn recovery_required_is_retried_not_dropped() {
+        let mut r = rec(Some("/top-app"), "4-6", &set("4-6"));
+        r.state = ManagedState::RecoveryRequired;
+        assert_eq!(
+            judge(
+                &r,
+                Some(r.identity),
+                Some("/top-app"),
+                Some(set("0-3")),
+                false,
+                false
+            ),
+            Verdict::Release(false)
+        );
+    }
+
+    /// 恢复亲和性失败必须往上报。以前这里 `let _ =` 吞掉错误，外层照样
+    /// 删账本，线程就永久停在接管前的限制之外
+    #[test]
+    fn affinity_restore_failure_is_reported() {
+        let (handle, tid) = spawn_named("AppOpt-test-restore");
+        let id = identity_of(tid).expect("读线程身份");
+        // 只含不存在的核：内核按空掩码处理，返回 EINVAL
+        let mut bogus = CpuSet::new();
+        bogus.set(900);
+        let mut r = rec(Some("/top-app"), "4-6", &bogus);
+        // rec 的第三个参数只设 last_applied，原亲和性要单独换成非法集合
+        r.original_affinity = bogus;
+        r.identity = id;
+        let res = restore(&r, false);
+        handle.thread().unpark();
+        let _ = handle.join();
+        assert!(res.is_err(), "写不进去必须报错，不能当成已恢复");
+    }
+
+    /// 进程退出时按 TGID 清账：一个进程里只有主线程的 TID 等于 TGID，
+    /// 只比 TID 会漏掉其余所有工作线程
+    #[test]
+    fn forget_pid_clears_every_thread_of_the_process() {
+        with_ledger(|l| l.clear());
+        for (tid, tgid) in [(100, 9_000), (101, 9_000), (102, 7_777)] {
+            let mut m = rec(Some("/top-app"), "4-6", &set("4-6"));
+            m.identity = TaskIdentity {
+                tid,
+                tgid,
+                start_time: 1,
+            };
+            with_ledger(|l| {
+                l.insert(tid, m);
+            });
+        }
+        forget_pid(9_000);
+        let left: Vec<i32> = with_ledger(|l| l.keys().copied().collect());
+        with_ledger(|l| l.clear());
+        assert_eq!(left, vec![102], "只该剩下别的进程那条");
     }
 
     /// 仍匹配其他规则：不释放，交给正常流程重算目标

@@ -232,12 +232,13 @@ fn main() {
             "-b" => {
                 i += 1;
                 if i < args.len() {
-                    cli_cpuset = Some(args[i].clone());
-                    if args[i].is_empty() || args[i].contains('/') {
-                        eprintln!("无效的 cpuset 目录名: {}", args[i]);
-                        eprintln!("目录名不能为空或包含路径分隔符");
+                    // 与 set_base_cpuset 同一个判据：这里放过去的怪名字，
+                    // 到了设置阶段会被拒，锁名与实际目录就对不上了
+                    if let Err(why) = crate::cpuset::validate_cpuset_name(&args[i]) {
+                        eprintln!("无效的 cpuset 目录名: {}（{}）", args[i], why);
                         process::exit(1);
                     }
+                    cli_cpuset = Some(args[i].clone());
                 } else {
                     eprintln!("错误: -b 需要指定 cpuset 目录名");
                     process::exit(1);
@@ -297,8 +298,13 @@ fn main() {
     // 正常退出（SIGTERM/SIGINT）也要还原时间片，否则只能等下次启动兜底
     install_exit_handler();
 
-    // 先设置 cpuset 路径再初始化拓扑，init_cpu_topo 会创建 BASE_CPUSET 目录
-    set_base_cpuset(&cpuset_name);
+    // 先设置 cpuset 路径再初始化拓扑，init_cpu_topo 会创建 BASE_CPUSET 目录。
+    // 名字非法必须当场退出：锁已经按这个名字建好了，回落到默认目录等于
+    // 两个实例管同一个 cpuset
+    if let Err(why) = set_base_cpuset(&cpuset_name) {
+        eprintln!("无效的 cpuset 目录名 {}：{}", cpuset_name, why);
+        process::exit(1);
+    }
     let topo = init_cpu_topo();
 
     if fs::metadata(&config_file).is_err() {
@@ -394,6 +400,9 @@ fn main() {
     // PMU 观察窗口。与 S7 独立：S7 要快，PMU 靠窗口差分才稳定。
     // 默认关，关掉时 tick 只是清一次状态就返回
     let mut pmu_deadline = Instant::now();
+    // 恢复失败记录的重试周期。只在配置变化时扫一遍的话，一次 EPERM/EINVAL
+    // 要等到用户下次改配置才会再试，这期间线程一直停在被限制的集合里
+    let mut recovery_deadline = Instant::now();
 
     // 恢复的强制 proc 模式无需 eBPF 初始化
     let mut ebpf_state: Option<EbpfState> = if MODE_FORCE.load(Ordering::Relaxed) == 2 {
@@ -509,6 +518,16 @@ fn main() {
             if removed > 0 {
                 crate::diag::tag("配置", &format!("回收 {} 个空 cpuset 目录", removed));
             }
+        }
+
+        // 恢复失败的记录按 30 秒重试。这类线程的规则已经撤了，不会再有
+        // 配置变化把它带回上面的分支；不主动重试就只能等退出时才还。
+        // 日志按状态签名去重，失败原因没变不会重复打
+        if crate::lifecycle::recovery_required() > 0
+            && recovery_deadline.elapsed() >= Duration::from_secs(30)
+        {
+            recovery_deadline = Instant::now();
+            crate::lifecycle::release_unmanaged(&cfg, false);
         }
 
         // 配置加载线程 panic 恢复

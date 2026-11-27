@@ -1631,7 +1631,11 @@ fn config_set_api(req: &Request) -> (u16, String) {
         CHECK_INTERVAL.store(n, Ordering::Relaxed);
     }
     if let Some(n) = name {
-        crate::cpuset::set_base_cpuset(n);
+        // 非法名字不能静默回落到默认目录：Web 上看着改成功了，
+        // 实际 base 没变，后面的所有组都建在旧路径下
+        if crate::cpuset::set_base_cpuset(n).is_err() {
+            return err_json(400, "无效的 cpuset 目录名");
+        }
         // 目录全部换到新 base 下，旧的“已建”记录必须作废
         reset_cpuset_dir_cache();
         if let Some(cfg) = current_cfg()

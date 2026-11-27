@@ -59,9 +59,12 @@ http://appopt.suto.top
 | 触发 | 做什么 | 产物 |
 |------|--------|------|
 | push 到 `experimental` | 构建两个架构 | Actions 页面 → 该次运行 → Artifacts，保留 14 天 |
-| 测试版 tag（`v*-beta*`） | 构建，不发 Release | Artifacts |
-| 正式版 tag（如 `v2.8.0`） | 构建，再发版到 GitHub / Gitee | Release 附件 |
+| 测试版 tag（`v*-beta*`） | 构建 + 发 GitHub / Gitee（标预发布） | Release 附件 + Artifacts |
+| 正式版 tag（如 `v2.8.0`） | 构建 + 发 GitHub / Gitee | Release 附件 |
 | PR / 手动触发 | 只构建 | Artifacts |
+
+测试版的 Release 在 GitHub 上是 prerelease、在 Gitee 上标题带「测试版（CI 构建）」，
+正文注明构建提交，正式版不带这些标记。
 
 CI 只构建，不跑单元测试：云端是 4 核 x86 虚拟机，和手机的大小核拓扑、
 cpuset / stune 布局完全是两套东西，在那儿跑测试只会因为环境差异误报。

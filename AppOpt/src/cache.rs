@@ -108,16 +108,25 @@ fn resolve_group(path: Option<&str>, prev: Option<&TaskEntry>) -> SysGroup {
 /// 日志里就会多出几百行 EINVAL 或几百次无效重绑，必须能脱离真机单测
 use crate::policy::{PolicySource, plan_entry};
 
+/// S7 落点。带上 `start_time`：tid 会被内核复用，只凭号码判断会把
+/// 上一条线程的落点套到刚创建的新线程上——新线程会被绑进一个更小的簇，
+/// 而它从没参与过那次迁移的负载判断
+#[derive(Clone, Copy)]
+struct Landing {
+    start_time: u64,
+    cpus: CpuSet,
+}
+
 /// 双模式共用进程缓存，eBPF 事件驱动增量维护，proc 模式触发全量重建
 pub struct ProcCache {
     pub tasks: HashMap<i32, TaskEntry>,
-    /// S7 接管落点：tid → 上次迁移成功写入的集合。
+    /// S7 接管落点：tid → 上次迁移成功写入的集合（附线程身份）。
     ///
     /// 必须单独存放，不能只记在 `TaskEntry` 里：proc 模式每 60 秒全量重建缓存，
     /// eBPF 模式配置变更也会 `clear()`，落点存在条目上会连同条目一起丢掉，
     /// 定期校验随后按规则原值重写，S7 的迁移活不过一个周期。
-    /// 规则改小、组不再可达、线程退出时由 `landing_for` 与 `purge_*` 清掉。
-    sched: HashMap<i32, CpuSet>,
+    /// 规则改小、组不再可达、线程退出时由 `landing_of` 与 `purge_*` 清掉。
+    sched: HashMap<i32, Landing>,
     /// 周期同步轮次，只用于 Own 组短路的定期复核。由 `affinity_sync` 推进：
     /// 事件驱动路径不推进它，否则事件密集时复核周期会被压到几秒
     round: u64,
@@ -155,7 +164,34 @@ impl ProcCache {
 
     /// S7 迁移成功。落点单独存，重建缓存后仍能维持
     pub fn note_sched(&mut self, tid: i32, cpus: CpuSet) {
-        self.sched.insert(tid, cpus);
+        // 记下此刻的 starttime 作为身份。读不到（线程正在退出）就不记：
+        // 没有身份的落点宁可不要，也不要让它落到下一个复用这个号的线程上
+        if let Some(id) = crate::lifecycle::identity_of(tid) {
+            self.sched.insert(
+                tid,
+                Landing {
+                    start_time: id.start_time,
+                    cpus,
+                },
+            );
+        }
+    }
+
+    /// 取落点，且必须是同一条线程的。tid 相同而 starttime 不同 = 号被复用，
+    /// 旧落点直接作废
+    fn landing_of(&self, tid: i32) -> Option<CpuSet> {
+        let l = self.sched.get(&tid)?;
+        let now = crate::lifecycle::identity_of(tid)?;
+        (now.start_time == l.start_time).then_some(l.cpus)
+    }
+
+    /// 一次性把有效落点摊成快照。`affinity_sync` 的循环已经可变借用了
+    /// `tasks`，里面不能再调 `&self` 方法；落点条目通常只有几条，扫一遍很便宜
+    fn valid_landings(&self) -> HashMap<i32, CpuSet> {
+        self.sched
+            .keys()
+            .filter_map(|&tid| self.landing_of(tid).map(|c| (tid, c)))
+            .collect()
     }
 
     /// 关掉 S7 时清空全部落点，让线程按规则重新落地
@@ -300,7 +336,7 @@ impl ProcCache {
         };
         let (target, keep) = plan_entry(
             &result.cpus,
-            self.sched.get(&tid).copied(),
+            self.landing_of(tid),
             group,
             eff.as_deref(),
             cfg.sysgroup_respect,
@@ -437,7 +473,10 @@ impl ProcCache {
         // 已退出的线程不会再有事件，落点留在这里只会慢慢堆积。
         // 每轮按在线条目裁剪一次，成本是一次哈希遍历
         self.sched.retain(|tid, _| self.tasks.contains_key(tid));
-        let sched = &mut self.sched;
+        // 落点连同身份一起取出来：tid 相同、starttime 不同说明号被复用，
+        // 旧线程的落点不能继承。快照在循环外做，循环里已经可变借用了 tasks
+        let landings = self.valid_landings();
+        let mut stale: Vec<i32> = Vec::new();
         for (tid, e) in self.tasks.iter_mut() {
             // 组归属每轮都重看，不只在「已被拦住」时看。应用切后台时系统会把
             // 线程从 top-app 搬进 background(0-3)，规则却仍要 4-6，交集为空。
@@ -497,16 +536,16 @@ impl ProcCache {
             // 直接拿它算会把刚迁到 4-7 的线程拉回 0-7，迁移白做
             let (target, keep) = plan_entry(
                 &e.want,
-                sched.get(tid).copied(),
+                landings.get(tid).copied(),
                 group,
                 eff.as_deref(),
                 respect,
                 migrate,
                 floor.as_ref(),
             );
-            if keep.is_none() && sched.contains_key(tid) {
+            if keep.is_none() && landings.contains_key(tid) {
                 // 落点已不可达（切后台、组收紧、规则改小）：接管作废
-                sched.remove(tid);
+                stale.push(*tid);
             }
             // 「首次绑定 / 目标变更」才需要校验组归属；稳态校验等于白读一次
             let changed = !e.applied || e.cpus != target.cpus;
@@ -613,6 +652,11 @@ impl ProcCache {
         }
         for tid in &dead_tids {
             self.task_gone(*tid);
+        }
+        // 落点已不可达的记录在循环外删：循环里 `tasks` 是可变的，
+        // 同一轮再借 `sched` 会冲突
+        for tid in stale {
+            self.sched.remove(&tid);
         }
         if blocked_now > 0 {
             crate::diag::note_sysgroup_batch(blocked_now as u64, blocked_hint);
@@ -769,12 +813,28 @@ mod tests {
     #[test]
     fn sched_landing_survives_cache_rebuild() {
         let mut cache = ProcCache::new();
-        cache.note_sched(4321, set_of("4-7"));
+        let tid = unsafe { libc::syscall(libc::SYS_gettid) as i32 };
+        cache.note_sched(tid, set_of("4-7"));
         cache.clear();
-        assert_eq!(cache.sched.get(&4321).copied(), Some(set_of("4-7")));
+        assert_eq!(cache.landing_of(tid), Some(set_of("4-7")));
         // 线程退出后不再保留
-        cache.task_del(4321);
-        assert!(!cache.sched.contains_key(&4321));
+        cache.task_del(tid);
+        assert!(cache.sched.is_empty());
+    }
+
+    /// 同一个号换了一条线程：落点必须作废。只按 tid 索引的话，新线程会
+    /// 直接继承上一条线程的迁移结果，被绑进一个更小的簇
+    #[test]
+    fn reused_tid_does_not_inherit_landing() {
+        let mut cache = ProcCache::new();
+        let tid = unsafe { libc::syscall(libc::SYS_gettid) as i32 };
+        cache.note_sched(tid, set_of("4-7"));
+        assert_eq!(cache.landing_of(tid), Some(set_of("4-7")));
+        // 把记录改成「上一条线程」的 starttime，模拟号被复用
+        if let Some(l) = cache.sched.get_mut(&tid) {
+            l.start_time = 1;
+        }
+        assert_eq!(cache.landing_of(tid), None);
     }
 
     /// 组名必须跟本轮读到的 path 走。沿用上一轮缓存会在「系统刚把线程从

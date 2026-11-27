@@ -17,17 +17,38 @@ static BASE_CPUSET_PATH: RwLock<Option<String>> = RwLock::new(None);
 
 pub const DEFAULT_CPUSET_NAME: &str = "AppOpt";
 
-/// 设置 BASE_CPUSET 目录名。名字直接拼进 `/dev/cpuset/<name>`，`/` 之外
+/// 校验 cpuset 目录名。名字直接拼进 `/dev/cpuset/<name>`，`/` 之外
 /// `.` 与 `..` 同样危险：`.` 退化成根组（线程被迁进去就不再受系统分组约束），
-/// `..` 让 base 变成 `/dev`，随后会在 `/dev` 下建 cpus/mems 与集合目录
-pub fn set_base_cpuset(name: &str) {
-    if name.is_empty() || name.len() >= 64 || name.contains('/') || name.contains("..") {
-        return;
+/// `..` 让 base 变成 `/dev`，随后会在 `/dev` 下建 cpus/mems 与集合目录。
+///
+/// 命令行、配置文件、Web 接口、`set_base_cpuset` 共用这一个判据：以前各处
+/// 各写一套，`-b .` 能过命令行的检查却在设置时被静默拒绝，结果单实例锁
+/// 按 `.` 命名、实际操作的却是默认目录，两个进程可以同时管一个 cpuset
+pub fn validate_cpuset_name(name: &str) -> Result<(), &'static str> {
+    if name.is_empty() {
+        return Err("目录名不能为空");
     }
-    if name == "." || name == ".." || name.bytes().any(|b| b <= b' ') {
-        return;
+    if name.len() >= 64 {
+        return Err("目录名过长");
     }
+    if name == "." || name == ".." {
+        return Err("不能用 . 或 .. 作为目录名");
+    }
+    if name.contains('/') || name.contains("..") {
+        return Err("目录名不能包含路径分隔符或 ..");
+    }
+    if name.bytes().any(|b| b <= b' ') {
+        return Err("目录名不能包含空白或控制字符");
+    }
+    Ok(())
+}
+
+/// 设置 BASE_CPUSET 目录名。失败时返回原因，调用方必须停下来——
+/// 静默回落到默认目录会让「锁名」和「实际路径」对不上
+pub fn set_base_cpuset(name: &str) -> Result<(), &'static str> {
+    validate_cpuset_name(name)?;
     *BASE_CPUSET_PATH.write().unwrap() = Some(format!("/dev/cpuset/{}", name));
+    Ok(())
 }
 
 pub fn base_cpuset() -> String {
@@ -1847,5 +1868,20 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
         // base 不存在时整体返回 0，不 panic
         assert_eq!(gc_empty_dirs_at(b, &referenced), 0);
+    }
+
+    /// 命令行、配置文件、Web 接口、set_base_cpuset 必须共用同一套判据。
+    /// 以前命令行只拦 `/`，`-b .` 能过；设置阶段静默拒掉后回落到默认目录，
+    /// 于是锁名按 `.` 建、实际却操作 `/dev/cpuset/AppOpt`，两个实例能同时管
+    #[test]
+    fn cpuset_name_is_validated_consistently() {
+        for bad in ["", ".", "..", "a/b", "a..b", "a b", "a\tb"] {
+            assert!(validate_cpuset_name(bad).is_err(), "{:?} 应当被拒绝", bad);
+        }
+        let long = "x".repeat(64);
+        assert!(validate_cpuset_name(&long).is_err(), "64 字符应被拒绝");
+        for ok in ["AppOpt", "AppOpt-8", "sched_2", &"x".repeat(63)] {
+            assert!(validate_cpuset_name(ok).is_ok(), "{:?} 应当通过", ok);
+        }
     }
 }

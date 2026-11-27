@@ -1868,7 +1868,14 @@ mod tests {
         }
         let ev = snapshot().events;
         assert_eq!(ev.len(), EVENT_CAP);
-        assert!(ev.last().unwrap().starts_with("e"));
+        // 事件环是全局的，别的测试并行时也会往里写几条，不能要求
+        // 「每一条都是 e」；只要自己的标记还占多数，就说明覆盖语义成立
+        let mine = ev.iter().filter(|s| s.starts_with('e')).count();
+        assert!(
+            mine >= EVENT_CAP / 2,
+            "被并发写入挤掉太多：{mine}/{}",
+            EVENT_CAP
+        );
     }
 
     fn set_of(cpus: &[usize]) -> CpuSet {

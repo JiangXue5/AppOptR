@@ -80,9 +80,25 @@ def packages(version: str) -> list[str]:
     return found
 
 
+def is_beta(version: str) -> bool:
+    """测试版：正式版号只有 2.7.0 这种，带连字符的是 beta/rc。"""
+    return "-" in version
+
+
+def ci_note() -> str:
+    """在 Actions 里跑时标一下构建来源；本地手动发版不写，免得谎报。"""
+    if os.environ.get("GITHUB_ACTIONS") != "true":
+        return ""
+    sha = os.environ.get("GITHUB_SHA", "")[:7]
+    run = os.environ.get("GITHUB_RUN_ID", "")
+    tail = f"，[运行 {run}](https://github.com/{GH_REPO}/actions/runs/{run})" if run else ""
+    return f"\n> CI 构建：GitHub Actions，提交 `{sha}`{tail}\n"
+
+
 def body_for(version: str) -> str:
     return (
-        f"## {version}\n\n{changelog_section(version)}\n\n"
+        f"## {version}\n\n{changelog_section(version)}\n"
+        f"{ci_note()}\n"
         "---\n"
         "装机：Magisk / KernelSU 刷入 zip；arm64 设备选 `arm64-v8a`，"
         "模拟器或 x86 设备选 `x86_64`。"
@@ -104,7 +120,13 @@ def release_github(version: str, token: str, files: list[str], dry: bool) -> str
         r = requests.post(
             api,
             headers=gh_headers(token),
-            json={"tag_name": tag, "name": tag, "body": body_for(version)},
+            json={
+                "tag_name": tag,
+                "name": tag,
+                "body": body_for(version),
+                # 测试版标 prerelease：Release 列表默认不把它当成稳定版
+                "prerelease": is_beta(version),
+            },
             timeout=60,
         )
         if r.status_code >= 300:
@@ -154,9 +176,15 @@ def release_gitee(version: str, token: str, files: list[str], dry: bool) -> str:
             data={
                 "access_token": token,
                 "tag_name": tag,
-                "name": f"AppOpt {version} 测试版",
+                # 测试版与正式版分开命名：Release 列表默认展示正式版，
+                # 测试版要一眼看出是 CI 出的、可以随时作废
+                "name": (
+                    f"AppOpt {version} 测试版（CI 构建）"
+                    if is_beta(version)
+                    else f"AppOpt {version}"
+                ),
                 "body": body_for(version),
-                "prerelease": "true",
+                "prerelease": "true" if is_beta(version) else "false",
                 "target_commitish": "experimental",
             },
             timeout=60,
