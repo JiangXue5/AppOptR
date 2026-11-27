@@ -58,9 +58,11 @@ http://appopt.suto.top
 
 | 触发 | 做什么 | 产物 |
 |------|--------|------|
-| push 到 `master` / `experimental` | 格式、clippy、单测，再构建两个架构 | Actions 页面 → 该次运行 → Artifacts，保留 14 天 |
+| push 到 `experimental` | 格式、clippy、单测，再构建两个架构 | Actions 页面 → 该次运行 → Artifacts，保留 14 天 |
 | push tag `v*` | 同上，并自动发版到 GitHub / Gitee | Release 附件 |
 | PR / 手动触发 | 只做检查与构建，不发版 | Artifacts |
+
+`master` 是 2.6.x 稳定线，暂未带这套工作流；2.7 的改动都在 `experimental` 上。
 
 日常小改动只需要推代码，不用本地构建：
 
