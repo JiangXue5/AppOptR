@@ -1453,15 +1453,10 @@ mod tests {
     fn shadow_never_touches_real_affinity() {
         let (handle, tid) = spawn_named("Thread-7");
         let t = topo();
-        // 这条会真的调 sched_setaffinity，掩码必须是本机存在的核：
-        // 假拓扑里的 4-7 在 4 核 CI 机器上不存在，内核直接 EINVAL。
-        // 取前 8 个里真实在线的核，本地 8 核以上与原值一致
-        let mut allowed = CpuSet::new();
-        for c in 0..8 {
-            if crate::cpuset::cpu_is_online(c) {
-                allowed.set(c);
-            }
-        }
+        // 用线程当前的有效亲和性当目标集合。sysfs 上写着哪些核不代表
+        // 这个 cgroup 能用：CI 的 runner 是 8 核宿主切 4 核，写 0-7 会被
+        // 内核裁成 0-3，回读立刻对不上。线程自己的有效集一定写得进去
+        let allowed = CpuSet::get_affinity(tid).expect("读取线程亲和性失败");
         let conf = format!("com.test.game={}\n", allowed.to_range_string());
         assert_eq!(
             crate::apply_affinity::affinity_apply(

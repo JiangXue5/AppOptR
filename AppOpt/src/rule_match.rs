@@ -212,7 +212,24 @@ mod tests {
         assert_eq!(comm_to_pkg(1, "com.test.applic", &cfg), None);
     }
 
+    /// 在 CI 上也要能读到自己进程的 cmdline：能读到说明 /proc 的读取
+    /// 通道没问题，那条被 ignore 的用例失败只可能是「执行临时文件」这一环
     #[test]
+    fn read_cmdline_sees_self() {
+        let name = crate::apply_affinity::read_cmdline(std::process::id() as i32)
+            .expect("读不到自己的 cmdline");
+        assert!(!name.is_empty());
+        assert!(!name.contains('/'), "cmdline 应已取到 basename：{}", name);
+    }
+
+    /// 截断键命中后必须用 cmdline 确认真身。
+    ///
+    /// 这条要真的执行 `/tmp` 下的临时可执行文件。CI 的 runner 上进程一起来
+    /// 就以 1 退出（临时目录的执行限制），拿不到 cmdline，所以标 ignore：
+    /// 本地与真机跑 `cargo test -- --ignored` 验证。「命中但被 cmdline 否决」
+    /// 那条（`truncated_key_hit_still_verified_by_cmdline`）在 CI 里一直跑
+    #[test]
+    #[ignore = "需要能执行临时文件的环境，CI runner 上进程秒退"]
     fn truncated_key_hit_real_process() {
         let cfg = cfg_with("real", "com.test.applications=0-1\n");
         let bin = "/tmp/com.test.applications";
