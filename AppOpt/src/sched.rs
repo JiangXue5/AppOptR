@@ -703,7 +703,7 @@ impl SchedState {
                 || crate::background::should_demote(
                     cfg.foreground_demote,
                     entry.is_thread_rule,
-                    tid,
+                    entry.pid,
                     entry.group,
                 )
             {
