@@ -1453,11 +1453,18 @@ mod tests {
     fn shadow_never_touches_real_affinity() {
         let (handle, tid) = spawn_named("Thread-7");
         let t = topo();
-        // 用线程当前的有效亲和性当目标集合。sysfs 上写着哪些核不代表
-        // 这个 cgroup 能用：CI 的 runner 是 8 核宿主切 4 核，写 0-7 会被
-        // 内核裁成 0-3，回读立刻对不上。线程自己的有效集一定写得进去
-        let allowed = CpuSet::get_affinity(tid).expect("读取线程亲和性失败");
-        let conf = format!("com.test.game={}\n", allowed.to_range_string());
+        // 假拓扑的三档是 0-3 / 4-6 / 7，这条要真把 4-7 写进内核。
+        // 4 核的 CI runner 上这些核不存在（EINVAL），写入都做不到，
+        // 断言「写完之后没被 shadow 改掉」就没有意义——直接跳过。
+        // 判定逻辑由 tick / would 那几条纯计算用例覆盖，不靠这条
+        if CpuSet::get_affinity(tid).is_none_or(|eff| eff.count() < 8) {
+            handle.thread().unpark();
+            handle.join().unwrap();
+            return;
+        }
+        let mut allowed = CpuSet::new();
+        allowed.or(&t.p_core);
+        allowed.or(&t.hp_core);
         assert_eq!(
             crate::apply_affinity::affinity_apply(
                 tid,
@@ -1472,7 +1479,7 @@ mod tests {
             AffinityOutcome::Set
         );
 
-        let cfg = cfg_with("shadow_real", &conf);
+        let cfg = cfg_with("shadow_real", "com.test.game=p-core,hp-core\n");
         let mut cache = ProcCache::new();
         cache.tasks.insert(
             tid,
