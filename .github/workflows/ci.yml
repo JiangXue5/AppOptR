@@ -30,7 +30,9 @@ jobs:
     name: 构建
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      # v7 起改用 node24；旧的 v4 走 node20，GitHub 已强制在 node24 上跑，
+      # 每次都会报一条「Node.js 20 已弃用」的警告
+      - uses: actions/checkout@v7
 
       - name: 安装工具链
         run: |
@@ -61,7 +63,7 @@ jobs:
           fi
           bpf-linker --version
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2.9.3
         with:
           workspaces: |
             AppOpt -> target
@@ -84,7 +86,7 @@ jobs:
           done
 
       - name: 保存产物
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: AppOpt-${{ github.sha }}
           path: dist/*.zip
@@ -101,13 +103,13 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # 浅克隆推不到 Gitee：对方会以 shallow update not allowed 拒掉
           fetch-depth: 0
 
       - name: 取回产物
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: AppOpt-${{ github.sha }}
           path: dist

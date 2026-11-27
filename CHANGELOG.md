@@ -25,6 +25,10 @@
 - 几个测试原先默认机器有 8 个核（写死 `6-7`、直接用 `p-core`/`hp-core`），
   换到少核机器上会因为掩码被裁而误报。改成 0-3 以内的核号、拓扑集合为空时
   退化成全部核；`load` 那两条共用全局基线的用例改成串行，不再互相清 STATE
+- CI 用到的 action 全部换到 node24 运行时：`checkout@v4 → v7`、
+  `upload-artifact@v4 → v7`、`download-artifact@v4 → v8`、
+  `rust-cache@v2 → v2.9.3`。旧的走 node20，GitHub 已经强制在 node24 上跑，
+  每次运行都会多一条「Node.js 20 已弃用」的警告
 
 ## 2.7.0-beta30（2026-11-27）
 
