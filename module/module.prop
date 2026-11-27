@@ -1,7 +1,7 @@
 id=AppOpt
 name=线程优化
-version=2.7.0-beta26
-versionCode=283
+version=2.7.0-beta27
+versionCode=284
 author=Suto
 description=一个支持自定义规则的安卓应用线程CPU亲和性优化程序
 updateJson=https://gitee.com/JiangXue_2004/AppOptR/raw/master/modules_update/AppOpt.json

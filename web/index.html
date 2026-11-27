@@ -111,6 +111,8 @@ box-shadow:0 1px 3px rgba(0,0,0,.22);transition:transform .2s cubic-bezier(.3,.9
 .btn:active{opacity:.75}
 .btn-outline{background:none;border:1px solid var(--line);color:var(--ink2);padding:8px 15px;border-radius:9px;font-size:14px;text-align:center}
 .btn-outline:active{opacity:.6}
+.btn-danger{background:var(--danger);color:#fff}
+.btn-danger:active{opacity:.8}
 .entry{display:flex;width:100%;align-items:center;gap:8px;padding:13px 16px;font-size:15px}
 .entry+.entry{border-top:1px solid var(--line2)}
 .entry svg{margin-left:auto;width:14px;height:14px;stroke:var(--ink3);fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0}
@@ -570,10 +572,10 @@ border-top:none;border-right:1px solid var(--line);order:-1;justify-content:cent
 <div id="modal-confirm" class="modal-bg" hidden>
 <div class="modal">
 <h3 id="mc-title">删除规则</h3>
-<p class="hint" id="mc-msg" style="text-align:center;font-size:13px;color:var(--fg)"></p>
+<p class="hint" id="mc-msg" style="text-align:center;font-size:13px;color:var(--ink);word-break:normal;overflow-wrap:anywhere"></p>
 <div class="modal-actions">
 <button class="btn-outline" id="mc-cancel">取消</button>
-<button class="btn" id="mc-ok" style="background:var(--red)">删除</button>
+<button class="btn btn-danger" id="mc-ok">删除</button>
 </div>
 </div>
 </div>
