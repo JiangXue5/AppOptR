@@ -269,6 +269,9 @@ struct Sink {
 
 static SINK: Mutex<Option<Sink>> = Mutex::new(None);
 static INIT: AtomicBool = AtomicBool::new(false);
+/// 最近一轮同步的分布。`Sink.tally` 会被周期摘要取走用于打印，
+/// 这份副本留给 Web 诊断与退出对照，不会被消费
+static LAST_TALLY: Mutex<Option<SyncTally>> = Mutex::new(None);
 
 fn sink() -> std::sync::MutexGuard<'static, Option<Sink>> {
     let mut guard = lock_ignore_poison(&SINK);
@@ -1041,18 +1044,29 @@ pub fn note_sysgroup_batch(n: u64, hint: Option<(SysGroup, String)>) {
 /// 限制的线程混在一起，只能靠读的人自己去减。这一行把它摊开，
 /// 用户在 Scene 里看到的和日志给出的必须是同一件事
 pub fn note_sync_tally(total: usize, ok: usize, rebound: usize, failed: usize, blocked: usize) {
-    let mut guard = sink();
-    let Some(s) = guard.as_mut() else { return };
-    if total > 0 {
-        s.ever_bound = true;
-    }
-    s.tally = Some(SyncTally {
+    let t = SyncTally {
         total,
         ok,
         rebound,
         failed,
         blocked,
-    });
+    };
+    // 另存一份给 Web 与退出对照。周期摘要会 take 掉 sink 里那份，
+    // 那份被取走后，问「受管多少」就只能得到 0——正是「账本/受管」
+    // 对不上时最需要看这个数
+    *lock_ignore_poison(&LAST_TALLY) = Some(t);
+    let mut guard = sink();
+    let Some(s) = guard.as_mut() else { return };
+    if total > 0 {
+        s.ever_bound = true;
+    }
+    s.tally = Some(t);
+}
+
+/// 最近一轮同步的受管分布。尚未跑过同步时返回 `None`，
+/// 不能当成「受管 0 条」——那会把启动瞬间说成线程全丢了
+pub fn managed_now() -> Option<SyncTally> {
+    *lock_ignore_poison(&LAST_TALLY)
 }
 
 /// 目标集合被所在组的生效集合裁小。写全集时内核会求交，返回成功但回读永远是
@@ -1373,7 +1387,12 @@ pub fn periodic_summary(current: &SchedSnapshot) {
     // ── 总账 ──────────────────────────────────────────────────
     match tally.filter(|t| t.total > 0) {
         Some(t) => {
-            let mut line = tally_line(t, rewrites, s.blocked_note.as_ref());
+            let mut line = tally_line(
+                t,
+                Some(crate::lifecycle::managed_count()),
+                rewrites,
+                s.blocked_note.as_ref(),
+            );
             // 组归属回读次数跟在总账尾部：它是「短路有没有生效」的直接证据。
             // 受管 200、回读 3 说明稳态几乎不碰 /proc；回读 200 则说明
             // 线程每轮都在换组，此时任何「按 PID 缓存」都不解决问题
@@ -1800,6 +1819,9 @@ pub struct Snapshot {
     pub threads: Vec<ThreadDiag>,
     pub jank: Vec<JankSample>,
     pub pressure: Option<f64>,
+    /// 最近一轮同步的分布。周期摘要会把 `s.tally` 取走用于打印，
+    /// 这里读的是另存的一份，Web 随时能回答「缓存里到底有多少受管线程」
+    pub(crate) tally: Option<SyncTally>,
 }
 
 pub fn snapshot() -> Snapshot {
@@ -1810,6 +1832,7 @@ pub fn snapshot() -> Snapshot {
     };
     Snapshot {
         aff,
+        tally: managed_now(),
         events,
         threads: lock_ignore_poison(&THREADS).clone(),
         jank: lock_ignore_poison(&JANK).clone(),
@@ -2156,6 +2179,7 @@ mod tests {
     /// 「受管 N 个 / 当前符合 X」必须能回答 Scene 里看到的到底是什么状态
     #[test]
     fn sync_tally_is_kept_for_summary() {
+        let _guard = TALLY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         note_sync_tally(200, 12, 3, 1, 184);
         let t = sink()
             .as_ref()
@@ -2167,6 +2191,29 @@ mod tests {
         );
         // 四个分档加本轮退出的线程应能对上总数
         assert!(t.ok + t.rebound + t.failed + t.blocked <= t.total);
+    }
+
+    /// 全局计数只有一份：这两个用例都要写它，串行跑
+    static TALLY_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// 周期摘要会把 sink 里那份 take 走。Web 与退出对照读的是另存副本，
+    /// 被一起消费掉就会在摘要之后永远显示「受管 0」——而账本/受管
+    /// 对不上时，恰恰是这个数最需要看
+    #[test]
+    fn managed_now_outlives_summary_consumption() {
+        let _guard = TALLY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        note_sync_tally(431, 400, 20, 4, 7);
+        assert_eq!(managed_now().map(|t| t.total), Some(431));
+        {
+            let mut g = sink();
+            let taken = g.as_mut().and_then(|s| s.tally.take());
+            assert!(taken.is_some(), "摘要应当能取走 sink 里那份");
+        }
+        assert_eq!(
+            managed_now().map(|t| t.total),
+            Some(431),
+            "另存的副本不能被摘要消费掉"
+        );
     }
 
     /// 状态没变时不重复刷同一行（实测 5 分钟刷了 5 遍「规则无跨簇」），

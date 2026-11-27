@@ -156,6 +156,7 @@ pub(crate) fn combo_list(combo: &HashMap<(bool, String), u32>, resets: bool) -> 
 /// 这条被误读过两次（「日志说没绑上，Scene 里却是对的」），所以抽成纯函数可回归
 pub(crate) fn tally_line(
     t: SyncTally,
+    ledger: Option<usize>,
     rewrites: u64,
     blocked_note: Option<&(SysGroup, String)>,
 ) -> String {
@@ -168,7 +169,13 @@ pub(crate) fn tally_line(
         // 「1 个一致 + 1 个重绑 = 2 个线程」
         consistent.push_str(&format!("（其中重绑 {}）", t.rebound));
     }
-    let mut parts = vec![format!("受管 {}", t.total), consistent];
+    // 账本条数紧跟在受管数后面：两个数应当接近，差出来的部分就是
+    // 「绑上了但没记账」——退出时不会还原的正是这些线程
+    let head = match ledger {
+        Some(n) => format!("受管 {}（账本 {}）", t.total, n),
+        None => format!("受管 {}", t.total),
+    };
+    let mut parts = vec![head, consistent];
     if t.failed > 0 {
         parts.push(format!("失败 {}", t.failed));
     }
@@ -388,7 +395,7 @@ mod tests {
             failed: 0,
             blocked: 0,
         };
-        let line = tally_line(t, 171, None);
+        let line = tally_line(t, None, 171, None);
         assert!(line.contains("受管 173"), "{}", line);
         assert!(line.contains("一致 173"), "{}", line);
         let state = line.find("一致 173").unwrap();
@@ -397,7 +404,7 @@ mod tests {
         assert!(!line.contains("组上限"), "明细不该挤进总账：{}", line);
 
         // 一次都没被改过时不要提「本周期改写 0」
-        assert!(!tally_line(t, 0, None).contains("改写"));
+        assert!(!tally_line(t, None, 0, None).contains("改写"));
 
         // 全部线程都是本轮重绑的：主数字仍必须是「一致 1」
         let rebound = tally_line(
@@ -408,6 +415,7 @@ mod tests {
                 failed: 0,
                 blocked: 0,
             },
+            None,
             1,
             None,
         );
@@ -425,6 +433,7 @@ mod tests {
                 failed: 0,
                 blocked: 170,
             },
+            None,
             0,
             Some(&hint),
         );

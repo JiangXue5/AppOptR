@@ -1239,6 +1239,16 @@ fn diag_json() -> String {
                 "total_ms": (scan.last_full.total_us / 1000) as u64,
             },
         },
+        // 账本条数 vs 缓存受管数。两者应当接近：账本少说明登记漏了，
+        // 退出时这些线程的亲和性不会被还原；账本多说明有记录没清掉
+        "ledger": {
+            "records": crate::lifecycle::managed_count(),
+            "recovery": crate::lifecycle::recovery_required(),
+            "managed": d.tally.map_or(0, |t| t.total),
+            "consistent": d.tally.map_or(0, |t| t.ok + t.rebound),
+            "blocked": d.tally.map_or(0, |t| t.blocked),
+            "known": d.tally.is_some(),
+        },
         "jank": jank,
         "pressure": d.pressure,
         "threads": threads,

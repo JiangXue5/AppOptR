@@ -1262,7 +1262,16 @@ async function loadDiag(){
     // 一项一行。以前全用「 · 」串成一句，十几个数字连在一起根本读不进去
     const li=arr=>arr.filter(Boolean).map(x=>`<span class="li">${x}</span>`).join('');
     const a=d.affinity||{};
+    const lg=d.ledger||{};
+    // 账本是「我动过手、要负责还回去」的记录，受管是缓存里此刻绑住的线程。
+    // 被系统组挡住的线程本来就不登记，所以差值要扣掉 blocked 再看
+    const unlogged=(lg.known&&lg.managed>0)?lg.managed-(lg.records||0)-(lg.blocked||0):0;
     $('d-aff').innerHTML=li([
+      lg.records!=null
+        ?`账本 ${lg.records} 条 · 受管 ${lg.managed||0} 条`
+          +(unlogged>0?` · <b>${unlogged} 条没登记</b>`:(lg.records>(lg.managed||0)?` · 多 ${lg.records-(lg.managed||0)} 条`:''))
+          +(lg.recovery?` · 待恢复 ${lg.recovery}`:'')
+        :'',
       `调用 ${a.calls} · 真写 ${a.writes} · 短路 ${a.noop}`,
       `失败 ${a.failed}${a.errno_line?'（'+esc(a.errno_line)+'）':''} · 线程已退出 ${a.gone}`,
       (a.clip||a.reset||a.shifted)

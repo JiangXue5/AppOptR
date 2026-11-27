@@ -429,6 +429,31 @@ fn main() {
             // 身份与组归属两项检查照做，拿不准的一律不动。
             // RT 所有权也在账本里，release 时同一趟把 RR 收回来
             if let Some(cfg) = lock_ignore_poison(&CURRENT_CONFIG).clone() {
+                // 先摆出「账本几条 / 缓存里受管几条」。两个数对不上时，
+                // 下面的释放会按账本走——账本为空就等于什么都没还，
+                // 而日志否则只会显示「时间片已恢复」，看不出线程还钉着
+                let records = crate::lifecycle::managed_count();
+                let tally = crate::diag::managed_now();
+                let managed = tally.map_or(0, |t| t.total);
+                let blocked = tally.map_or(0, |t| t.blocked);
+                // 缓存里的受管数天然略大于账本：被系统组挡住的线程、
+                // 写入失败的线程都还没登记。超出的部分才是登记漏了
+                let unlogged = managed.saturating_sub(records + blocked);
+                if tally.is_some() && managed > 0 && unlogged > 2 {
+                    crate::diag::tag(
+                        "警告",
+                        &format!(
+                            "账本 {} 条 / 受管 {} 条，其中 {} 条没有登记：这趟释放不会动它们，\
+                             退出后亲和性仍是规则值（见 /api/diag.ledger）",
+                            records, managed, unlogged
+                        ),
+                    );
+                } else {
+                    crate::diag::tag(
+                        "事件",
+                        &format!("账本 {} 条 / 受管 {} 条，开始释放", records, managed),
+                    );
+                }
                 crate::lifecycle::release_unmanaged(&cfg, true);
             }
             // 线程已经由上面那步处理完，这里只剩全局时间片
