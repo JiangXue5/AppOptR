@@ -483,7 +483,7 @@ border-top:none;border-right:1px solid var(--line);order:-1;justify-content:cent
 <button class="btn-outline adv-save" id="d-refresh">刷新</button>
 <div class="diag-h">最近事件</div>
 <div class="diag-l dim mono" id="d-events" style="white-space:pre-line">-</div>
-<div class="hint">失败通常是两类原因：权限或安全策略拦截，或目标核心不在当前分组内。「期望」是规则要求的，「实际」是当前生效的。</div>
+<div class="hint">「期望」是规则要求的集合（降档生效时就是小核集合），「实际」是内核当前值，末列是应用此刻在前台还是后台。后台线程被压在小核属正常结果，不计入失败。</div>
 </div>
 </details>
 </div>
@@ -764,8 +764,11 @@ async function refreshStat(){
     $('s-rules').textContent=d.rules;
     $('s-pkgs').textContent=d.pkgs;
     const pf=+d.parse_fail||0;
+    // 只说「1 行被跳过」用户找不到；把行号与原文直接摊在横幅上
+    const pfl=d.parse_fail_lines||[];
+    const pftxt=pfl.length?'（'+pfl.map(x=>x.line?'第 '+x.line+' 行 '+x.text:x.text).join('；')+(pf>pfl.length?' 等':'')+'）':'';
     $('s-pf').hidden=!pf;
-    $('s-pf').textContent=pf?pf+' 行规则因格式无效被跳过，请检查配置文件':'';
+    $('s-pf').textContent=pf?pf+' 行规则因格式无效被跳过'+pftxt+'，请检查配置文件':'';
     $('s-hit').textContent=d.hit_pkgs;
     $('s-threads').textContent=d.threads;
     $('s-procs').textContent=d.total_procs;
@@ -1253,8 +1256,6 @@ $('c-cpuset-save').onclick=()=>saveField({cpuset_name:$('c-cpuset').value.trim()
 $('c-file-save').onclick=()=>saveField({config_file:$('c-file').value.trim()});
 
 let diagTimer=null;
-const ROLE_CN={Critical:'关键',Latency:'延迟敏感',Worker:'计算',Background:'后台'};
-function roleCn(r){return ROLE_CN[r]||r||''}
 async function loadDiag(){
   try{
     const d=await api('/api/diag');
@@ -1325,12 +1326,16 @@ async function loadDiag(){
       }
     }
     const th=d.threads||[];
-    const bad=th.filter(t=>!t.ok);
+    // 后台线程没绑满规则值是策略本身要的结果（前后台降档、系统后台组限制），
+    // 不能和「前台线程绑丢了」混在一起数，否则每次切后台都像出了故障
+    const bad=th.filter(t=>!t.ok&&!t.bg);
+    const bgMiss=th.filter(t=>!t.ok&&t.bg);
     const show=(bad.length?bad:th).slice(0,8);
     $('d-threads').innerHTML=show.length
-      ?show.map(t=>`<span class="li${t.ok?'':' bad'}">${esc(t.comm||'?')}（${t.tid}）　`
-          +`期望 ${esc(t.expect)}　实际 ${esc(t.actual)}　${esc(roleCn(t.role))}</span>`).join('')
-        +(bad.length?`<span class="li dim">有 ${bad.length} 个线程未落在期望集合内</span>`:'')
+      ?show.map(t=>`<span class="li${t.ok?'':' bad'}${t.bg?' dim':''}">${esc(t.comm||'?')}（${t.tid}）　`
+          +`期望 ${esc(t.expect)}　实际 ${esc(t.actual)}　${t.bg?'后台':'前台'}</span>`).join('')
+        +(bad.length?`<span class="li dim">有 ${bad.length} 个前台线程未落在期望集合内</span>`:'')
+        +(bgMiss.length?`<span class="li dim">另有 ${bgMiss.length} 个后台线程压在小核（预期结果，不算失败）</span>`:'')
       :'<span class="li dim">当前没有被管理的线程</span>';
     const ev=d.events||[];
     $('d-events').textContent=ev.length?ev.slice(-6).join('\n'):'—';

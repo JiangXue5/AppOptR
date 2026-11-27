@@ -14,7 +14,7 @@ use crate::apply_affinity::{read_cmdline, reset_cpuset_dir_cache, task_tids};
 use crate::cache::ProcCache;
 use crate::config::{
     CHECK_INTERVAL, CONFIG_FILE, CURRENT_CONFIG, FORCE_RELOAD, PARSE_FAILS, RT_MAX_LIMIT,
-    RT_TIMESLICE_LIMIT, config_reload_now, spec_like,
+    RT_TIMESLICE_LIMIT, config_reload_now, parse_fail_lines, spec_like,
 };
 use crate::config::{RtMatch, RtScope};
 use crate::cpuset::{
@@ -647,6 +647,12 @@ fn status_json() -> String {
         "rules": s.rules,
         "pkgs": s.pkgs,
         "parse_fail": PARSE_FAILS.load(Ordering::Relaxed),
+        // 只给前三条：状态页是一行横幅，再多也读不完，完整信息在诊断面板
+        "parse_fail_lines": parse_fail_lines()
+            .into_iter()
+            .take(3)
+            .map(|(no, text)| json!({ "line": no, "text": text }))
+            .collect::<Vec<_>>(),
         "hit_pkgs": s.hit_pkgs,
         "threads": s.threads,
         "dropped": s.dropped,
@@ -1160,7 +1166,7 @@ fn diag_json() -> String {
                 "expect": t.expect,
                 "actual": t.actual,
                 "ok": t.ok,
-                "role": t.role,
+                "bg": t.bg,
             })
         })
         .collect();

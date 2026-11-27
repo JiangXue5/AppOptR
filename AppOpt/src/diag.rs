@@ -1614,7 +1614,9 @@ pub struct ThreadDiag {
     pub expect: String,
     pub actual: String,
     pub ok: bool,
-    pub role: &'static str,
+    /// 这条线程所在应用此刻是否在后台。后台线程没绑满规则值是预期结果
+    /// （前后台降档、系统后台组限制），不该和「前台线程绑丢了」混在一起数
+    pub bg: bool,
 }
 
 static THREADS: Mutex<Vec<ThreadDiag>> = Mutex::new(Vec::new());
@@ -1633,26 +1635,19 @@ pub fn publish_threads(cache: &ProcCache) {
                 .map(|c| c.to_range_string())
                 .unwrap_or_else(|| "已退出".to_string()),
             ok,
-            role: role_label(role_of(&e.comm)),
+            bg: crate::background::is_background(e.pid, e.group),
         });
     }
-    // 未绑住的排前面，其次按线程名，便于一眼看到异常项
+    // 只把「前台且没绑住」排到最前：后台线程被系统组或降档压在小核是
+    // 策略本身要的结果，把它们顶到第一屏会让真正的问题看起来有一堆
     out.sort_by(|a, b| {
-        a.ok.cmp(&b.ok)
+        let bad = |t: &ThreadDiag| !t.ok && !t.bg;
+        bad(b)
+            .cmp(&bad(a))
             .then_with(|| a.comm.cmp(&b.comm))
             .then_with(|| a.tid.cmp(&b.tid))
     });
     *lock_ignore_poison(&THREADS) = out;
-}
-
-fn role_label(r: Role) -> &'static str {
-    match r {
-        Role::Critical => "关键",
-        Role::Latency => "延迟",
-        Role::Worker => "工作",
-        Role::Background => "后台",
-        Role::Unknown => "未知",
-    }
 }
 
 /// 卡顿信号：Critical 线程在就绪队列上的平均等待

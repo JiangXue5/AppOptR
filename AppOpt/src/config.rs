@@ -576,6 +576,57 @@ pub static CURRENT_CONFIG: Mutex<Option<Arc<AppConfig>>> = Mutex::new(None);
 
 pub static PARSE_FAILS: AtomicUsize = AtomicUsize::new(0);
 
+/// 最近一次解析里被判为格式无效的行（行号 + 原文，最多 5 条）。
+///
+/// 只报「1 行被跳过」等于让用户自己去四十多行配置里找，实际没人会找。
+/// 原文要截断：一行写错可能带上整段规则，塞进日志会把别的行挤掉
+#[derive(Clone, Default)]
+pub struct FailLines(pub Vec<(usize, String)>);
+
+static PARSE_FAIL_LINES: Mutex<FailLines> = Mutex::new(FailLines(Vec::new()));
+
+/// 失败行的指纹，用来避免热重载把同一条错误反复打出来
+static FAIL_SIG: AtomicU64 = AtomicU64::new(0);
+
+/// 取最近一次解析的失败行样本，Web 状态页用
+pub fn parse_fail_lines() -> Vec<(usize, String)> {
+    lock_ignore_poison(&PARSE_FAIL_LINES).0.clone()
+}
+
+const MAX_FAIL_SAMPLES: usize = 5;
+/// 单行原文最多保留这么多字节。UTF-8 边界由 `truncate_bytes` 兜住
+const MAX_FAIL_LINE_BYTES: usize = 60;
+
+/// 解析失败的收集器。`hit` 同时累加计数与样本，避免出现「计数加了、
+/// 样本忘了记」这种只有一半信息的状态
+#[derive(Default)]
+struct Fails {
+    n: usize,
+    lines: Vec<(usize, String)>,
+}
+
+impl Fails {
+    fn hit(&mut self, no: usize, raw: &str) {
+        self.n += 1;
+        if self.lines.len() < MAX_FAIL_SAMPLES {
+            self.lines.push((no, clip_line(raw)));
+        }
+    }
+}
+
+/// 按字节上限截断，且不切断 UTF-8 字符
+fn clip_line(s: &str) -> String {
+    let s = s.trim();
+    if s.len() <= MAX_FAIL_LINE_BYTES {
+        return s.to_string();
+    }
+    let mut end = MAX_FAIL_LINE_BYTES;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
+}
+
 /// `@render_guard` 的迁移提示只对用户说一次，热重载不再重复
 static LEGACY_WARNED: AtomicBool = AtomicBool::new(false);
 
@@ -1106,7 +1157,7 @@ fn load_config_with(
     let content = fs::read_to_string(config_file).ok()?;
 
     let mut rules: Vec<AffinityRule> = Vec::new();
-    let mut fail_cnt: usize = 0;
+    let mut fails = Fails::default();
     let mut cur_pkg = String::new();
     let mut pending_pkg = String::new();
     let mut in_block = false;
@@ -1140,8 +1191,10 @@ fn load_config_with(
     // 分应用条目先收集原文，等 @rt.max 解析完再统一构造，避免配置行顺序影响缺省上限
     let mut rt_apps: Vec<String> = Vec::new();
 
-    for line in content.lines() {
+    for (idx, line) in content.lines().enumerate() {
         let p = line.trim();
+        // 行号从 1 起，与编辑器里看到的一致
+        let no = idx + 1;
         if p.is_empty() || p.starts_with('#') || p.starts_with("//") {
             continue;
         }
@@ -1149,7 +1202,7 @@ fn load_config_with(
         // 指令行：@unmatched=keep|all，与规则行互不影响
         if let Some(rest) = p.strip_prefix('@') {
             if in_block {
-                fail_cnt += 1;
+                fails.hit(no, line);
                 continue;
             }
             let (key, val) = match rest.split_once('=') {
@@ -1194,7 +1247,7 @@ fn load_config_with(
                             dest.insert(n);
                         }
                     }
-                    None => fail_cnt += 1,
+                    None => fails.hit(no, line),
                 },
                 ("rt", "off") => rt.scope = RtScope::Off,
                 ("rt", "global") => rt.scope = RtScope::Global,
@@ -1206,11 +1259,11 @@ fn load_config_with(
                 }
                 ("rt.max", v) => match v.parse::<u8>() {
                     Ok(n) if (1..=RT_MAX_LIMIT).contains(&n) => rt.max_per_app = n,
-                    _ => fail_cnt += 1,
+                    _ => fails.hit(no, line),
                 },
                 ("rt.timeslice", v) => match v.parse::<u32>() {
                     Ok(n) if (1..=RT_TIMESLICE_LIMIT).contains(&n) => rt.timeslice_ms = n,
-                    _ => fail_cnt += 1,
+                    _ => fails.hit(no, line),
                 },
                 // 分应用条目：@rt.app=com.x auto 2 / names:RenderThread,RHI* / off
                 ("rt.app", v) if !v.is_empty() => rt_apps.push(v.to_string()),
@@ -1219,9 +1272,9 @@ fn load_config_with(
                         rt.scope = RtScope::Global;
                         rt.global = RtMatch::Names(names);
                     }
-                    None => fail_cnt += 1,
+                    None => fails.hit(no, line),
                 },
-                _ => fail_cnt += 1,
+                _ => fails.hit(no, line),
             }
             continue;
         }
@@ -1235,7 +1288,7 @@ fn load_config_with(
             match split_rule_line(p) {
                 Some((thread, cpus, closed)) => {
                     if !add_rule(&mut rules, topo, &cur_pkg, thread, cpus) {
-                        fail_cnt += 1;
+                        fails.hit(no, line);
                     }
                     if closed {
                         in_block = false;
@@ -1243,7 +1296,7 @@ fn load_config_with(
                     }
                 }
                 None => {
-                    fail_cnt += 1;
+                    fails.hit(no, line);
                     if p.contains('}') {
                         in_block = false;
                         cur_pkg.clear();
@@ -1261,11 +1314,11 @@ fn load_config_with(
                 open,
             } => {
                 if !pending_pkg.is_empty() {
-                    fail_cnt += 1;
+                    fails.hit(no, line);
                 }
                 pending_pkg.clear();
                 if !add_rule(&mut rules, topo, pkg, thread, cpus) {
-                    fail_cnt += 1;
+                    fails.hit(no, line);
                 }
                 if open {
                     cur_pkg = pkg.to_string();
@@ -1274,10 +1327,10 @@ fn load_config_with(
             }
             OuterLine::Rule { pkg, cpus, open } => {
                 if !pending_pkg.is_empty() {
-                    fail_cnt += 1;
+                    fails.hit(no, line);
                 }
                 if !add_rule(&mut rules, topo, pkg, "", cpus) {
-                    fail_cnt += 1;
+                    fails.hit(no, line);
                 }
                 if open {
                     cur_pkg = pkg.to_string();
@@ -1288,14 +1341,14 @@ fn load_config_with(
             OuterLine::BareOpen { pkg } => {
                 let owner = if !pkg.is_empty() {
                     if !pending_pkg.is_empty() {
-                        fail_cnt += 1;
+                        fails.hit(no, line);
                     }
                     pkg.to_string()
                 } else {
                     pending_pkg.clone()
                 };
                 if owner.is_empty() {
-                    fail_cnt += 1;
+                    fails.hit(no, line);
                     continue;
                 }
                 cur_pkg = owner;
@@ -1304,19 +1357,19 @@ fn load_config_with(
             }
             OuterLine::Pending { pkg } => {
                 if !pending_pkg.is_empty() {
-                    fail_cnt += 1;
+                    fails.hit(no, line);
                 }
                 pending_pkg = pkg.to_string();
             }
             OuterLine::Junk => {
-                fail_cnt += 1;
+                fails.hit(no, line);
                 pending_pkg.clear();
             }
         }
     }
 
     if in_block || !pending_pkg.is_empty() {
-        fail_cnt += 1;
+        fails.hit(0, "配置结尾有未闭合的规则块（缺少 }）");
     }
 
     // 分应用条目此时构造：@rt.max 已解析完，缺省上限与书写顺序无关
@@ -1325,12 +1378,23 @@ fn load_config_with(
             Some((pkg, app)) => {
                 rt.apps.insert(pkg, app);
             }
-            None => fail_cnt += 1,
+            None => fails.hit(0, arg),
         }
     }
 
     *last_mtime = mtime;
-    PARSE_FAILS.store(fail_cnt, Ordering::Relaxed);
+    PARSE_FAILS.store(fails.n, Ordering::Relaxed);
+    // 失败行本身也要进指纹：只在「哪些行错」变化时播报。改一行业务规则
+    // 就把同一条拼写错误再打一遍，等于每次保存都提醒一次已经知道的事
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    fails.n.hash(&mut hasher);
+    for (no, text) in &fails.lines {
+        no.hash(&mut hasher);
+        text.hash(&mut hasher);
+    }
+    let sig = hasher.finish();
+    let fail_changed = fails.n == 0 || FAIL_SIG.swap(sig, Ordering::Relaxed) != sig;
+    *lock_ignore_poison(&PARSE_FAIL_LINES) = FailLines(fails.lines.clone());
 
     // 不静默吞掉：用户得知道这行已经不起作用，否则会以为护栏还开着
     if legacy_render_guard && !LEGACY_WARNED.swap(true, Ordering::Relaxed) {
@@ -1427,14 +1491,34 @@ fn load_config_with(
         Some(old) => report_reload(config_file, old, &rules, pkgs.len()),
     }
     report_offline_rules(&rules, topo);
-    if fail_cnt > 0 {
+    if fails.n > 0 && fail_changed {
         // 指令写错也走这条路（`@screen=dim` 之类），只说「规则」会让人回头
-        // 去翻规则行，实际该看的是指令拼写
+        // 去翻规则行，实际该看的是指令拼写。必须给出具体行：只说「1 行被
+        // 跳过」，用户面对四十多行配置根本无从找起
+        let samples: Vec<String> = fails
+            .lines
+            .iter()
+            .take(3)
+            .map(|(no, text)| {
+                if *no == 0 {
+                    format!("`{text}`")
+                } else {
+                    format!("第 {no} 行 `{text}`")
+                }
+            })
+            .collect();
+        let more = if fails.n > samples.len() {
+            format!("，另有 {} 条未列出", fails.n - samples.len())
+        } else {
+            String::new()
+        };
         crate::diag::tag(
             "警告",
             &format!(
-                "{} 行因格式无效被跳过（规则或指令，写法见 README）",
-                fail_cnt
+                "{} 行因格式无效被跳过（规则或指令）：{}{} ｜ 写法见 README",
+                fails.n,
+                samples.join("；"),
+                more
             ),
         );
     }
@@ -1969,6 +2053,30 @@ mod tests {
         let topo = topo_of(&[0, 1, 2, 3], &[0, 1, 2, 3], &[0, 1, 2, 3]);
         let s = scope_of("degraded", "com.a=0-1\n", &topo);
         assert_eq!((s.levels, s.rules, s.pkgs), (1, 0, 0));
+    }
+
+    /// 失败样本必须带行号且封顶：四十多行配置里报「1 行被跳过」等于没说
+    #[test]
+    fn fail_samples_keep_line_numbers_and_cap_at_five() {
+        let mut f = Fails::default();
+        f.hit(3, "com.a 4-5");
+        assert_eq!(f.n, 1);
+        assert_eq!(f.lines[0], (3, "com.a 4-5".to_string()));
+        for no in 4..=20 {
+            f.hit(no, "x");
+        }
+        assert_eq!(f.n, 18);
+        assert_eq!(f.lines.len(), MAX_FAIL_SAMPLES);
+    }
+
+    /// 截断不能切断 UTF-8：切在半截字符上会让整行日志变成乱码
+    #[test]
+    fn long_fail_line_is_clipped_on_char_boundary() {
+        let s = "规则".repeat(40);
+        let c = clip_line(&s);
+        assert!(c.ends_with('…'));
+        assert!(c.len() <= MAX_FAIL_LINE_BYTES + '…'.len_utf8());
+        assert!(!c.contains('\u{FFFD}'));
     }
 
     fn cfg_of(name: &str, conf: &str) -> AppConfig {
