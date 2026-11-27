@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::fs;
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -328,6 +328,18 @@ fn offsets_inject(bpf: &mut Ebpf) -> bool {
 /// 注入偏移。挂不上不算失败：内核没开 kprobe、syscall wrapper 符号被裁掉、
 /// 或 SELinux 拦下 perf_event_open，都会走到这里返回 false，
 /// 退回到原来的周期校验。
+/// `sched_setaffinity` 的入口符号，按架构排尝试顺序。
+///
+/// Android 导出的都是 syscall 包装 `__arm64_sys_*` / `__x64_sys_*`，
+/// 更老的内核直接导出 `sys_sched_setaffinity`。混着试只会在日志里
+/// 多两条「符号不存在」，看着像两个都坏了。
+fn probe_symbols(arch: &str) -> &'static [&'static str] {
+    match arch {
+        "aarch64" => &["__arm64_sys_sched_setaffinity", "sys_sched_setaffinity"],
+        _ => &["__x64_sys_sched_setaffinity", "sys_sched_setaffinity"],
+    }
+}
+
 fn attach_affinity_probe(bpf: &mut Ebpf) -> bool {
     // arm64: pt_regs.regs[0] 存参数块指针，参数块里 regs[0]=pid、regs[2]=mask
     // x86_64: pt_regs.di(112) 存参数块指针，参数块里 di(112)=pid、dx(96)=mask
@@ -335,10 +347,7 @@ fn attach_affinity_probe(bpf: &mut Ebpf) -> bool {
         "aarch64" => (0u32, 0u32, 16u32),
         "x86_64" => (112u32, 112u32, 96u32),
         other => {
-            crate::diag_warn!(
-                "kprobe 改写监听不支持 {} 架构，改写仍按周期校验回改",
-                other
-            );
+            crate::diag_warn!("kprobe 改写监听不支持 {} 架构，改写仍按周期校验回改", other);
             return false;
         }
     };
@@ -374,14 +383,19 @@ fn attach_affinity_probe(bpf: &mut Ebpf) -> bool {
         crate::diag_warn!("eBPF setaffinity 程序类型不符，跳过改写监听");
         return false;
     };
-    // 符号名随内核版本变：Android 走 __arm64_sys_/__x64_sys_ 包装，
-    // 更老的内核直接导出 sys_sched_setaffinity
-    for sym in [
-        "__arm64_sys_sched_setaffinity",
-        "__x64_sys_sched_setaffinity",
-        "sys_sched_setaffinity",
-    ] {
-        match kp.attach(sym, 0) {
+    // aya 0.14 不在 load 对象时加载程序，attach 前必须自己 load 一次。
+    // 少了这一步，attach 会报 "the program is not loaded"（beta25 就是这样）。
+    if let Err(e) = kp.load() {
+        AFFINITY_PROBE.store(2, Ordering::Relaxed);
+        crate::diag_warn!(
+            "kprobe 程序未通过内核校验 ({})，改写监听关闭，仍按周期校验回改",
+            e
+        );
+        return false;
+    }
+
+    for sym in probe_symbols(std::env::consts::ARCH) {
+        match kp.attach(*sym, 0) {
             Ok(_) => {
                 AFFINITY_PROBE.store(1, Ordering::Relaxed);
                 crate::diag_say!("eBPF 已监听 {}，外部改写立刻改回", sym);
@@ -714,16 +728,7 @@ fn affinity_apply_task(
     } else {
         ApplyReason::Rule
     };
-    let outcome = affinity_apply(
-        tid,
-        cpus,
-        cpuset_dir,
-        &cfg.topo,
-        reason,
-        comm,
-        verify_group,
-    )
-    .0;
+    let outcome = affinity_apply(tid, cpus, cpuset_dir, &cfg.topo, reason, comm, verify_group).0;
     if outcome != AffinityOutcome::Gone {
         applied_set(bpf, tid, cpus);
     }
@@ -810,16 +815,16 @@ fn rebind_known(state: &mut EbpfState, tid: i32, cfg: &AppConfig) {
         return;
     };
     let bpf = &mut state.bpf;
-    state.cache.task_apply(tid, pid, &pkg, &comm, cfg, |t, c, d, r, v| {
-        affinity_apply_task(t, c, d, cfg, bpf, &comm, r, v)
-    });
+    state
+        .cache
+        .task_apply(tid, pid, &pkg, &comm, cfg, |t, c, d, r, v| {
+            affinity_apply_task(t, c, d, cfg, bpf, &comm, r, v)
+        });
 }
 
 /// 定期纠正 affinity_sync 清死亡 tid
 pub fn affinity_check(state: &mut EbpfState, cfg: &AppConfig) {
-    let dead_tids = state
-        .cache
-        .affinity_sync(cfg);
+    let dead_tids = state.cache.affinity_sync(cfg);
     for tid in dead_tids {
         applied_del(&mut state.bpf, tid);
         // 这里的 tid 已经 ESRCH。EXIT 事件丢失时这是唯一能收回 RT 记录与配额的路径，
@@ -1083,6 +1088,21 @@ mod tests {
         // 与 AppOpt-ebpf 的 EVENT_AFFINITY 必须一致，改一处就是 ABI 变更
         assert_eq!(EBPF_EVENT_AFFINITY, 5);
         assert_eq!(std::mem::size_of::<RegsOff>(), 16);
+    }
+
+    #[test]
+    fn probe_symbols_follow_arch() {
+        assert_eq!(probe_symbols("aarch64")[0], "__arm64_sys_sched_setaffinity");
+        assert_eq!(probe_symbols("x86_64")[0], "__x64_sys_sched_setaffinity");
+        // 每个架构都要留老内核的兜底名
+        assert_eq!(
+            probe_symbols("aarch64").last(),
+            Some(&"sys_sched_setaffinity")
+        );
+        assert_eq!(
+            probe_symbols("x86_64").last(),
+            Some(&"sys_sched_setaffinity")
+        );
     }
 
     #[test]

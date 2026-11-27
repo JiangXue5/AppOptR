@@ -1,5 +1,27 @@
 # AppOptR 变更记录
 
+## 2.7.0-beta26（2026-11-27）
+
+beta25 的改写监听没生效，日志里三行 `kprobe ... 挂载失败 (the program is not loaded)`。
+原因很直接：aya 0.14 早就不在 `EbpfLoader::load()` 里加载程序了，每个程序
+要自己 `load()` 一次再 `attach()`。tracepoint 那边一直有这一步，新写的 kprobe
+漏了，于是 attach 拿着空 fd 去挂，报「程序未加载」。
+
+**修**
+
+- kprobe 在 attach 前显式 `load()`；校验失败只关掉改写监听，绑核与 tracepoint 不受影响
+- 符号尝试按架构分开：aarch64 只试 `__arm64_sys_*`，x86_64 只试 `__x64_sys_*`，
+  再各自兜底 `sys_sched_setaffinity`。原来两个架构的名字混着试，日志里必然多出
+  一条「符号不存在」，看着像全坏了
+- 补一条测试固定符号顺序
+
+**订正 beta25 的风险说明**
+
+beta25 说「kprobe 被 verifier 拒绝会导致整个 eBPF 对象加载失败、掉回 /proc」——
+这是错的。程序是 attach 时才加载的，一个程序校验不过不会牵连其它程序。
+beta25 的日志也印证了：tracepoint 偏移注入成功、`eBPF 初始化成功`、白名单 3 个 comm 键，
+只有 kprobe 那三行失败。所以不需要改成独立对象加载。
+
 ## 2.7.0-beta25（2026-11-26）
 
 别人改我们的绑核，不用再等下一轮校验了。之前「接管组」只管组归属，
