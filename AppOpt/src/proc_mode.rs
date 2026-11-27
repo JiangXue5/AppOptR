@@ -1,9 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::apply_affinity::{
-    AffinityOutcome, ApplyErrorKind, pkg_owned, proc_walk, read_cmdline, task_tids, tid_comm,
+    AffinityOutcome, ApplyErrorKind, pkg_owned, proc_walk_set, read_cmdline, task_tids, tid_comm,
 };
 use crate::cache::ProcCache;
 use crate::config::AppConfig;
@@ -15,6 +16,75 @@ const FULL_CHECK: Duration = Duration::from_secs(60);
 /// 没有 rename 事件；发现线程时若还没命名，线程规则就会永远落不上。
 /// 按游标轮转，常见规模（<200 线程）几轮内覆盖一遍
 const COMM_RECHECK: usize = 32;
+/// 全量扫描超过这个耗时才打一行分解：正常情况下它只有几十毫秒，
+/// 每轮都报只会让日志变吵
+const SLOW_SCAN_US: u64 = 200_000;
+
+/// 一轮扫描的耗时分解。回答的是「卡在哪」：`/proc` 目录与 cmdline 读取，
+/// 还是 task 目录 + 规则计算。没有这两个数，「扫描很慢」只能靠猜
+#[derive(Clone, Copy, Default, Debug)]
+pub struct ScanCost {
+    pub procs: usize,
+    pub threads: usize,
+    /// 遍历 /proc 与读 cmdline 的耗时
+    pub walk_us: u64,
+    /// 遍历 task 目录、读线程名、跑规则与写缓存的耗时
+    pub tasks_us: u64,
+    pub total_us: u64,
+}
+
+/// 累计指标，Web 诊断读取
+#[derive(Clone, Copy, Default, Debug)]
+pub struct ScanMetrics {
+    pub last_full: ScanCost,
+    pub full_scans: u64,
+    pub incremental: u64,
+    pub worst_full_us: u64,
+}
+
+const EMPTY_METRICS: ScanMetrics = ScanMetrics {
+    last_full: ScanCost {
+        procs: 0,
+        threads: 0,
+        walk_us: 0,
+        tasks_us: 0,
+        total_us: 0,
+    },
+    full_scans: 0,
+    incremental: 0,
+    worst_full_us: 0,
+};
+
+static METRICS: Mutex<ScanMetrics> = Mutex::new(EMPTY_METRICS);
+
+/// 最近一次全量扫描的成本与累计次数
+pub fn metrics() -> ScanMetrics {
+    *crate::lock_ignore_poison(&METRICS)
+}
+
+fn publish(full: bool, cost: ScanCost) {
+    {
+        let mut m = crate::lock_ignore_poison(&METRICS);
+        if full {
+            m.full_scans = m.full_scans.saturating_add(1);
+            m.last_full = cost;
+            m.worst_full_us = m.worst_full_us.max(cost.total_us);
+        } else {
+            m.incremental = m.incremental.saturating_add(1);
+        }
+    }
+    // 只有明显偏慢才播报：这两个数就是「该不该继续优化扫描」的依据
+    if full && cost.total_us >= SLOW_SCAN_US {
+        crate::diag_say!(
+            "全量扫描 {:.0} ms（进程 {}、线程 {}；遍历 {} ms、建表 {} ms）",
+            cost.total_us as f64 / 1000.0,
+            cost.procs,
+            cost.threads,
+            cost.walk_us as f64 / 1000.0,
+            cost.tasks_us as f64 / 1000.0
+        );
+    }
+}
 
 pub struct ProcScanState {
     pub cache: ProcCache,
@@ -60,7 +130,9 @@ pub fn cache_sync(cfg: &AppConfig, state: &mut ProcScanState) {
         return;
     }
 
+    let started = Instant::now();
     let current = read_pid_set();
+    let walk_us = started.elapsed().as_micros() as u64;
 
     let new_pids: Vec<i32> = current
         .iter()
@@ -113,6 +185,17 @@ pub fn cache_sync(cfg: &AppConfig, state: &mut ProcScanState) {
 
     state.known_pids = current;
     recheck_names(cfg, state);
+    let total_us = started.elapsed().as_micros() as u64;
+    publish(
+        false,
+        ScanCost {
+            procs: state.known_pids.len(),
+            threads: state.known_tids.len(),
+            walk_us,
+            tasks_us: total_us.saturating_sub(walk_us),
+            total_us,
+        },
+    );
 }
 
 /// 轮转重读线程名，补上没有 rename 事件时漏掉的改名。
@@ -173,21 +256,25 @@ fn discover_targets(tracked: &HashMap<i32, String>, cfg: &AppConfig) -> Vec<i32>
         .collect()
 }
 
-/// 全量重建：清空缓存与跟踪状态后遍历 /proc
+/// 全量重建：清空缓存与跟踪状态后遍历 /proc。
+///
+/// 遍历只做一趟：`proc_walk_set` 在读 cmdline 的同时把 PID 集合带回，
+/// 不再像以前那样先用 `read_pid_set()` 读一遍、再整棵 /proc 走一遍
 fn proc_scan(cfg: &AppConfig, state: &mut ProcScanState) {
-    let current = read_pid_set();
+    let started = Instant::now();
     state.cache.clear();
     state.tracked_pids.clear();
     state.known_tids.clear();
 
-    let _ = proc_walk(
-        cfg,
-        |_| true,
-        |pid, pkg| {
-            state.tracked_pids.insert(pid, pkg.to_string());
-            proc_tasks(pid, pkg, cfg.needs_comm(pkg), cfg, state);
-        },
-    );
+    // 回调里累计建表耗时：整趟只记一个总时间的话，无法区分
+    // 「/proc 读得慢」与「规则算得慢」
+    let mut tasks_ns: u128 = 0;
+    let (procs, current) = proc_walk_set(cfg, |pid, pkg| {
+        let t = Instant::now();
+        state.tracked_pids.insert(pid, pkg.to_string());
+        proc_tasks(pid, pkg, cfg.needs_comm(pkg), cfg, state);
+        tasks_ns = tasks_ns.saturating_add(t.elapsed().as_nanos());
+    });
 
     state.known_pids = current;
     state.rescan_all = false;
@@ -196,6 +283,19 @@ fn proc_scan(cfg: &AppConfig, state: &mut ProcScanState) {
     // 缓存已重建，再对账 RT：进程在扫描窗口内退出、包被移出配置时，
     // 旧的 RT 记录不能留着。仍符合条件的线程不受影响
     rt::reconcile(cfg, &state.cache);
+
+    let total_us = started.elapsed().as_micros() as u64;
+    let tasks_us = (tasks_ns / 1000) as u64;
+    publish(
+        true,
+        ScanCost {
+            procs,
+            threads: state.known_tids.len(),
+            walk_us: total_us.saturating_sub(tasks_us),
+            tasks_us,
+            total_us,
+        },
+    );
 }
 
 fn read_pid_set() -> HashSet<i32> {
@@ -283,5 +383,30 @@ mod tests {
         let mut tracked = HashMap::new();
         tracked.insert(200, "com.b".to_string());
         assert_eq!(discover_targets(&tracked, &cfg), vec![200]);
+    }
+
+    /// 扫描指标要能累计：全量次数、最坏耗时、最近一次分解
+    #[test]
+    fn scan_metrics_accumulate() {
+        let before = metrics();
+        publish(
+            true,
+            ScanCost {
+                procs: 320,
+                threads: 812,
+                walk_us: 12_000,
+                tasks_us: 40_000,
+                total_us: 52_000,
+            },
+        );
+        let after = metrics();
+        assert_eq!(after.full_scans, before.full_scans + 1);
+        assert!(after.worst_full_us >= 52_000);
+        assert_eq!(after.last_full.procs, 320);
+        assert_eq!(after.last_full.threads, 812);
+        assert_eq!(
+            after.last_full.total_us,
+            after.last_full.walk_us + after.last_full.tasks_us
+        );
     }
 }

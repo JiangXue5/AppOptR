@@ -456,6 +456,100 @@ pub enum ApplyReason {
     Sched,
 }
 
+/// 回读与目标的三种关系。`sched_setaffinity` 返回 0 只代表内核接受了参数，
+/// 最终生效集合还要和 cpuset 的 `effective_cpus`、`cpu_active_mask` 求交：
+///
+/// - `Exact`：完全一致，按目标维持；
+/// - `Trimmed`：回读是目标的真子集。这是合法裁剪（组只能跑这几核、核被
+///   hotplug 下电），不是失败——按目标维持会每轮重写、每轮被裁一次；
+/// - `Stray`：与目标无关的集合，说明写入没生效或被别人改走，必须报失败
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Readback {
+    Exact,
+    Trimmed,
+    Stray,
+}
+
+/// 分类必须放在一处：S7 与周期校验各自解释一次「回读不一致」，
+/// 结果就是一边当失败、一边当成功
+pub fn classify_readback(target: &CpuSet, actual: &CpuSet) -> Readback {
+    if actual == target {
+        Readback::Exact
+    } else if actual.count() > 0 && actual.subset_of(target) {
+        Readback::Trimmed
+    } else {
+        Readback::Stray
+    }
+}
+
+/// 一次「写入 + 回读」的完整结果。`readback` 为 `None` 表示没做成校验
+/// （写入失败，或线程在读回前退出），调用方不能再拿 `Set` 当「确认生效」
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ApplyReport {
+    pub outcome: AffinityOutcome,
+    pub wrote: bool,
+    pub readback: Option<Readback>,
+    /// 回读到的实际集合，`Trimmed` 时就是内核接受的子集
+    pub actual: Option<CpuSet>,
+}
+
+impl ApplyReport {
+    /// 完全没写成：结果里不放任何可能被误读成「已生效」的字段
+    pub fn failed(outcome: AffinityOutcome) -> Self {
+        Self {
+            outcome,
+            wrote: false,
+            readback: None,
+            actual: None,
+        }
+    }
+}
+
+/// 统一的写入验证层：写亲和性、回读、分类，一次说清「到底生效了没有」。
+///
+/// 只给需要确认结果的路径用（S7 迁移、规则重绑）。周期校验内部已经按
+/// `Sync` 语义做过一次回读，不必再套一层
+pub fn apply_and_verify(
+    tid: i32,
+    cpus: &CpuSet,
+    cpuset_dir: Option<&str>,
+    topo: &CpuTopology,
+    reason: ApplyReason,
+    comm: &str,
+    verify_group: bool,
+) -> ApplyReport {
+    let (outcome, wrote) = affinity_apply(tid, cpus, cpuset_dir, topo, reason, comm, verify_group);
+    if outcome != AffinityOutcome::Set {
+        return ApplyReport {
+            outcome,
+            wrote,
+            readback: None,
+            actual: None,
+        };
+    }
+    let Some(actual) = CpuSet::get_affinity(tid) else {
+        // 写成功、读的时候线程已经没了：结果不可判定，调用方按未确认处理
+        return ApplyReport {
+            outcome,
+            wrote,
+            readback: None,
+            actual: None,
+        };
+    };
+    let readback = classify_readback(cpus, &actual);
+    if readback == Readback::Trimmed {
+        // 合法裁剪也要留现场：同一个线程反复被裁，说明目标本来就不在
+        // 可达集合里，用户需要看到「要 4-7、实际 4-5」
+        diag::note_ineffective(tid, comm, cpus, &actual);
+    }
+    ApplyReport {
+        outcome,
+        wrote,
+        readback: Some(readback),
+        actual: Some(actual),
+    }
+}
+
 /// 对单线程应用亲和性。cpuset 目录只是辅助手段，成败以内核返回为准。
 /// 返回 `(结果, 是否真的写入)`：短路的「已一致」不算写入，
 /// 定期校验可以据此判断线程是否被外部改写
@@ -569,7 +663,7 @@ pub fn affinity_apply(
 /// 是否读线程名交给调用方用 `cfg.needs_comm` 判断，这里不再传旧的包级标记
 pub(crate) fn proc_walk(
     cfg: &AppConfig,
-    filter: impl Fn(i32) -> bool,
+    mut filter: impl FnMut(i32) -> bool,
     mut f: impl FnMut(i32, &str),
 ) -> (usize, i32) {
     let Some(entries) = fs::read_dir("/proc").ok() else {
@@ -600,6 +694,28 @@ pub(crate) fn proc_walk(
         count += 1;
     }
     (count, total)
+}
+
+/// 全量扫描专用：一趟 `/proc` 同时拿到 PID 集合与匹配进程。
+///
+/// 以前 `read_pid_set()` 与 `proc_walk()` 各遍历一次 `/proc`，同一批目录项
+/// 读了两遍。进程数上千时多出来的 syscall 全落在全量对账这一秒里。
+/// 这里借 `filter` 收集 pid：它在读 cmdline 之前对每个条目调用一次，
+/// 正好是「这个 pid 存在」的完整集合
+pub(crate) fn proc_walk_set(
+    cfg: &AppConfig,
+    mut f: impl FnMut(i32, &str),
+) -> (usize, HashSet<i32>) {
+    let mut pids = HashSet::new();
+    let (count, _) = proc_walk(
+        cfg,
+        |pid| {
+            pids.insert(pid);
+            true
+        },
+        |pid, pkg| f(pid, pkg),
+    );
+    (count, pids)
 }
 
 #[cfg(test)]
@@ -695,5 +811,40 @@ mod tests {
             affinity_apply(GHOST, &one, None, &topo, ApplyReason::Rule, "", false).0,
             AffinityOutcome::Gone
         );
+    }
+
+    fn set(spec: &str) -> CpuSet {
+        crate::cpuset::parse_cpu_ranges(spec, None)
+    }
+
+    /// 三种回读关系不能混：合法裁剪既不是失败，也不能当成按目标生效
+    #[test]
+    fn readback_distinguishes_trim_from_mismatch() {
+        assert_eq!(classify_readback(&set("4-7"), &set("4-7")), Readback::Exact);
+        // cpuset 只能跑 4-5：内核接受了请求，但裁掉了够不到的核
+        assert_eq!(
+            classify_readback(&set("4-7"), &set("4-5")),
+            Readback::Trimmed
+        );
+        // 被挪回小核：与目标无关，属于写入没生效
+        assert_eq!(classify_readback(&set("4-7"), &set("0-3")), Readback::Stray);
+        // 空集合不是「合法的子集」，是线程已无可运行核
+        assert_eq!(
+            classify_readback(&set("4-7"), &CpuSet::new()),
+            Readback::Stray
+        );
+    }
+
+    /// 写入验证层在目标就是当前集合时必须报 Exact，不能把短路当成没校验
+    #[test]
+    fn apply_and_verify_reports_exact_on_noop() {
+        let topo = CpuTopology::empty();
+        let tid = self_tid();
+        let curr = CpuSet::get_affinity(tid).expect("读取自身亲和性失败");
+        let rep = apply_and_verify(tid, &curr, None, &topo, ApplyReason::Sched, "", false);
+        assert_eq!(rep.outcome, AffinityOutcome::Set);
+        assert!(!rep.wrote);
+        assert_eq!(rep.readback, Some(Readback::Exact));
+        assert_eq!(rep.actual, Some(curr));
     }
 }

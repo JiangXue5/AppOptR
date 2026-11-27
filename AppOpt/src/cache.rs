@@ -108,12 +108,14 @@ fn resolve_group(path: Option<&str>, prev: Option<&TaskEntry>) -> SysGroup {
 /// 日志里就会多出几百行 EINVAL 或几百次无效重绑，必须能脱离真机单测
 use crate::policy::{PolicySource, plan_entry};
 
-/// S7 落点。带上 `start_time`：tid 会被内核复用，只凭号码判断会把
+/// S7 落点。带上完整线程身份：tid 会被内核复用，只凭号码判断会把
 /// 上一条线程的落点套到刚创建的新线程上——新线程会被绑进一个更小的簇，
-/// 而它从没参与过那次迁移的负载判断
+/// 而它从没参与过那次迁移的负载判断。
+///
+/// 身份判据统一走 `TaskIdentity::same_thread`，与生命周期账本、RT 所有权一致
 #[derive(Clone, Copy)]
 struct Landing {
-    start_time: u64,
+    identity: crate::lifecycle::TaskIdentity,
     cpus: CpuSet,
 }
 
@@ -164,16 +166,10 @@ impl ProcCache {
 
     /// S7 迁移成功。落点单独存，重建缓存后仍能维持
     pub fn note_sched(&mut self, tid: i32, cpus: CpuSet) {
-        // 记下此刻的 starttime 作为身份。读不到（线程正在退出）就不记：
+        // 记下此刻的身份。读不到（线程正在退出）就不记：
         // 没有身份的落点宁可不要，也不要让它落到下一个复用这个号的线程上
-        if let Some(id) = crate::lifecycle::identity_of(tid) {
-            self.sched.insert(
-                tid,
-                Landing {
-                    start_time: id.start_time,
-                    cpus,
-                },
-            );
+        if let Some(identity) = crate::lifecycle::identity_of(tid) {
+            self.sched.insert(tid, Landing { identity, cpus });
         }
     }
 
@@ -182,7 +178,7 @@ impl ProcCache {
     fn landing_of(&self, tid: i32) -> Option<CpuSet> {
         let l = self.sched.get(&tid)?;
         let now = crate::lifecycle::identity_of(tid)?;
-        (now.start_time == l.start_time).then_some(l.cpus)
+        now.same_thread(&l.identity).then_some(l.cpus)
     }
 
     /// 一次性把有效落点摊成快照。`affinity_sync` 的循环已经可变借用了
@@ -830,9 +826,9 @@ mod tests {
         let tid = unsafe { libc::syscall(libc::SYS_gettid) as i32 };
         cache.note_sched(tid, set_of("4-7"));
         assert_eq!(cache.landing_of(tid), Some(set_of("4-7")));
-        // 把记录改成「上一条线程」的 starttime，模拟号被复用
+        // 把记录改成「上一条线程」的身份，模拟号被复用
         if let Some(l) = cache.sched.get_mut(&tid) {
-            l.start_time = 1;
+            l.identity.start_time = 1;
         }
         assert_eq!(cache.landing_of(tid), None);
     }

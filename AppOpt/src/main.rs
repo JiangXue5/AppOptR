@@ -34,12 +34,15 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::apply_affinity::{AffinityOutcome, ApplyErrorKind, ApplyReason, affinity_apply};
+use crate::apply_affinity::{
+    AffinityOutcome, ApplyErrorKind, ApplyReason, ApplyReport, Readback, apply_and_verify,
+};
+use crate::cache::ProcCache;
 use crate::config::{
     AppConfig, CHECK_INTERVAL, CONFIG_FILE, CURRENT_CONFIG, SchedMode, config_loader, init_inotify,
     load_config,
 };
-use crate::cpuset::{CpuSet, init_cpu_topo, set_base_cpuset};
+use crate::cpuset::{init_cpu_topo, set_base_cpuset};
 use crate::ebpf_mode::{
     DROPPED_TOTAL, EbpfState, affinity_check, comm_map_init, config_rescan, ebpf_init,
     event_dispatch, full_scan, reconcile,
@@ -522,12 +525,12 @@ fn main() {
 
         // 恢复失败的记录按 30 秒重试。这类线程的规则已经撤了，不会再有
         // 配置变化把它带回上面的分支；不主动重试就只能等退出时才还。
-        // 日志按状态签名去重，失败原因没变不会重复打
+        // 只取待恢复的那几条：健康记录不参与克隆，也不为它们重读 /proc
         if crate::lifecycle::recovery_required() > 0
             && recovery_deadline.elapsed() >= Duration::from_secs(30)
         {
             recovery_deadline = Instant::now();
-            crate::lifecycle::release_unmanaged(&cfg, false);
+            crate::lifecycle::retry_recovery(&cfg);
         }
 
         // 配置加载线程 panic 恢复
@@ -721,13 +724,14 @@ fn main() {
                     Vec::new()
                 };
                 for m in &moves {
-                    let outcome = match (&mut ebpf_state, &mut proc_state) {
-                        (Some(es), _) => apply_move_ebpf(es, &cfg, m),
-                        (None, Some(ps)) => apply_move_proc(ps, &cfg, m),
-                        _ => AffinityOutcome::Failed(ApplyErrorKind::Other),
+                    let rep = match (&mut ebpf_state, &mut proc_state) {
+                        (Some(es), _) => apply_move(&mut es.cache, &cfg, m),
+                        (None, Some(ps)) => apply_move(&mut ps.cache, &cfg, m),
+                        _ => ApplyReport::failed(AffinityOutcome::Failed(ApplyErrorKind::Other)),
                     };
-                    // 只有内核确认写入成功，settle 才会提交落点与 moved
-                    sched_state.settle(m, outcome);
+                    // 只有内核确认写入成功，settle 才会提交落点与 moved；
+                    // 被 cpuset 裁剪时按实际生效的子集提交，别让下一轮再迁一次
+                    sched_state.settle(m, rep.outcome, rep.actual);
                 }
 
                 sched_state.publish();
@@ -804,12 +808,14 @@ fn main() {
     }
 }
 
-/// S7 迁移执行（eBPF 模式）：只改亲和性，不写 cpuset 目录，保持原有归属。
-/// 只有 `Set` 才同步缓存里的集合，失败保持旧值等下一轮
-fn apply_move_ebpf(es: &mut EbpfState, cfg: &AppConfig, m: &sched::Move) -> AffinityOutcome {
-    // S7 只改绑核，不写 cpuset：cgroup 迁移会带来额外抖动，
-    // 失败时还会把线程留在一个比目标更宽的集合里
-    match affinity_apply(
+/// S7 迁移执行：只改亲和性，不写 cpuset 目录，保持原有归属。
+///
+/// 两种模式共用这一条路径。以前 eBPF 与 proc 各写一份，唯一的差别是拿哪本
+/// 缓存，逻辑却要同步维护两遍——一次改动漏掉一边，S7 落点就在其中一个模式里
+/// 不生效。写入与回读校验也统一到 `apply_and_verify`：`sched_setaffinity`
+/// 返回 0 只代表内核收下了参数
+fn apply_move(cache: &mut ProcCache, cfg: &AppConfig, m: &sched::Move) -> ApplyReport {
+    let rep = apply_and_verify(
         m.tid,
         &m.cpus,
         None,
@@ -817,64 +823,36 @@ fn apply_move_ebpf(es: &mut EbpfState, cfg: &AppConfig, m: &sched::Move) -> Affi
         ApplyReason::Sched,
         &m.comm,
         false,
-    )
-    .0
-    {
+    );
+    match rep.outcome {
         AffinityOutcome::Set => {
-            // S7 只写 sched_setaffinity，cgroup 会把集合求交：返回 0 也可能被裁小。
-            // 读回不一致就不能记落点——定期校验会按一个内核根本不接受的集合维持，
-            // S7 又把「回读不一致」当成被规则拉回，每轮重置状态再迁一次
-            if CpuSet::get_affinity(m.tid).is_some_and(|a| a != m.cpus) {
-                return AffinityOutcome::Failed(ApplyErrorKind::ReadbackMismatch);
+            // 回读跑到目标之外：写入没生效（被系统改回去、或写进了不可调度的核）。
+            // 记落点只会让下一轮按一个内核根本不接受的集合维持
+            if rep.readback == Some(Readback::Stray) {
+                return ApplyReport::failed(AffinityOutcome::Failed(
+                    ApplyErrorKind::ReadbackMismatch,
+                ));
             }
+            // 被 cpuset 合法裁剪时按内核真正接受的子集维持：按目标维持会让
+            // 每轮同步重写一次、再被裁一次，线程在两次写入之间反复迁移
+            let applied = rep.actual.unwrap_or(m.cpus);
             // 同步缓存：affinity_sync 每 3*interval 秒会按 entry.cpus 重设，
             // 不改这里，迁移结果几秒后就被拉回规则值
-            if let Some(e) = es.cache.tasks.get_mut(&m.tid) {
-                e.cpus = m.cpus;
+            if let Some(e) = cache.tasks.get_mut(&m.tid) {
+                e.cpus = applied;
                 // 账本里的「最后写入」也要跟上：释放前拿它判断是否被外部改过，
                 // 停在旧值会让一次正常的 S7 迁移被误判成外部改写
-                crate::lifecycle::note_applied(m.tid, &m.cpus, &e.cpuset_dir);
+                crate::lifecycle::note_applied(m.tid, &applied, &e.cpuset_dir);
             }
             // 落点另存一份：缓存随时可能被全量重建，条目里的值活不过一次重扫
-            es.cache.note_sched(m.tid, m.cpus);
-            AffinityOutcome::Set
+            cache.note_sched(m.tid, applied);
+            rep
         }
         AffinityOutcome::Gone => {
-            es.cache.task_gone(m.tid);
-            AffinityOutcome::Gone
+            cache.task_gone(m.tid);
+            rep
         }
-        AffinityOutcome::Failed(kind) => AffinityOutcome::Failed(kind),
-    }
-}
-
-fn apply_move_proc(ps: &mut ProcScanState, cfg: &AppConfig, m: &sched::Move) -> AffinityOutcome {
-    match affinity_apply(
-        m.tid,
-        &m.cpus,
-        None,
-        &cfg.topo,
-        ApplyReason::Sched,
-        &m.comm,
-        false,
-    )
-    .0
-    {
-        AffinityOutcome::Set => {
-            if CpuSet::get_affinity(m.tid).is_some_and(|a| a != m.cpus) {
-                return AffinityOutcome::Failed(ApplyErrorKind::ReadbackMismatch);
-            }
-            if let Some(e) = ps.cache.tasks.get_mut(&m.tid) {
-                e.cpus = m.cpus;
-                crate::lifecycle::note_applied(m.tid, &m.cpus, &e.cpuset_dir);
-            }
-            ps.cache.note_sched(m.tid, m.cpus);
-            AffinityOutcome::Set
-        }
-        AffinityOutcome::Gone => {
-            ps.cache.task_gone(m.tid);
-            AffinityOutcome::Gone
-        }
-        AffinityOutcome::Failed(kind) => AffinityOutcome::Failed(kind),
+        AffinityOutcome::Failed(_) => rep,
     }
 }
 

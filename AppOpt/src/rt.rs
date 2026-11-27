@@ -16,10 +16,12 @@ use std::ffi::CString;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use crate::cache::{ProcCache, TaskEntry};
 use crate::config::{AppConfig, RtMatch};
 use crate::cpuset::CpuSet;
+use crate::lifecycle::{TaskIdentity, identity_of};
 use crate::roles::role_of;
 
 const RR_TIMESLICE_PATH: &str = "/proc/sys/kernel/sched_rr_timeslice_ms";
@@ -28,11 +30,17 @@ const SCHED_RESET_ON_FORK: libc::c_int = 0x4000_0000;
 
 /// 由本模块提升的线程。只有 `sched_setscheduler` 返回 0 的线程会进来
 struct Owned {
-    pid: i32,
+    /// 完整线程身份。只留 pid 不够：同一个进程里 TID 也会被复用，
+    /// 「新线程恰好是同一个号」与「旧线程还活着」在 pid 层面无法区分
+    identity: TaskIdentity,
     pkg: String,
     comm: String,
     /// 提升时的规则允许集合，配置热更新时用于复核 Auto 的核数条件
     allowed: CpuSet,
+    /// 撤销时降级失败：记录留着，等下一轮重试。
+    /// 以前是先删记录再降级，失败就等于「这条 RT 从此无人认领」——
+    /// 线程一直停在 RR，模块却以为已经放手
+    pending_demote: bool,
 }
 
 pub struct RtState {
@@ -99,7 +107,10 @@ impl RtState {
                 drop.push(tid);
                 continue;
             }
-            quota.entry((a.pid, a.pkg.clone())).or_default().push(tid);
+            quota
+                .entry((a.identity.tgid, a.pkg.clone()))
+                .or_default()
+                .push(tid);
         }
         // 上限下调时按 tid 升序保留前 max 个，保证结果与遍历顺序无关
         for ((_, pkg), mut tids) in quota {
@@ -112,7 +123,7 @@ impl RtState {
                 drop.extend(tids.split_off(max as usize));
             }
         }
-        let n = self.drop_threads(&drop);
+        let n = self.drop_threads(&drop).0;
         if n > 0 {
             crate::diag_say!("RT 配置变更后回滚 {} 个线程到 SCHED_OTHER", n);
         }
@@ -132,16 +143,34 @@ impl RtState {
             return false;
         }
 
-        // TID 复用：记录里的 pid 与当前线程不符，说明旧线程已经退出，
-        // 这条记录与新线程无关。必须排在策略检查和任何降级之前——
-        // 否则复用了该 tid 的新线程会顶着别人的记录被 drop_threads 降级
-        if self.own.get(&tid).is_some_and(|a| a.pid != pid) {
+        // 拿一次线程身份。`pid` 由上游给的是进程号（TGID），stat 里读不到，
+        // 这里补进身份里供配额与进程退出清账使用；starttime 只能从内核拿
+        let Some(start) = identity_of(tid) else {
+            // 线程在事件到达与这次调用之间退出：旧记录留着只会一直占配额，
+            // 也没有任何号可以再核对
+            self.own.remove(&tid);
+            return false;
+        };
+        let identity = TaskIdentity {
+            tid,
+            tgid: pid,
+            start_time: start.start_time,
+        };
+
+        // TID 复用：同一个号换了线程（同进程内也会发生），旧记录与新线程无关。
+        // 必须排在策略检查和任何降级之前——否则复用了该 tid 的新线程会顶着
+        // 别人的记录被 drop_threads 降级
+        if self
+            .own
+            .get(&tid)
+            .is_some_and(|a| !a.identity.same_thread(&identity))
+        {
             self.own.remove(&tid);
         }
 
         let Some((mode, max)) = cfg.rt.policy(pkg) else {
             // 新配置里这个包已无 RT 资格：只收回自己提升过的线程。
-            // 走到这里 own 里若还有该 tid，pid 已核对一致，确实属于当前线程
+            // 走到这里 own 里若还有该 tid，身份已核对一致，确实属于当前线程
             if self.own.contains_key(&tid) {
                 self.drop_threads(&[tid]);
             }
@@ -171,7 +200,9 @@ impl RtState {
                     }
                     a.allowed = *allowed;
                     a.pkg = pkg.to_string();
-                    a.pid = pid;
+                    a.identity.tgid = pid;
+                    // 配置又允许它了：之前那次撤销作废，别在重试里把它降下去
+                    a.pending_demote = false;
                 }
                 false
             }
@@ -179,7 +210,7 @@ impl RtState {
                 self.drop_threads(&[tid]);
                 false
             }
-            Action::Adopt => self.apply(tid, pid, pkg, comm, allowed),
+            Action::Adopt => self.apply(identity, pkg, comm, allowed),
             // 外部 RT（不接管）或不符合策略/配额已满
             Action::Foreign | Action::Skip => false,
         }
@@ -190,9 +221,11 @@ impl RtState {
         self.own.remove(&tid);
     }
 
-    /// 进程退出：清理该 PID 下全部 RT 记录与配额
+    /// 进程退出：清理该进程下全部 RT 记录与配额。
+    /// 按 TGID 比对；tgid 未知时（理论上不会）退回 tid，避免把记录永远留下
     pub fn release_pid(&mut self, pid: i32) {
-        self.own.retain(|_, a| a.pid != pid);
+        self.own
+            .retain(|&tid, a| a.identity.tgid != pid && tid != pid);
     }
 
     /// 全量重扫后的对账：只处理自己提升过的线程。
@@ -202,10 +235,16 @@ impl RtState {
         if self.own.is_empty() {
             return;
         }
+        // 上一轮降级失败的记录先重试：它们的规则已经撤了，等不到事件，
+        // 只有全量扫描这一条路径能再碰它们
+        self.retry_pending();
         let mut demote: Vec<i32> = Vec::new();
         let mut forget: Vec<i32> = Vec::new();
         for (&tid, a) in &self.own {
-            match plan(cfg, a, cache.tasks.get(&tid)) {
+            // 每条自有记录一次 stat：只有几十条，换掉「同进程 TID 复用无法识别」
+            // 这个缺口是值得的。读不到 = 线程已退出
+            let now = identity_of(tid);
+            match plan(cfg, a, cache.tasks.get(&tid), now) {
                 Plan::Keep => {}
                 Plan::Demote => demote.push(tid),
                 Plan::Forget => forget.push(tid),
@@ -214,9 +253,26 @@ impl RtState {
         for tid in forget {
             self.own.remove(&tid);
         }
-        let n = self.drop_threads(&demote);
+        let n = self.drop_threads(&demote).0;
         if n > 0 {
             crate::diag_say!("RT 全量重扫后回滚 {} 个不再符合条件的线程", n);
+        }
+    }
+
+    /// 降级失败留下的记录，按全量扫描周期再试一次
+    fn retry_pending(&mut self) {
+        let tids: Vec<i32> = self
+            .own
+            .iter()
+            .filter(|(_, a)| a.pending_demote)
+            .map(|(&tid, _)| tid)
+            .collect();
+        if tids.is_empty() {
+            return;
+        }
+        let (ok, _) = self.drop_threads(&tids);
+        if ok > 0 {
+            crate::diag_say!("RT 重试成功，{} 个线程已回到 SCHED_OTHER", ok);
         }
     }
 
@@ -226,7 +282,7 @@ impl RtState {
             return;
         }
         let tids: Vec<i32> = self.own.keys().copied().collect();
-        let n = self.drop_threads(&tids);
+        let n = self.drop_threads(&tids).0;
         if n > 0 {
             crate::diag_say!("RT 回滚 {} 个线程到 SCHED_OTHER", n);
         }
@@ -248,24 +304,56 @@ impl RtState {
         self.restore_timeslice();
     }
 
-    /// 该 PID 当前由本模块管理的 RT 线程数
-    fn count(&self, pid: i32) -> usize {
-        self.own.values().filter(|a| a.pid == pid).count()
+    /// 该进程当前由本模块管理的 RT 线程数
+    fn count(&self, tgid: i32) -> usize {
+        self.own
+            .values()
+            .filter(|a| a.identity.tgid == tgid)
+            .count()
     }
 
-    /// 移除并降级。线程已退出时 setscheduler 失败，属正常情况
-    fn drop_threads(&mut self, tids: &[i32]) -> usize {
+    /// 移除并降级。返回（成功降级数, 失败数）。
+    ///
+    /// 失败时保留记录：线程可能只是暂时改不动（权限、SELinux 瞬态），
+    /// 直接清掉就等于永远失去它的所有权。成功或线程已退出才删
+    fn drop_threads(&mut self, tids: &[i32]) -> (usize, usize) {
         let mut n = 0;
+        let mut failed = 0;
+        let mut last_err = 0;
         for tid in tids {
-            if self.own.remove(tid).is_some() && demote(*tid) {
-                n += 1;
+            if !self.own.contains_key(tid) {
+                continue;
+            }
+            match demote(*tid) {
+                Demote::Done => {
+                    self.own.remove(tid);
+                    n += 1;
+                }
+                // 线程已经不在：记录没有任何继续存在的理由
+                Demote::Gone => {
+                    self.own.remove(tid);
+                }
+                Demote::Failed(errno) => {
+                    if let Some(a) = self.own.get_mut(tid) {
+                        a.pending_demote = true;
+                    }
+                    failed += 1;
+                    last_err = errno;
+                }
             }
         }
         self.demoted += n as u64;
-        n
+        if failed > 0 {
+            // 一次一条：几十个线程因为同一个原因降不下去时，逐条播报只会刷屏
+            warn_demote_fail(failed, last_err);
+        } else {
+            *crate::lock_ignore_poison(&LAST_DEMOTE_FAIL) = None;
+        }
+        (n, failed)
     }
 
-    fn apply(&mut self, tid: i32, pid: i32, pkg: &str, comm: &str, allowed: &CpuSet) -> bool {
+    fn apply(&mut self, identity: TaskIdentity, pkg: &str, comm: &str, allowed: &CpuSet) -> bool {
+        let tid = identity.tid;
         // 用零初始化再赋优先级：aarch64-musl 的 sched_param 带 SCHED_DEADLINE 字段，
         // 结构体字面量在部分 target 上无法编译
         let mut param: libc::sched_param = unsafe { std::mem::zeroed() };
@@ -297,10 +385,11 @@ impl RtState {
         self.own.insert(
             tid,
             Owned {
-                pid,
+                identity,
                 pkg: pkg.to_string(),
                 comm: comm.to_string(),
                 allowed: *allowed,
+                pending_demote: false,
             },
         );
         true
@@ -446,12 +535,19 @@ enum Plan {
     Forget,
 }
 
-/// `None` 说明缓存里没有这个 tid：多数是线程已退出（`demote` 拿到 ESRCH 无害），
-/// 也可能是包被移出配置导致不再进缓存，这种情况必须真的撤销，所以按撤销处理。
-/// 只有 pid 对不上时才走 `Forget`——那是别人的线程，不能对它调 `sched_setscheduler`
-fn plan(cfg: &AppConfig, a: &Owned, entry: Option<&TaskEntry>) -> Plan {
+/// `None` 说明线程已经不存在：只丢记录，不对一个不存在的号调
+/// `sched_setscheduler`。缓存里没有但线程还在，才是「包被移出配置」，
+/// 必须真的撤销
+fn plan(cfg: &AppConfig, a: &Owned, entry: Option<&TaskEntry>, now: Option<TaskIdentity>) -> Plan {
+    let Some(now) = now else {
+        return Plan::Forget;
+    };
+    // 同进程内复用 TID 也会被这里拦住：pid 相同、starttime 不同
+    if !a.identity.same_thread(&now) {
+        return Plan::Forget;
+    }
     match entry {
-        Some(e) if e.pid != a.pid => Plan::Forget,
+        Some(e) if e.pid != a.identity.tgid => Plan::Forget,
         Some(e) => {
             let ok = e.pkg == a.pkg
                 && cfg
@@ -522,10 +618,27 @@ fn owned_value(current: Option<u32>, applied: Option<u32>) -> bool {
     current.is_some() && current == applied
 }
 
-fn demote(tid: i32) -> bool {
+/// 一次降级调用的三种结果。必须区分「线程没了」与「这次没改成」：
+/// 前者要清记录，后者要留着记录等重试
+enum Demote {
+    Done,
+    /// ESRCH
+    Gone,
+    Failed(i32),
+}
+
+fn demote(tid: i32) -> Demote {
     let mut param: libc::sched_param = unsafe { std::mem::zeroed() };
     param.sched_priority = 0;
-    sys_setsched(tid, libc::SCHED_OTHER, &param) == 0
+    if sys_setsched(tid, libc::SCHED_OTHER, &param) == 0 {
+        return Demote::Done;
+    }
+    let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    if errno == libc::ESRCH {
+        Demote::Gone
+    } else {
+        Demote::Failed(errno)
+    }
 }
 
 fn backup_path() -> Option<PathBuf> {
@@ -551,9 +664,27 @@ fn restore_stale() {
     let _ = fs::remove_file(&path);
 }
 
+/// 上一次降级失败播报的签名。失败记录会按全量扫描周期重试，同一个原因
+/// 每分钟一条会把别的行挤掉；状态没变就不再重复
+static LAST_DEMOTE_FAIL: Mutex<Option<(usize, i32)>> = Mutex::new(None);
+
+fn warn_demote_fail(failed: usize, errno: i32) {
+    let mut g = crate::lock_ignore_poison(&LAST_DEMOTE_FAIL);
+    if *g == Some((failed, errno)) {
+        return;
+    }
+    *g = Some((failed, errno));
+    drop(g);
+    crate::diag_warn!(
+        "RT 有 {} 个线程降级失败（errno {}），保留所有权，等下次全量扫描重试",
+        failed,
+        errno
+    );
+}
+
 /// 全局实例。RT 调用只发生在新线程或配置重扫时，不在热路径上，
 /// 用互斥锁换取「不必给每个调用点都加一个参数」的简洁
-pub static RT: std::sync::Mutex<Option<RtState>> = std::sync::Mutex::new(None);
+pub static RT: Mutex<Option<RtState>> = Mutex::new(None);
 
 pub fn init() {
     *crate::lock_ignore_poison(&RT) = Some(RtState::new());
@@ -697,14 +828,36 @@ mod tests {
         }
     }
 
-    fn adopt(s: &mut RtState, tid: i32, pid: i32, pkg: &str, comm: &str, allowed: CpuSet) {
+    fn id_of(tid: i32, tgid: i32, start_time: u64) -> TaskIdentity {
+        TaskIdentity {
+            tid,
+            tgid,
+            start_time,
+        }
+    }
+
+    fn adopt(s: &mut RtState, tid: i32, tgid: i32, pkg: &str, comm: &str, allowed: CpuSet) {
+        adopt_at(s, tid, tgid, 1, pkg, comm, allowed);
+    }
+
+    /// 指定 starttime：模拟「同一个号、上一条线程」
+    fn adopt_at(
+        s: &mut RtState,
+        tid: i32,
+        tgid: i32,
+        start_time: u64,
+        pkg: &str,
+        comm: &str,
+        allowed: CpuSet,
+    ) {
         s.own.insert(
             tid,
             Owned {
-                pid,
+                identity: id_of(tid, tgid, start_time),
                 pkg: pkg.to_string(),
                 comm: comm.to_string(),
                 allowed,
+                pending_demote: false,
             },
         );
     }
@@ -987,7 +1140,7 @@ mod tests {
             &["com.a"],
         );
         let mut s = state();
-        let ok = s.apply(GHOST, 100, "com.a", "RenderThread", &cpus(2));
+        let ok = s.apply(id_of(GHOST, 100, 1), "com.a", "RenderThread", &cpus(2));
         let _ = cfg;
         assert!(!ok);
         assert!(s.own.is_empty());
@@ -999,6 +1152,9 @@ mod tests {
     /// 全量重扫后：仍符合条件的保留，已消失的收回
     #[test]
     fn reconcile_keeps_live_and_drops_missing() {
+        let (handle, tid) = spawn_named("RenderThread");
+        let id = identity_of(tid).expect("读线程身份");
+        let mypid = std::process::id() as i32;
         let cfg = cfg_of(
             RtConfig {
                 scope: RtScope::Global,
@@ -1007,17 +1163,27 @@ mod tests {
             &["com.a"],
         );
         let mut s = state();
-        adopt(&mut s, 10, 100, "com.a", "RenderThread", cpus(2));
+        adopt_at(
+            &mut s,
+            tid,
+            mypid,
+            id.start_time,
+            "com.a",
+            "RenderThread",
+            cpus(2),
+        );
         adopt(&mut s, GHOST, 100, "com.a", "RenderThread", cpus(2));
         let mut cache = crate::cache::ProcCache::new();
         cache
             .tasks
-            .insert(10, entry(100, "com.a", "RenderThread", 2));
+            .insert(tid, entry(mypid, "com.a", "RenderThread", 2));
 
         s.reconcile(&cfg, &cache);
-        assert!(s.own.contains_key(&10), "仍符合条件的线程不能被降级");
+        assert!(s.own.contains_key(&tid), "仍符合条件的线程不能被降级");
         assert!(!s.own.contains_key(&GHOST), "缓存里没有的线程必须收回");
-        assert_eq!(s.count(100), 1);
+        assert_eq!(s.count(mypid), 1);
+        handle.thread().unpark();
+        let _ = handle.join();
     }
 
     /// 全量扫描时包被移出配置，RT 记录不能留着
@@ -1054,9 +1220,12 @@ mod tests {
         assert!(s.own.is_empty(), "旧 tid 的所有权不能交给新线程");
     }
 
-    /// 对账时 pid 对不上：走 Forget，不对现承租人调 sched_setscheduler
+    /// 对账时缓存里的 pid 对不上：走 Forget，不对现承租人调 sched_setscheduler
     #[test]
     fn reconcile_forgets_reused_tid() {
+        let (handle, tid) = spawn_named("RenderThread");
+        let id = identity_of(tid).expect("读线程身份");
+        let mypid = std::process::id() as i32;
         let cfg = cfg_of(
             RtConfig {
                 scope: RtScope::Global,
@@ -1065,32 +1234,73 @@ mod tests {
             &["com.a"],
         );
         let mut s = state();
-        adopt(&mut s, 10, 100, "com.a", "RenderThread", cpus(2));
+        adopt_at(
+            &mut s,
+            tid,
+            mypid,
+            id.start_time,
+            "com.a",
+            "RenderThread",
+            cpus(2),
+        );
         let mut cache = ProcCache::new();
-        // 同一个 tid 现在属于 pid 200，包与线程名仍然符合规则
+        // 缓存里同一个 tid 属于另一个进程，包与线程名仍然符合规则
         cache
             .tasks
-            .insert(10, entry(200, "com.a", "RenderThread", 2));
+            .insert(tid, entry(200, "com.a", "RenderThread", 2));
 
-        let p = plan(&cfg, s.own.get(&10).unwrap(), cache.tasks.get(&10));
+        let p = plan(
+            &cfg,
+            s.own.get(&tid).unwrap(),
+            cache.tasks.get(&tid),
+            Some(id),
+        );
         assert!(matches!(p, Plan::Forget));
 
         s.reconcile(&cfg, &cache);
         assert!(s.own.is_empty());
+        handle.thread().unpark();
+        let _ = handle.join();
+    }
+
+    /// 降级失败留下的记录必须能重试：把 pending 记录指向一个不存在的号，
+    /// 重试时拿到 ESRCH 会清掉它——若没有重试，这条记录会一直占着配额
+    #[test]
+    fn pending_demote_is_retried_on_reconcile() {
+        let mut s = state();
+        adopt(&mut s, GHOST, 100, "com.a", "RenderThread", cpus(2));
+        s.own.get_mut(&GHOST).unwrap().pending_demote = true;
+        let config = cfg_of(RtConfig::default(), &[]);
+        s.reconcile(&config, &ProcCache::new());
+        assert!(s.own.is_empty(), "待撤销的记录必须被重试并清理");
     }
 
     /// 缓存缺失仍按撤销处理：包被移出配置时必须真的降级
     #[test]
     fn reconcile_demotes_when_entry_missing() {
+        let (handle, tid) = spawn_named("RenderThread");
+        let id = identity_of(tid).expect("读线程身份");
+        let mypid = std::process::id() as i32;
         let cfg = cfg_of(RtConfig::default(), &[]);
         let mut s = state();
-        adopt(&mut s, 10, 100, "com.a", "RenderThread", cpus(2));
+        adopt_at(
+            &mut s,
+            tid,
+            mypid,
+            id.start_time,
+            "com.a",
+            "RenderThread",
+            cpus(2),
+        );
         let p = plan(
             &cfg,
-            s.own.get(&10).unwrap(),
-            Some(&entry(100, "com.a", "RenderThread", 2)),
+            s.own.get(&tid).unwrap(),
+            Some(&entry(mypid, "com.a", "RenderThread", 2)),
+            Some(id),
         );
         assert!(matches!(p, Plan::Demote));
+        handle.thread().unpark();
+        let _ = handle.join();
     }
 
     /// 起一个真实线程并命名。RT 的成败取决于进程权限，用例按实际结果分支断言，
@@ -1164,7 +1374,7 @@ mod tests {
         // 避免测试真去改沙箱里 pid 1 的调度策略
         adopt(&mut s, GHOST, 100, "com.a", "RenderThread", cpus(2));
 
-        let ok = s.apply(tid, 200, "com.a", "RenderThread", &cpus(2));
+        let ok = s.apply(id_of(tid, 200, 1), "com.a", "RenderThread", &cpus(2));
         if ok {
             // 有 CAP_SYS_NICE 的环境：用例不适用，把自己改回去
             s.demote_all();
@@ -1180,25 +1390,26 @@ mod tests {
     }
 
     /// TID 复用：旧记录 pid 与新线程不符时，必须在任何降级之前丢弃。
-    /// 旧代码先查策略，无策略时直接 drop_threads，会把复用该 tid 的新线程降级。
-    /// 用真实线程（CFS → CFS 不需要 CAP_SYS_NICE）让「是否降级」可以从 demoted 观察
+    /// 只比 pid 抓不住这里：同一个进程里 TID 也会被复用，pid 完全一样。
+    /// 用例故意让新旧记录同 pid、只有 starttime 不同
     #[test]
     fn note_drops_stale_record_before_policy_check() {
         let (handle, tid) = spawn_named("Worker");
+        let mypid = std::process::id() as i32;
         let mut s = state();
-        // 旧记录：同一个 tid，pid 100，所属包本来有 RT 资格
-        adopt(&mut s, tid, 100, "com.old", "RenderThread", cpus(2));
-        // 新线程：tid 被复用，pid 变成 200，所属包没有任何 RT 策略
+        // 旧记录：同一个 tid、同一个 pid，starttime 是上一条线程的
+        adopt_at(&mut s, tid, mypid, 1, "com.old", "RenderThread", cpus(2));
+        // 新线程所属包没有任何 RT 策略
         let cfg = cfg_of(RtConfig::default(), &[]);
 
-        assert!(!s.note(tid, 200, "com.new", "Worker", &cpus(2), &cfg));
+        assert!(!s.note(tid, mypid, "com.new", "Worker", &cpus(2), &cfg));
 
         assert!(!s.own.contains_key(&tid), "旧记录必须被清除");
         assert!(
-            !s.own.values().any(|a| a.pid == 100),
-            "不能留下 pid 100 的旧所有权记录"
+            !s.own.values().any(|a| a.identity.start_time == 1),
+            "不能留下上一条线程的所有权记录"
         );
-        assert_eq!(s.demoted, 0, "pid 不符的旧记录不能触发降级");
+        assert_eq!(s.demoted, 0, "号被复用的旧记录不能触发降级");
         // 新线程没有策略，不能被提升，也不该被改成别的调度策略
         assert_eq!(sys_getsched(tid), libc::SCHED_OTHER);
 

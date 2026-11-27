@@ -1152,6 +1152,7 @@ fn config_json() -> String {
 fn diag_json() -> String {
     let d = diag::snapshot();
     let pmu_snap = crate::pmu::snapshot();
+    let scan = crate::proc_mode::metrics();
     let snap = lock_ignore_poison(&SCHED_SNAPSHOT)
         .clone()
         .unwrap_or_default();
@@ -1224,6 +1225,19 @@ fn diag_json() -> String {
             "moved": snap.moved,
             "failed": snap.failed,
             "blocked": snap.blocked,
+        },
+        // /proc 扫描成本：回答「定时对账到底贵不贵、贵在哪一段」
+        "scan": {
+            "full_scans": scan.full_scans,
+            "incremental": scan.incremental,
+            "worst_ms": (scan.worst_full_us / 1000) as u64,
+            "last": {
+                "procs": scan.last_full.procs,
+                "threads": scan.last_full.threads,
+                "walk_ms": (scan.last_full.walk_us / 1000) as u64,
+                "tasks_ms": (scan.last_full.tasks_us / 1000) as u64,
+                "total_ms": (scan.last_full.total_us / 1000) as u64,
+            },
         },
         "jank": jank,
         "pressure": d.pressure,

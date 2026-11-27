@@ -552,11 +552,16 @@ impl SchedState {
     }
 
     /// 迁移执行结果回填。只有真正写入成功才提交落点、`own` 与 `moved`；
-    /// 失败时保留旧状态并进入冷却，避免每秒重试同一个必然失败的调用
-    pub fn settle(&mut self, m: &Move, outcome: AffinityOutcome) {
+    /// 失败时保留旧状态并进入冷却，避免每秒重试同一个必然失败的调用。
+    ///
+    /// `applied` 是回读到的实际集合。内核合法裁剪（cpuset 生效集合、核下线）
+    /// 时它比 `m.cpus` 小，必须按它记账：否则下一轮 `entry.cpus != st.applied`
+    /// 会被当成「规则重扫」把状态清掉，线程在两个集合之间来回迁
+    pub fn settle(&mut self, m: &Move, outcome: AffinityOutcome, applied: Option<CpuSet>) {
         match outcome {
             AffinityOutcome::Set => {
                 let now = Instant::now();
+                let actual = applied.unwrap_or(m.cpus);
                 let mut from = None;
                 let mut freeze = false;
                 if let Some(st) = self.threads.get_mut(&m.tid) {
@@ -564,7 +569,7 @@ impl SchedState {
                     st.last_from = st.cur;
                     st.cur = Some(m.target);
                     st.own = true;
-                    st.applied = m.cpus;
+                    st.applied = actual;
                     st.last_move = Some(now);
                     // 预算窗口按线程滚动；窗口内迁移超限后冻结，避免跨簇抖动
                     if st.window.elapsed() > MOVE_WINDOW {
@@ -578,7 +583,7 @@ impl SchedState {
                     }
                 }
                 self.moved += 1;
-                let line = format!(
+                let mut line = format!(
                     "S7: {}({}) {} → {}（{}‰ → {}‰）",
                     m.comm,
                     m.tid,
@@ -587,6 +592,14 @@ impl SchedState {
                     from.map(|c| self.load[c as usize]).unwrap_or(-1),
                     self.load[m.target as usize]
                 );
+                // 回读比目标小时把实际集合写进同一行：读者看到「迁到了大核」
+                // 却又发现线程只在小核上跑，会以为日志在骗人
+                if actual != m.cpus {
+                    line.push_str(&format!(
+                        "，回读只有 {}（cpuset 或离线核裁剪）",
+                        actual.to_range_string()
+                    ));
+                }
                 println!("{}", line);
                 self.push_ring(line.clone());
                 diag::note_sched(line);
@@ -1384,12 +1397,37 @@ mod tests {
         assert!(!st.threads[&1001].own);
         assert_eq!(st.threads[&1001].cur, None);
 
-        st.settle(&mv[0], AffinityOutcome::Set);
+        st.settle(&mv[0], AffinityOutcome::Set, None);
         assert_eq!(st.moved, 1);
         let th = &st.threads[&1001];
         assert!(th.own);
         assert_eq!(th.cur, Some(2));
         assert_eq!(th.applied.to_range_string(), "7");
+    }
+
+    /// 合法裁剪：内核只接受了目标的子集时，落点按子集记。
+    /// 若仍按目标记，下一轮会判成「缓存与上次写入不一致」并清空状态，
+    /// 线程在两个集合之间来回迁
+    #[test]
+    fn settle_records_trimmed_actual() {
+        let (_, cache) = span_cache("trimmed");
+        let mut st = state_for(&cache, SchedMode::On);
+        let mut target = CpuSet::new();
+        target.set(6);
+        target.set(7);
+        let m = Move {
+            tid: 1001,
+            target: 2,
+            cpus: target,
+            comm: "Thread-7".into(),
+        };
+        let mut actual = CpuSet::new();
+        actual.set(7);
+        st.settle(&m, AffinityOutcome::Set, Some(actual));
+
+        assert_eq!(st.moved, 1);
+        assert_eq!(st.threads[&1001].applied, actual, "按回读到的集合记账");
+        assert_eq!(st.threads[&1001].cur, Some(2));
     }
 
     /// EPERM/EINVAL 这类失败不能伪装成迁移成功
@@ -1406,6 +1444,7 @@ mod tests {
         st.settle(
             &mv[0],
             AffinityOutcome::Failed(crate::apply_affinity::ApplyErrorKind::Other),
+            None,
         );
         assert_eq!(st.moved, 0, "失败不能计入 moved");
         assert_eq!(st.failed, 1);
@@ -1426,7 +1465,7 @@ mod tests {
         let mv = st.tick_at(&cfg, &cache, [-1, 600, 200], now);
         assert_eq!(mv.len(), 1);
 
-        st.settle(&mv[0], AffinityOutcome::Gone);
+        st.settle(&mv[0], AffinityOutcome::Gone, None);
         assert_eq!(st.moved, 0);
         assert!(!st.threads.contains_key(&1001));
     }
@@ -1710,7 +1749,7 @@ mod tests {
                 cpus: CpuSet::new(),
                 comm: "Thread-7".into(),
             };
-            st.settle(&m, AffinityOutcome::Set);
+            st.settle(&m, AffinityOutcome::Set, None);
         }
         assert_eq!(st.frozen, 1);
         assert!(st.threads[&1001].frozen);

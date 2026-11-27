@@ -372,10 +372,36 @@ pub fn online_cpus() -> Option<CpuSet> {
 /// （`/foreground` 上 172 个线程就是 344 次 open + 按父链求交）。
 /// 组配置以秒级稳定，5 秒缓存既跟得上真实变更，也不会把这份开销摊到每个线程
 const EFF_TTL: Duration = Duration::from_secs(5);
+/// 硬容量上限。TTL 只保证「旧的不被读」，不保证表不会长：
+/// 短时间内遍历到大量不同组路径时，过期项还没被清掉就会继续插入。
+/// Android 的 cpuset 目录数量有限，128 条足够覆盖，超了就淘汰最早的一条
+const EFF_CACHE_CAP: usize = 128;
 /// 组路径 → (读取时刻, 生效集合)。`None` 表示读不到，同样缓存：
 /// 读不到时按父链求交会连撞几次失败，没必要每个线程重来一遍
 type EffCache = HashMap<String, (Instant, Option<String>)>;
 static EFF_CACHE: RwLock<Option<EffCache>> = RwLock::new(None);
+
+/// 插入前的容量整理：先清过期，仍然满就淘汰最早写入的一条。
+/// 这里不引入 LRU：缓存只有一百多条，线性扫一遍比维护链表便宜，
+/// 也不会因为顺序字段写错而误淘汰刚写进去的热点
+fn eff_make_room(m: &mut EffCache, now: Instant) {
+    if m.len() < EFF_CACHE_CAP {
+        return;
+    }
+    m.retain(|_, (at, _)| now.duration_since(*at) < EFF_TTL);
+    // 过期项清完仍然满，就逐条淘汰最早写入的，直到留出一个空位。
+    // 一次只淘汰一条是不够的：表可能已经超了很多，插入后仍然超限
+    while m.len() >= EFF_CACHE_CAP {
+        let Some(oldest) = m
+            .iter()
+            .min_by_key(|(_, (at, _))| *at)
+            .map(|(k, _)| k.clone())
+        else {
+            break;
+        };
+        m.remove(&oldest);
+    }
+}
 
 pub fn group_effective_cached(path: &str) -> Option<String> {
     let now = Instant::now();
@@ -389,9 +415,7 @@ pub fn group_effective_cached(path: &str) -> Option<String> {
     let v = group_effective(path);
     if let Ok(mut g) = EFF_CACHE.write() {
         let m = g.get_or_insert_with(HashMap::new);
-        if m.len() > 64 {
-            m.retain(|_, (at, _)| now.duration_since(*at) < EFF_TTL);
-        }
+        eff_make_room(m, now);
         m.insert(path.to_string(), (now, v.clone()));
     }
     v
@@ -1873,6 +1897,9 @@ mod tests {
     /// 命令行、配置文件、Web 接口、set_base_cpuset 必须共用同一套判据。
     /// 以前命令行只拦 `/`，`-b .` 能过；设置阶段静默拒掉后回落到默认目录，
     /// 于是锁名按 `.` 建、实际却操作 `/dev/cpuset/AppOpt`，两个实例能同时管
+    /// 命令行、配置文件、Web 接口、set_base_cpuset 必须共用同一套判据。
+    /// 以前命令行只拦 `/`，`-b .` 能过；设置阶段静默拒掉后回落到默认目录，
+    /// 于是锁名按 `.` 建、实际却操作 `/dev/cpuset/AppOpt`，两个实例能同时管
     #[test]
     fn cpuset_name_is_validated_consistently() {
         for bad in ["", ".", "..", "a/b", "a..b", "a b", "a\tb"] {
@@ -1883,5 +1910,25 @@ mod tests {
         for ok in ["AppOpt", "AppOpt-8", "sched_2", &"x".repeat(63)] {
             assert!(validate_cpuset_name(ok).is_ok(), "{:?} 应当通过", ok);
         }
+    }
+
+    /// 生效集合缓存的容量上限是硬的：TTL 只保证过期项不被读，
+    /// 不能阻止短时间内插入大量未过期路径把表撑大
+    #[test]
+    fn eff_cache_capacity_is_hard_capped() {
+        let now = Instant::now();
+        let mut m: EffCache = HashMap::new();
+        // 全部在 TTL 内，retain 清不掉，只能靠淘汰最早的一条
+        for i in 0..EFF_CACHE_CAP + 32 {
+            m.insert(
+                format!("/g{i}"),
+                (now - Duration::from_millis(i as u64), None),
+            );
+        }
+        eff_make_room(&mut m, now);
+        assert!(m.len() < EFF_CACHE_CAP, "容量必须落到上限以下");
+        // 写入最早的那条被淘汰，最新插入的保留
+        assert!(!m.contains_key(&format!("/g{}", EFF_CACHE_CAP + 31)));
+        assert!(m.contains_key("/g0"));
     }
 }

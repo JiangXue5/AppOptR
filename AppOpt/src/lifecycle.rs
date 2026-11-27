@@ -31,6 +31,20 @@ pub struct TaskIdentity {
     pub start_time: u64,
 }
 
+impl TaskIdentity {
+    /// 「同一个号还是不是同一条线程」的唯一判据。
+    ///
+    /// 全项目只用这一处：生命周期账本、S7 落点、RT 所有权都拿它比对。
+    /// 以前三处各自写 `start_time !=`，其中 RT 和落点还退化成只比 pid/tid，
+    /// 于是同一个进程里复用的 TID 会继承上一条线程的调度状态。
+    ///
+    /// `tgid` 不参与判定：它回答的是「属于哪个进程」，用于退出时批量清账，
+    /// 与线程同一性无关（`identity_of` 热路径也不读它）
+    pub fn same_thread(&self, other: &Self) -> bool {
+        self.tid == other.tid && self.start_time == other.start_time
+    }
+}
+
 /// 线程的托管状态。切换都发生在同一次调用里，但保留成显式状态是为了让
 /// 「为什么这个线程没被释放」在日志和后续排查里能直接回答
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -267,7 +281,7 @@ fn judge(
     };
     // starttime 是同一性判据：tid 由账本键保证已相同，只有它能把
     // 「同一个号」区分成「同一个线程」
-    if id.start_time != rec.identity.start_time {
+    if !rec.identity.same_thread(&id) {
         return Verdict::Drop("tid 已被复用");
     }
     if still_managed && !force {
@@ -385,6 +399,29 @@ fn restore(rec: &ManagedTask, in_own: bool) -> Result<(), (i32, &'static str)> {
 /// 「这个号还是不是那条线程」，不是「别人有没有动过它」。
 pub fn release_unmanaged(cfg: &AppConfig, force: bool) -> ReleaseReport {
     let list: Vec<ManagedTask> = with_ledger(|l| l.values().cloned().collect());
+    release_list(cfg, force, list)
+}
+
+/// 只重试处于 `RecoveryRequired` 的记录。
+///
+/// 主循环每 30 秒调一次。以前这里复用 `release_unmanaged`，等于为了几条卡住
+/// 的记录把整套账本连字符串一起克隆，再对每个健康线程各读一次 stat 与 comm——
+/// 受管线程一多，这份白工就是每秒几十次 open。重试只需要待恢复的那几条。
+pub fn retry_recovery(cfg: &AppConfig) -> ReleaseReport {
+    let list: Vec<ManagedTask> = with_ledger(|l| {
+        l.values()
+            .filter(|m| m.state == ManagedState::RecoveryRequired)
+            .cloned()
+            .collect()
+    });
+    if list.is_empty() {
+        return ReleaseReport::default();
+    }
+    release_list(cfg, false, list)
+}
+
+/// 对给定的记录做一遍释放判定。`force` 为真时跳过规则检查（退出前调用）
+fn release_list(cfg: &AppConfig, force: bool, list: Vec<ManagedTask>) -> ReleaseReport {
     let mut rep = ReleaseReport::default();
     let mut samples: Vec<String> = Vec::new();
     let mut held: Vec<String> = Vec::new();
@@ -722,6 +759,9 @@ mod tests {
         (handle, tid)
     }
 
+    /// 全局账本是单例：涉及清账的用例必须串行，否则互相把对方的记录清掉
+    static LEDGER_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     fn rec(orig: Option<&str>, applied: &str, aff: &CpuSet) -> ManagedTask {
         ManagedTask {
             identity: TaskIdentity {
@@ -884,6 +924,7 @@ mod tests {
     /// 只比 TID 会漏掉其余所有工作线程
     #[test]
     fn forget_pid_clears_every_thread_of_the_process() {
+        let _guard = LEDGER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         with_ledger(|l| l.clear());
         for (tid, tgid) in [(100, 9_000), (101, 9_000), (102, 7_777)] {
             let mut m = rec(Some("/top-app"), "4-6", &set("4-6"));
@@ -900,6 +941,39 @@ mod tests {
         let left: Vec<i32> = with_ledger(|l| l.keys().copied().collect());
         with_ledger(|l| l.clear());
         assert_eq!(left, vec![102], "只该剩下别的进程那条");
+    }
+
+    /// 30 秒一次的重试只碰待恢复记录：健康记录不参与克隆与判定，
+    /// 否则为了几条卡住的记录要对整套账本重读一遍 /proc
+    #[test]
+    fn retry_recovery_only_touches_pending_records() {
+        let _guard = LEDGER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        with_ledger(|l| l.clear());
+        let mut healthy = rec(Some("/top-app"), "4-6", &set("4-6"));
+        healthy.identity = TaskIdentity {
+            tid: 900_001,
+            tgid: 900_000,
+            start_time: 1,
+        };
+        let mut pending = rec(Some("/top-app"), "4-6", &set("4-6"));
+        pending.identity = TaskIdentity {
+            tid: 900_002,
+            tgid: 900_000,
+            start_time: 1,
+        };
+        pending.state = ManagedState::RecoveryRequired;
+        with_ledger(|l| {
+            l.insert(900_001, healthy);
+            l.insert(900_002, pending);
+        });
+
+        // 两个 tid 都不存在：真要做判定，两条都会被清掉。
+        // 只清一条才说明过滤生效
+        let rep = retry_recovery(&AppConfig::empty());
+        let left: Vec<i32> = with_ledger(|l| l.keys().copied().collect());
+        with_ledger(|l| l.clear());
+        assert_eq!(left, vec![900_001], "健康记录不该被重试路径碰到");
+        assert_eq!(rep.dropped, 1);
     }
 
     /// 仍匹配其他规则：不释放，交给正常流程重算目标
