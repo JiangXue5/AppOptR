@@ -140,9 +140,14 @@ fn fork_parse(ctx: &TracePointContext, offsets: &TracepointOffsets) -> EventMeta
     let pid_tgid = bpf_get_current_pid_tgid();
     let parent_tid = (pid_tgid & 0xFFFFFFFF) as u32;
     let parent_tgid = (pid_tgid >> 32) as u32;
-    let child_pid = unsafe { ctx.read_at::<i32>(offsets.fork_child_pid as usize).unwrap_or(0) };
-    let child_comm =
-        unsafe { ctx.read_at::<[u8; 16]>(offsets.fork_child_comm as usize).unwrap_or([0u8; 16]) };
+    let child_pid = unsafe {
+        ctx.read_at::<i32>(offsets.fork_child_pid as usize)
+            .unwrap_or(0)
+    };
+    let child_comm = unsafe {
+        ctx.read_at::<[u8; 16]>(offsets.fork_child_comm as usize)
+            .unwrap_or([0u8; 16])
+    };
     EventMeta {
         pid: parent_tgid as i32,
         tid: child_pid,
@@ -223,8 +228,10 @@ fn task_rename(ctx: TracePointContext) -> u32 {
     let Some(offsets) = offsets_load() else {
         return 0;
     };
-    let new_comm =
-        unsafe { ctx.read_at::<[u8; 16]>(offsets.rename_newcomm as usize).unwrap_or([0u8; 16]) };
+    let new_comm = unsafe {
+        ctx.read_at::<[u8; 16]>(offsets.rename_newcomm as usize)
+            .unwrap_or([0u8; 16])
+    };
 
     if !tracked && !whitelist_matched(&new_comm) {
         return 0;
@@ -241,7 +248,8 @@ fn task_rename(ctx: TracePointContext) -> u32 {
 
 /// 捕获线程退出，已管理线程清理 APPLIED_MAP
 #[tracepoint(name = "sched_process_exit", category = "sched")]
-fn sched_process_exit(_ctx: TracePointContext) -> u32 {    let pid_tgid = bpf_get_current_pid_tgid();
+fn sched_process_exit(_ctx: TracePointContext) -> u32 {
+    let pid_tgid = bpf_get_current_pid_tgid();
     let tid = (pid_tgid & 0xFFFFFFFF) as u32;
     let tgid = (pid_tgid >> 32) as u32;
 

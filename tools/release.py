@@ -32,13 +32,26 @@ TIMEOUT = 180
 
 
 def credentials() -> dict[str, str]:
-    """从 git 凭证里取两个平台的令牌；不打印、不落盘。"""
+    """取两个平台的令牌；不打印、不落盘。
+
+    优先环境变量（CI 用 secrets 注入），读不到再回落到 `~/.git-credentials`（本地）。
+    CI 里没有凭证文件，也不该把令牌写进仓库，所以顺序不能反。
+    """
+    out: dict[str, str] = {}
+    for key, env in (("github", "GITHUB_TOKEN"), ("gitee", "GITEE_TOKEN")):
+        val = os.environ.get(env, "").strip()
+        if val:
+            out[key] = val
+    if len(out) == 2:
+        return out
+
     path = os.path.expanduser("~/.git-credentials")
     if not os.path.exists(path):
-        sys.exit(f"找不到 {path}，无法读取令牌")
+        return out
     text = open(path, encoding="utf-8").read()
-    out = {}
     for host, key in (("github.com", "github"), ("gitee.com", "gitee")):
+        if key in out:  # 环境变量优先，文件只补缺
+            continue
         m = re.search(rf"https://[^:]+:([^@]+)@{re.escape(host)}", text)
         if m:
             out[key] = m.group(1)
@@ -192,12 +205,12 @@ def main() -> None:
 
     if args.only in (None, "github"):
         if "github" not in creds:
-            sys.exit("~/.git-credentials 里没有 github.com 的凭证")
+            sys.exit("没有 GitHub 令牌：设 GITHUB_TOKEN，或写进 ~/.git-credentials")
         print("GitHub:")
         print("  " + release_github(version, creds["github"], files, args.dry_run))
     if args.only in (None, "gitee"):
         if "gitee" not in creds:
-            sys.exit("~/.git-credentials 里没有 gitee.com 的凭证")
+            sys.exit("没有 Gitee 令牌：设 GITEE_TOKEN，或写进 ~/.git-credentials")
         print("Gitee:")
         print("  " + release_gitee(version, creds["gitee"], files, args.dry_run))
 

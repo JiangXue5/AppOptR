@@ -1,0 +1,175 @@
+name: CI
+
+# 三种触发：
+#   push 到 master / experimental  → 检查 + 构建，产物挂在 Actions 页面供下载
+#   push tag v*                    → 检查 + 构建 + 发布到 GitHub / Gitee Release
+#   手动 / PR                      → 只做检查与构建，不发版
+on:
+  push:
+    branches: [master, experimental]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+# 同一分支连推多次时，取消上一次未跑完的，省时间也省额度
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # 构建日志里不要出现完整的 GitHub token / 临时路径
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    name: 检查
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+          rustc --version
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            AppOpt -> target
+          key: check
+
+      - name: 格式
+        run: |
+          cargo fmt --manifest-path AppOpt/Cargo.toml --check
+          cargo fmt --manifest-path AppOpt-ebpf/Cargo.toml --check
+
+      - name: 静态检查
+        run: cargo clippy --manifest-path AppOpt/Cargo.toml --all-targets --locked -- -D warnings
+
+      - name: 单元测试
+        run: cargo test --manifest-path AppOpt/Cargo.toml --locked
+
+  build:
+    name: 构建
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装工具链
+        run: |
+          set -euo pipefail
+          # stable 编用户态（静态 musl），nightly 编 eBPF（build-std 需要 rust-src）
+          rustup toolchain install stable --profile minimal
+          rustup toolchain install nightly --profile minimal --component rust-src
+          rustup target add --toolchain stable aarch64-unknown-linux-musl x86_64-unknown-linux-musl
+          rustup default stable
+          rustc --version
+          cargo +nightly --version
+
+      - name: 安装 bpf-linker
+        run: |
+          set -euo pipefail
+          # 预编译包是静态链接 LLVM 的，省掉十分钟源码编译和一堆 apt 依赖。
+          # 下载不到再退回 cargo install，慢但能保证有东西可用
+          url="https://github.com/aya-rs/bpf-linker/releases/download/v0.13.0/bpf-linker-x86_64-unknown-linux-musl.tar.zst"
+          mkdir -p "$HOME/.cargo/bin"
+          if curl -fsSL --retry 3 --max-time 300 "$url" -o /tmp/bl.tar.zst; then
+            tar --zstd -xf /tmp/bl.tar.zst -C "$HOME/.cargo/bin"
+            chmod +x "$HOME/.cargo/bin/bpf-linker"
+          else
+            echo "预编译包不可用，改为源码编译"
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends llvm libclang-dev
+            cargo install bpf-linker --locked
+          fi
+          bpf-linker --version
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            AppOpt -> target
+            AppOpt-ebpf -> target
+          key: build
+
+      - name: 构建双架构
+        run: ./build.sh -a all
+
+      - name: 核对产物
+        run: |
+          set -euo pipefail
+          v=$(sed -n 's/^version=//p' module/module.prop | head -1)
+          for abi in arm64-v8a x86_64; do
+            z="dist/AppOpt-$v-$abi.zip"
+            [ -f "$z" ] || { echo "缺少 $z"; exit 1; }
+            unzip -p "$z" module.prop | grep -qx "version=$v" || { echo "$abi 包内版本不是 $v"; exit 1; }
+            unzip -l "$z" | grep -q "bin/$abi/AppOpt-ebpf" || { echo "$abi 包内没有 eBPF 程序"; exit 1; }
+            echo "$abi: $(du -h "$z" | cut -f1)"
+          done
+
+      - name: 保存产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: AppOpt-${{ github.sha }}
+          path: dist/*.zip
+          retention-days: 14
+          if-no-files-found: error
+
+  release:
+    name: 发布
+    # 只有 tag 才发版；PR 与普通 push 到这一步就结束
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 取回产物
+        uses: actions/download-artifact@v4
+        with:
+          name: AppOpt-${{ github.sha }}
+          path: dist
+
+      - name: 版本一致性
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          v=$(sed -n 's/^version=//p' module/module.prop | head -1)
+          [ "$tag" = "$v" ] || { echo "tag 是 $tag，module.prop 是 $v，不一致"; exit 1; }
+          grep -q "^## $tag（" CHANGELOG.md || { echo "CHANGELOG.md 没有 $tag 这一节"; exit 1; }
+
+      - name: 把 tag 同步到 Gitee
+        continue-on-error: true
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GITEE_TOKEN:-}" ]; then
+            echo "未配置 GITEE_TOKEN，跳过"
+            exit 0
+          fi
+          # Gitee 建 Release 要求 tag 已存在。这里只推 tag，不碰分支：
+          # 分支上是历史提交，自动覆盖容易和手动提交打架
+          git push "https://oauth2:${GITEE_TOKEN}@gitee.com/JiangXue_2004/AppOptR.git" \
+            "HEAD:refs/tags/${GITHUB_REF_NAME}"
+
+      - name: 发布
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet --disable-pip-version-check requests
+          v="${GITHUB_REF_NAME#v}"
+          # 没配 Gitee 令牌时只发 GitHub，不因为少一个 secret 整个发版失败
+          if [ -n "${GITEE_TOKEN:-}" ]; then
+            python3 tools/release.py "$v"
+          else
+            echo "未配置 GITEE_TOKEN，只发 GitHub"
+            python3 tools/release.py "$v" --only github
+          fi

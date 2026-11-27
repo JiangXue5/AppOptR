@@ -1,5 +1,26 @@
 # AppOptR 变更记录
 
+## 2.7.0-beta31（2026-11-27）
+
+每版都要在本地凑齐 nightly、rust-src、bpf-linker，再双架构打包，少一步就是
+「代码推了、包没出」。小改动也要走这一整套，成本比改动本身高。
+
+**改**
+
+- 加 GitHub Actions（`.github/workflows/ci.yml`）：推 `master` / `experimental`
+  自动跑格式、clippy、单测，再构建 `arm64-v8a` 与 `x86_64` 两个包，产物挂在
+  Actions 页面的 Artifacts 里，保留 14 天
+- 推 `v*` tag 自动发版：构建完先核对三件事——tag 与 `module.prop` 版本一致、
+  `CHANGELOG` 有这一节、两个包里都带着对应 ABI 的 `AppOpt-ebpf`——再建
+  GitHub / Gitee Release 并传包，顺手把 tag 推到 Gitee（Gitee 建 Release
+  要求 tag 已存在）
+- `tools/release.py` 的令牌改为环境变量优先（`GITHUB_TOKEN` / `GITEE_TOKEN`），
+  读不到再回落 `~/.git-credentials`。CI 里没有凭证文件，顺序反了就只能把令牌塞进仓库
+- 构建机用 bpf-linker 的预编译包（静态链接 LLVM），省掉十几分钟源码编译；
+  下载不到才退回 `cargo install`
+- 顺手对 `AppOpt-ebpf/src/main.rs` 跑了 `cargo fmt`：三处历史遗留的换行，
+  不动逻辑，只是让 CI 的格式检查过得去
+
 ## 2.7.0-beta30（2026-11-27）
 
 诊断面板那句「未知」和「1 行因格式无效」都答不了问题：前者不是绑定状态，

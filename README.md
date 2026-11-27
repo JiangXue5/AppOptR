@@ -48,11 +48,56 @@ http://appopt.suto.top
 - 用户态仅需稳定版 Rust；eBPF 需要 `nightly` + `rust-src` + `bpf-linker`，缺失时脚本会直接报错并给出安装命令。
 - 交叉编译目标可用 `APPOPT_ARM64_TRIPLE` / `APPOPT_X64_TRIPLE` 覆盖，链接器用 `CARGO_TARGET_<TRIPLE>_LINKER` 指定。
 
+本地不装工具链也能构建：把提交推上去，用 CI 出的包。工具链安装、eBPF 编译、双架构打包都在
+`.github/workflows/ci.yml` 里做完了。
 
-### 发版
+
+### CI
+
+`.github/workflows/ci.yml`，三种触发：
+
+| 触发 | 做什么 | 产物 |
+|------|--------|------|
+| push 到 `master` / `experimental` | 格式、clippy、单测，再构建两个架构 | Actions 页面 → 该次运行 → Artifacts，保留 14 天 |
+| push tag `v*` | 同上，并自动发版到 GitHub / Gitee | Release 附件 |
+| PR / 手动触发 | 只做检查与构建，不发版 | Artifacts |
+
+日常小改动只需要推代码，不用本地构建：
+
+```sh
+git commit -am "fix: ..." && git push github HEAD
+# 等 CI 绿了，去 Actions 页面下载 AppOpt-<sha> 里的 zip 装机验证
+```
+
+发版就打 tag，两个平台一起出包：
+
+```sh
+# 1. 改三处版本号（AppOpt/Cargo.toml、AppOpt/Cargo.lock、module/module.prop）
+#    再在 CHANGELOG.md 写一节 ## <版本>（日期），CI 会拿它当 Release 正文
+# 2. 推 tag，剩下交给 CI
+git tag -a v2.7.0-beta31 -m "2.7.0-beta31: ..." && git push github v2.7.0-beta31
+```
+
+CI 在发版前会核对三件事，不一致就直接失败，不会发出一个版本号对不上的包：
+tag 与 `module.prop` 的 version 一致、`CHANGELOG.md` 里有这一节、两个 zip 里都带着
+对应 ABI 的 `AppOpt-ebpf`。
+
+需要的 secret 只有一个：
+
+| secret | 用途 | 不配的后果 |
+|--------|------|------------|
+| `GITEE_TOKEN` | 把 tag 推到 Gitee、建 Gitee Release、传包 | 只发 GitHub，Gitee 仍需本地跑 `release.py` |
+
+`GITHUB_TOKEN` 由 Actions 自动提供，不用配。仓库 Settings → Secrets and variables →
+Actions → New repository secret，名字必须叫 `GITEE_TOKEN`，值是 Gitee 私人令牌（勾 `projects`
+权限）。
+
+
+### 发版（本地，CI 不可用时）
 
 推送 tag 不等于发版——tag 只是个 git 对象，Release 和安装包要在两个平台各建一次。
-beta8~beta23 就是这么漏的：代码和 tag 都在，Gitee 上一片空白。
+beta8~beta23 就是这么漏的：代码和 tag 都在，Gitee 上一片空白。CI 已接管这一段，
+下面只在 CI 挂了或要补发旧版本时用：
 
 ```sh
 ./build.sh -a all
@@ -63,7 +108,8 @@ python3 tools/release.py <版本> --dry-run  # 先看要做什么
 ```
 
 脚本幂等：Release 已存在就复用，附件已存在就跳过，缺哪个补哪个；也支持
-`--only github` / `--only gitee`。令牌从 `~/.git-credentials` 读。
+`--only github` / `--only gitee`。令牌优先读 `GITHUB_TOKEN` / `GITEE_TOKEN` 环境变量，
+读不到再回落到 `~/.git-credentials`。
 
 
 ### 规则文件指令
