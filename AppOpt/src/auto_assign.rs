@@ -19,11 +19,15 @@ use crate::roles::{Role, role_of};
 /// 候选有效期。超过这个时间的候选自动从列表里消失——三个月前的线程名
 /// 对现在的版本未必成立，留着只会误导
 const TTL_SECS: u64 = 30 * 24 * 3600;
-/// 线程至少存活这么久才建议：只闪一下的多是临时线程，给它们写规则
+/// 线程至少在前台存活这么久才建议：只闪一下的多是临时线程，给它们写规则
 /// 只会让配置膨胀而没有任何收益
 const MIN_ALIVE_SECS: u64 = 60;
-/// 存活超过这么久算高置信度
+/// 前台存活超过这么久算高置信度
 const HIGH_ALIVE_SECS: u64 = 300;
+/// 两次观察的最大合理间隔。超过它说明中间根本没看住这条线程（包被移出配置
+/// 一段时间后又加回来、进程被冻住），这段空档不能算成前台时长，否则一个
+/// 刚被重新纳入管理的进程能凭「挂了一小时」直接跳到高置信度
+const MAX_GAP_SECS: u64 = 120;
 
 /// 一条候选。字段与 `AppOpt.autocache.conf` 的列一一对应
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -51,6 +55,12 @@ impl Candidate {
 struct Seen {
     role: Role,
     first: u64,
+    /// 最近一次被观察到的时刻，用来把两轮之间的间隔计入前台时长
+    last: u64,
+    /// 累计在前台被观察到的秒数。后台挂着的时间一律不算
+    fg_secs: u64,
+    /// 是否至少在前台出现过。从没在前台跑过的线程不给建议
+    seen_fg: bool,
     /// 最近一次看到的 tid。线程重建后编号会变，用它做存活校验
     tid: i32,
 }
@@ -83,15 +93,10 @@ fn suggest_cpus(role: Role) -> Option<&'static str> {
     }
 }
 
-/// 线程已存活多少秒；tid 对不上（线程已退出或被复用）返回 0，视为不可用。
-/// 读不到 `/proc/<tid>/comm` 时不建议：候选列表里不该出现已经消失的线程
-fn alive_for(s: &Seen, thread: &str, now: u64) -> u64 {
-    let alive =
-        fs::read_to_string(format!("/proc/{}/comm", s.tid)).is_ok_and(|c| c.trim() == thread);
-    if !alive {
-        return 0;
-    }
-    now.saturating_sub(s.first)
+/// 线程是否还活着：tid 对不上（已退出或被复用）即为否。
+/// 读不到 `/proc/<tid>/comm` 时不建议——候选列表里不该出现已经消失的线程
+fn alive(s: &Seen, thread: &str) -> bool {
+    fs::read_to_string(format!("/proc/{}/comm", s.tid)).is_ok_and(|c| c.trim() == thread)
 }
 
 fn role_label(role: Role) -> &'static str {
@@ -104,9 +109,44 @@ fn role_label(role: Role) -> &'static str {
     }
 }
 
+/// 把一次观察写进记录。抽成纯函数：`note` 依赖墙钟与全局表，
+/// 只有它自己能脱离真机单测，而「空档不算前台」「重建从头计」这两条
+/// 恰好是最容易写错的地方
+fn observe(s: &mut Seen, thread: &str, tid: i32, now: u64, fg: bool) {
+    // tid 变了 = 同名的旧线程已退出、编号被新线程拿走（线程重建）。
+    // 计时必须从头算：沿用旧 `first` 会把上一个实例的前台时长算到新实例头上，
+    // 一个刚起来 2 秒的线程能直接显示「高置信度」，采纳后写进配置的却是
+    // 一个还没被观察过的对象
+    if s.tid != tid {
+        *s = Seen {
+            role: role_of(thread),
+            first: now,
+            last: now,
+            fg_secs: 0,
+            seen_fg: fg,
+            tid,
+        };
+        return;
+    }
+    if fg {
+        // 只把「确实看住的那段」算成前台：两轮之间隔了两分钟以上，说明这段
+        // 时间没有观察（包被移出配置、进程被冻住），按 0 计，不虚增置信度
+        let gap = now.saturating_sub(s.last);
+        if gap <= MAX_GAP_SECS {
+            s.fg_secs = s.fg_secs.saturating_add(gap);
+        }
+        s.seen_fg = true;
+    }
+    s.last = now;
+}
+
 /// 观察一条线程。`cache::task_apply` 每次评估都会调一次，判重靠 `(包, 线程名)`，
-/// 重复调用不累加计数——否则「每轮都看到」会被算成「活得久」，置信度虚高
-pub fn note(pkg: &str, thread: &str, tid: i32) {
+/// 重复调用不累加计数——否则「每轮都看到」会被算成「活得久」，置信度虚高。
+///
+/// `fg` 是这条线程所在应用此刻是否在前台。后台样本只记录角色、不累计时长：
+/// 后台进程常常整夜挂着，按存活时长算出来的「高置信度」毫无意义，而且
+/// 会让建议与前后台降档互相矛盾
+pub fn note(pkg: &str, thread: &str, tid: i32, fg: bool) {
     if thread.is_empty() {
         return;
     }
@@ -118,17 +158,12 @@ pub fn note(pkg: &str, thread: &str, tid: i32) {
         .or_insert(Seen {
             role: role_of(thread),
             first: now,
+            last: now,
+            fg_secs: 0,
+            seen_fg: fg,
             tid,
         });
-    // tid 变了 = 同名的旧线程已退出、编号被新线程拿走（线程重建）。
-    // 存活时长必须从头算：沿用旧 `first` 会把上一个实例的寿命算到新实例头上，
-    // 一个刚起来 2 秒的线程能直接显示「高置信度」，采纳后写进配置的却是
-    // 一个还没被观察过的对象
-    if e.tid != tid {
-        e.first = now;
-        e.tid = tid;
-        e.role = role_of(thread);
-    }
+    observe(e, thread, tid, now, fg);
 }
 
 /// 这条线程是否已被用户显式配置覆盖（含通配与包级兜底）。
@@ -146,9 +181,11 @@ pub fn collect(cfg: &AppConfig) -> Vec<Candidate> {
     let Some(map) = guard.as_ref() else {
         return Vec::new();
     };
+    // 门槛看「前台观察时长」而不是「存活时长」：后台挂着的线程活得再久，
+    // 也没有一条能说明它需要绑核的证据
     let mut out: Vec<Candidate> = map
         .iter()
-        .filter(|((_, thread), s)| alive_for(s, thread, now) >= MIN_ALIVE_SECS)
+        .filter(|((_, thread), s)| alive(s, thread) && s.seen_fg && s.fg_secs >= MIN_ALIVE_SECS)
         .filter_map(|((pkg, thread), s)| {
             // 已有同包同名（含通配）的线程规则就不再建议
             if covered(cfg, pkg, thread) {
@@ -160,7 +197,7 @@ pub fn collect(cfg: &AppConfig) -> Vec<Candidate> {
                 thread: thread.clone(),
                 cpus: cpus.to_string(),
                 role: role_label(s.role),
-                confidence: if alive_for(s, thread, now) >= HIGH_ALIVE_SECS {
+                confidence: if s.fg_secs >= HIGH_ALIVE_SECS {
                     "high"
                 } else {
                     "medium"
@@ -178,8 +215,10 @@ pub fn collect(cfg: &AppConfig) -> Vec<Candidate> {
     // 比让这些线程按继承的掩码到处跑更可控。
     // 阈值取 8：三五个临时线程不足以说明覆盖不全
     let mut unknown: HashMap<&str, (u32, u64)> = HashMap::new();
-    for ((pkg, _thread), s) in map.iter() {
-        if s.role == Role::Unknown && alive_for(s, _thread, now) >= MIN_ALIVE_SECS {
+    for ((pkg, thread), s) in map.iter() {
+        // 与候选同一条口径：后台观察到的未识别线程不算「覆盖不全」的证据，
+        // 否则一个只在后台跑过的包也会被建议加包级兜底规则
+        if s.role == Role::Unknown && alive(s, thread) && s.seen_fg && s.fg_secs >= MIN_ALIVE_SECS {
             let e = unknown.entry(pkg.as_str()).or_insert((0, s.first));
             e.0 += 1;
             e.1 = e.1.min(s.first);
@@ -457,22 +496,24 @@ mod tests {
         assert!(covered(&cfg, "com.a", "Anything"));
     }
 
-    /// 同名线程重建（tid 变了）时存活时长从头算：否则旧实例活了一小时，
+    /// 同名线程重建（tid 变了）时计时从头算：否则旧实例在前台跑了一小时，
     /// 新实例刚起来就被标成「高置信度」
     #[test]
     fn reused_tid_resets_alive_window() {
         reset();
         let pkg = "com.test.reuse";
         let thread = "RenderThread";
-        note(pkg, thread, 12345);
+        note(pkg, thread, 12345, true);
         {
             let mut g = lock_ignore_poison(&SEEN);
             let m = g.as_mut().expect("已登记");
-            m.get_mut(&(pkg.to_string(), thread.to_string()))
-                .expect("键存在")
-                .first = 0;
+            let e = m
+                .get_mut(&(pkg.to_string(), thread.to_string()))
+                .expect("键存在");
+            e.first = 0;
+            e.fg_secs = 600;
         }
-        note(pkg, thread, 54321);
+        note(pkg, thread, 54321, true);
         let g = lock_ignore_poison(&SEEN);
         let s = g
             .as_ref()
@@ -481,7 +522,56 @@ mod tests {
             .unwrap();
         assert_ne!(s.first, 0, "tid 变化后 first 必须重置");
         assert_eq!(s.tid, 54321);
+        assert_eq!(s.fg_secs, 0, "上一个实例的前台时长不能算到新实例头上");
         drop(g);
         reset();
+    }
+
+    fn seen(tid: i32) -> Seen {
+        Seen {
+            role: Role::Worker,
+            first: 0,
+            last: 0,
+            fg_secs: 0,
+            seen_fg: false,
+            tid,
+        }
+    }
+
+    /// 后台挂着的时间不能算成前台时长：否则一个整夜挂在后台的进程，
+    /// 第二天会被建议绑大核
+    #[test]
+    fn background_time_is_not_counted() {
+        let mut s = seen(7);
+        observe(&mut s, "Worker", 7, 10, false);
+        observe(&mut s, "Worker", 7, 120, false);
+        assert_eq!(s.fg_secs, 0);
+        assert!(!s.seen_fg);
+    }
+
+    /// 前台按轮次间隔累加，且只在真实观察到的那段里累加
+    #[test]
+    fn foreground_time_accumulates_by_gap() {
+        let mut s = seen(7);
+        // 新建记录时 last 与 now 相同，首轮间隔为 0
+        s.last = 10;
+        observe(&mut s, "Worker", 7, 10, true);
+        observe(&mut s, "Worker", 7, 70, true);
+        observe(&mut s, "Worker", 7, 130, true);
+        assert!(s.seen_fg);
+        assert_eq!(s.fg_secs, 120);
+    }
+
+    /// 两轮之间隔太久说明中间没看住（包被移出配置、进程被冻住），
+    /// 这段空档按 0 计，不能虚增置信度
+    #[test]
+    fn long_gap_is_not_counted() {
+        let mut s = seen(7);
+        observe(&mut s, "Worker", 7, 0, true);
+        observe(&mut s, "Worker", 7, MAX_GAP_SECS + 1, true);
+        assert_eq!(s.fg_secs, 0);
+        // 下一次间隔正常，照常累加
+        observe(&mut s, "Worker", 7, MAX_GAP_SECS + 31, true);
+        assert_eq!(s.fg_secs, 30);
     }
 }

@@ -21,7 +21,7 @@ http://appopt.suto.top
 | `roles.rs` | 线程名角色分类（渲染 / 延迟敏感 / 工作线程 / 后台前缀） |
 | `sched.rs` | S7 负载感知调度（`off` / `shadow` / `on` 三档，按 `/proc/stat` 判定迁移） |
 | `policy.rs` | 目标解析纯函数（规则 → S7 落点 → 降档 → 组裁剪 → 最终集合） |
-| `background.rs` | 前后台判定（系统组优先，`oom_score_adj` 兜底） |
+| `background.rs` | 前后台判定（按应用：系统组 → stune 组 → `oom_score_adj`） |
 | `auto_assign.rs` | Auto Assign 候选采集（只写 `AppOpt.autocache.conf`） |
 | `load.rs` | 三簇实时占用（`/proc/stat` 逐核忙时按拓扑归簇；不需要 S7 / PMU / root） |
 | `pmu.rs` | PMU 观察（Instructions / Cycles / CPI；硬件计数不可用时退到 CPU 时间，只采样不迁移） |
@@ -81,10 +81,10 @@ python3 tools/release.py <版本> --dry-run  # 先看要做什么
 | `@rt.app` | `<包名> on\|off [auto\|names:名1,名2] [上限]` | — | 单个应用的 RT 条目。参数省略时按 `auto` 与 `@rt.max`。 |
 | `@sysgroup` | `respect` / `takeover` | `respect` | 线程被 Android 放进 `background`/`system-background`/`restricted` 组时，该组的生效集合只有小核。`respect` 尊重系统安排，规则要的大核绑不上就跳过并说明；`takeover` 强行把线程拉进 AppOpt 组再绑（大核跑后台，耗电上升）。 |
 | `@group` | `own` / `mask` | `own` | 首次绑定或目标变更时，把线程迁进 `AppOpt/<集合>` 组。只在掩码上绑、不接管组时，系统会在进程状态变化时把亲和性收敛回组允许集合——这是「绑上又被冲掉」的主因。`mask` 退回 2.6.1 的「只写掩码」行为。 |
-| `@foreground_demote` | `on` / `off` | `off` | 前后台降档。`on` 时，判为后台（系统后台组，或已被接管但 `oom_score_adj ≥ 900`）且**没有显式线程规则**的线程，目标缩到 `e-core`。应用切回前台后按规则原值重算，不会停在降档值上。降档的优先级高于 S7 落点：这类线程不参与 S7 迁簇，避免「降档—迁回大核—再降档」两轮一抖。 |
+| `@foreground_demote` | `on` / `off` | `off` | 前后台降档。`on` 时，判为后台（系统后台组，或已被接管但 stune 组在 `background`、或 `oom_score_adj ≥ 700`）且**没有显式线程规则**的线程，目标缩到 `e-core`。判据按应用而不是按线程，同进程的线程不会一半降一半不降。应用切回前台后按规则原值重算，不会停在降档值上。降档的优先级高于 S7 落点：这类线程不参与 S7 迁簇，避免「降档—迁回大核—再降档」两轮一抖。 |
 | `@blacklist` | `<包名>[ ,<包名>…]`（逗号或空格分隔） | — | 完全不管理：不读 cmdline/comm、不匹配规则、不进 S7/RT。可写多行累加。新增后热加载会立即把已在 `AppOpt` 组里的线程还回去。 |
 | `@exempt` | `<包名>[ ,<包名>…]`（逗号或空格分隔） | — | 半管理：只写 `sched_setaffinity`，不迁组、不补组、不参与 S7。给 LKT / Uperf 这类同样管 cpuset 的模块让路，避免两边互相覆盖。 |
-| `@auto_assign` | `on` / `off` | `off` | 采集 Auto Assign 候选，写入同目录的 `AppOpt.autocache.conf`（30 天过期）。只观察、不改规则；在 WebUI 规则页逐条采纳或忽略，采纳才会经 `rule_edit` 写进主配置。 |
+| `@auto_assign` | `on` / `off` | `off` | 采集 Auto Assign 候选，写入同目录的 `AppOpt.autocache.conf`（30 天过期）。只观察、不改规则；在 WebUI 规则页逐条采纳或忽略，采纳才会经 `rule_edit` 写进主配置。只累计应用在前台时的观察时长：后台挂着的线程活得再久也不成候选，避免「后台样本」把建议带偏。 |
 | `@pmu_alloc` | `shadow` / `off` | `shadow` | PMU 配额 Shadow。拿 PMU 本窗口的全量采样，按活动量把线程分成重 / 中 / 轻三档，再按各簇 capacity 算出「应该承载多少」，与该时间段的实际簇占用对照（有跨簇规则时用 S7 的统计，否则自己读 `/proc/stat` 逐核忙时），输出匹配度与偏空的簇。分档按活动量份额切：累计到 50% 算重、85% 算中，其余算轻。**只算不执行**：不发任何写操作，绑核结果不受影响。只在 `@pmu=observe` 打开时生效。 |
 | `@pmu` | `observe` / `off` | `off` | PMU 观察。`observe` 时读取硬件计数器（Instructions / Cycles / cache-misses），在诊断页显示每个受管线程的 CPI 与指令速率，用于评估 S7 迁移是否真的划算。硬件计数器能打开但读数恒为 0（部分厂商锁了 PMU）时自动退到 `TASK_CLOCK`，按 CPU 时间显示占用；两种都读不到才关闭。**只采样、不迁移**：执行路径不会因为本开关改变一个核。上限 128 线程，FD 按 `RLIMIT_NOFILE` 预算自动收缩。只放出 cycles 的内核上按周期速率显示（`Gcyc/s`），不会显示成 0。权限不足、计数器不支持、读数为 0（厂商独占 PMU）时自动关闭并写明原因，绑核结果不受影响。 |
 

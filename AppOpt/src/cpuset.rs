@@ -94,6 +94,29 @@ pub fn thread_cgroup(tid: i32) -> Option<String> {
 }
 
 /// 按组路径归类。只看第一段，子组（如 /foreground/bg）跟随父组语义
+/// 读线程在 schedtune（挂载点 `/dev/stune`，控制器名 `schedtune`）层级里的组。
+///
+/// 这是判断前后台时唯一不会被我们夺走的信号：cpuset 组一旦被
+/// `@group=own` 接管，名字就变成 `AppOpt/<集合>`，之后系统把应用切进切出
+/// 都不会再改它；而 AMS 每次改前后台都会同步写 stune 组。
+///
+/// cgroup v2 把 cpuset 与 stune 合并成一个层级（控制器列为空），那时没有
+/// 独立信号，返回 `None` 交给 `oom_score_adj` 兜底。
+pub fn stune_group(tid: i32) -> Option<SysGroup> {
+    let raw = fs::read_to_string(format!("/proc/{}/cgroup", tid)).ok()?;
+    for line in raw.lines() {
+        let mut it = line.splitn(3, ':');
+        let _id = it.next()?;
+        let ctrl = it.next()?;
+        let path = it.next()?;
+        if !ctrl.split(',').any(|c| c == "schedtune" || c == "stune") {
+            continue;
+        }
+        return Some(classify_group(path.trim()));
+    }
+    None
+}
+
 pub fn classify_group(path: &str) -> SysGroup {
     let p = path.trim_matches('/');
     let base = base_name();
@@ -886,7 +909,10 @@ impl RankMetric {
 /// 返回 `None` 表示两种指标都不完整——此时不能猜分层，只能整体降级。
 /// 排序与合并是 e/p/hp 三档视图和四层原始视图的共同前提，抽出来是为了
 /// 两者不会因为一处改口径而出现「三档说 3 层、原始层说 4 层」的矛盾
-fn rank_groups(entries: &[CoreGroup], online: &CpuSet) -> Option<(Vec<(u64, CpuSet)>, &'static str)> {
+fn rank_groups(
+    entries: &[CoreGroup],
+    online: &CpuSet,
+) -> Option<(Vec<(u64, CpuSet)>, &'static str)> {
     // 全部离线的簇不参与分组，其指标缺失也不应牵连整体判定
     let active: Vec<&CoreGroup> = entries
         .iter()
@@ -1344,7 +1370,11 @@ mod tests {
     #[test]
     fn all_tiers_one_plus_three_plus_four() {
         let online = set(&[0, 1, 2, 3, 4, 5, 6, 7]);
-        let entries = vec![grp(&[0], 200, 0), grp(&[1, 2, 3], 700, 0), grp(&[4, 5, 6, 7], 1024, 0)];
+        let entries = vec![
+            grp(&[0], 200, 0),
+            grp(&[1, 2, 3], 700, 0),
+            grp(&[4, 5, 6, 7], 1024, 0),
+        ];
         let (tiers, src) = classify_tiers(&entries, &online);
         assert_eq!(tiers, vec![set(&[0]), set(&[1, 2, 3]), set(&[4, 5, 6, 7])]);
         let (e, p, h, _) = derive_cores(&tiers, &online, src);

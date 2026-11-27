@@ -214,9 +214,13 @@ impl ProcCache {
         // 说它是游戏进程还是 surfaceflinger 的，全凭读者猜
         crate::diag::bind_pkg(tid, pkg, tid == pid);
         // 必须在规则匹配之前观察：Auto Assign 要看到「当前没命中任何线程规则」
-        // 的线程，否则只能建议已配过的线程，等于没有建议
+        // 的线程，否则只能建议已配过的线程，等于没有建议。
+        // 后台样本不进建议：线程在后台挂满五分钟同样「活得久」，按总存活时长
+        // 判定会把「一直没在跑」算成「高置信度」，采纳后连后台都绑大核，
+        // 与前后台降档正好对打。判不出前后台时按前台算，宁可多建议一条
         if cfg.auto_assign {
-            crate::auto_assign::note(pkg, thread_name, tid);
+            let fg = !crate::background::app_background(pid).unwrap_or(false);
+            crate::auto_assign::note(pkg, thread_name, tid, fg);
         }
         let Some(result) = thread_affinity(pkg, thread_name, cfg) else {
             return false;
@@ -287,7 +291,7 @@ impl ProcCache {
         let floor = if crate::background::should_demote(
             cfg.foreground_demote,
             result.is_thread_rule,
-            tid,
+            pid,
             group,
         ) {
             crate::background::floor_of(&cfg.topo)
@@ -482,7 +486,7 @@ impl ProcCache {
             let floor = if crate::background::should_demote(
                 cfg.foreground_demote,
                 e.is_thread_rule,
-                *tid,
+                e.pid,
                 group,
             ) {
                 crate::background::floor_of(topo)
