@@ -750,9 +750,9 @@ pub fn event_dispatch(event: &EbpfProcEvent, cfg: &AppConfig, state: &mut EbpfSt
     match event.event_type {
         EBPF_EVENT_EXIT => {
             // 内核态已在 sched_process_exit 里删除 APPLIED_MAP[tid]，此处不再重复删除
+            // task_gone 内部已经把账本记录（含 RT 所有权）一并删掉
             state.cache.task_gone(tid);
             state.last_fix.remove(&tid);
-            rt::forget(tid);
         }
 
         EBPF_EVENT_EXEC if !event_apply(&mut state.cache, &mut state.bpf, tid, pid, comm, cfg) => {
@@ -832,10 +832,9 @@ fn rebind_known(state: &mut EbpfState, tid: i32, cfg: &AppConfig) {
 pub fn affinity_check(state: &mut EbpfState, cfg: &AppConfig) {
     let dead_tids = state.cache.affinity_sync(cfg);
     for tid in dead_tids {
+        // 这里的 tid 已经 ESRCH。`affinity_sync` 对每个死号都调了 `task_gone`，
+        // 账本记录（含 RT 所有权）已经收回，只剩 eBPF 表要清
         applied_del(&mut state.bpf, tid);
-        // 这里的 tid 已经 ESRCH。EXIT 事件丢失时这是唯一能收回 RT 记录与配额的路径，
-        // 不处理会让配额被永久占用
-        rt::forget(tid);
     }
 }
 

@@ -21,34 +21,20 @@ use std::sync::Mutex;
 use crate::cache::{ProcCache, TaskEntry};
 use crate::config::{AppConfig, RtMatch};
 use crate::cpuset::CpuSet;
-use crate::lifecycle::{TaskIdentity, identity_of};
+use crate::lifecycle::{
+    RtRecord, TaskIdentity, clear_rt, identity_of, mark_rt_pending, note_rt, rt_count,
+    rt_owned_raw, rt_records,
+};
 use crate::roles::role_of;
 
 const RR_TIMESLICE_PATH: &str = "/proc/sys/kernel/sched_rr_timeslice_ms";
 /// Linux 专有位，libc 未导出
 const SCHED_RESET_ON_FORK: libc::c_int = 0x4000_0000;
 
-/// 由本模块提升的线程。只有 `sched_setscheduler` 返回 0 的线程会进来
-struct Owned {
-    /// 完整线程身份。只留 pid 不够：同一个进程里 TID 也会被复用，
-    /// 「新线程恰好是同一个号」与「旧线程还活着」在 pid 层面无法区分
-    identity: TaskIdentity,
-    pkg: String,
-    comm: String,
-    /// 提升时的规则允许集合，配置热更新时用于复核 Auto 的核数条件
-    allowed: CpuSet,
-    /// 撤销时降级失败：记录留着，等下一轮重试。
-    /// 以前是先删记录再降级，失败就等于「这条 RT 从此无人认领」——
-    /// 线程一直停在 RR，模块却以为已经放手
-    pending_demote: bool,
-}
-
 pub struct RtState {
     /// 全局闸门。权限类失败会触发熔断并清理残留，本次进程内不再尝试：
     /// 配置重载也不会自动重置，避免每次热更新都重试一遍必然失败的调用
     enabled: bool,
-    /// tid -> 归属信息。配额直接从这张表统计，避免计数器与集合不同步
-    own: HashMap<i32, Owned>,
     /// 被改写的原时间片，`None` 表示当前没有改写
     pending_restore: Option<String>,
     /// 已经写进内核的时间片值，用于判断配置是否真的变了
@@ -69,7 +55,6 @@ impl RtState {
         restore_stale();
         Self {
             enabled: true,
-            own: HashMap::new(),
             pending_restore: None,
             applied_ms: None,
             demoted: 0,
@@ -80,7 +65,9 @@ impl RtState {
     /// 全部关闭时还原；已有备份的情况下只改值，绝不重新读取"原值"
     pub fn prepare(&mut self, cfg: &AppConfig) {
         if !cfg.rt_active() {
-            self.demote_all();
+            // 线程由 `prune` 统一收回（配置变更时先于本函数调用），
+            // 这里只剩时间片。RT 记录现在存在账本里，退出时也由
+            // `release_unmanaged(force)` 一并处理，不再需要单独遍历
             self.restore_timeslice();
             return;
         }
@@ -91,26 +78,30 @@ impl RtState {
     }
 
     /// 配置热更新后复核所有权：不再符合新规则的线程放回 CFS，
-    /// 仍符合的保留 RT，避免无意义的降级与重新提升
+    /// 仍符合的保留 RT，避免无意义的降级与重新提升。
+    ///
+    /// 只看策略与配额，不核对线程是否还在——配置变更不改变存活状态，
+    /// 下一轮全量扫描会补上（否则每条记录要多两次 open）
     pub fn prune(&mut self, cfg: &AppConfig) {
-        if self.own.is_empty() {
+        let recs = rt_records();
+        if recs.is_empty() {
             return;
         }
         let mut drop: Vec<i32> = Vec::new();
         let mut quota: HashMap<(i32, String), Vec<i32>> = HashMap::new();
-        for (&tid, a) in &self.own {
-            let Some((mode, _)) = cfg.rt.policy(&a.pkg) else {
-                drop.push(tid);
+        for r in &recs {
+            let Some((mode, _)) = cfg.rt.policy(&r.pkg) else {
+                drop.push(r.tid);
                 continue;
             };
-            if !eligible(mode, &a.comm, &a.allowed) {
-                drop.push(tid);
+            if !eligible(mode, &r.comm, &r.tag.allowed) {
+                drop.push(r.tid);
                 continue;
             }
             quota
-                .entry((a.identity.tgid, a.pkg.clone()))
+                .entry((r.identity.tgid, r.pkg.clone()))
                 .or_default()
-                .push(tid);
+                .push(r.tid);
         }
         // 上限下调时按 tid 升序保留前 max 个，保证结果与遍历顺序无关
         for ((_, pkg), mut tids) in quota {
@@ -146,9 +137,9 @@ impl RtState {
         // 拿一次线程身份。`pid` 由上游给的是进程号（TGID），stat 里读不到，
         // 这里补进身份里供配额与进程退出清账使用；starttime 只能从内核拿
         let Some(start) = identity_of(tid) else {
-            // 线程在事件到达与这次调用之间退出：旧记录留着只会一直占配额，
-            // 也没有任何号可以再核对
-            self.own.remove(&tid);
+            // 线程在事件到达与这次调用之间退出：整条账都该作废。
+            // 亲和性也无从还原（线程都没了），留着只会一直占配额
+            crate::lifecycle::forget(tid);
             return false;
         };
         let identity = TaskIdentity {
@@ -157,21 +148,18 @@ impl RtState {
             start_time: start.start_time,
         };
 
-        // TID 复用：同一个号换了线程（同进程内也会发生），旧记录与新线程无关。
-        // 必须排在策略检查和任何降级之前——否则复用了该 tid 的新线程会顶着
-        // 别人的记录被 drop_threads 降级
-        if self
-            .own
-            .get(&tid)
-            .is_some_and(|a| !a.identity.same_thread(&identity))
-        {
-            self.own.remove(&tid);
+        // 号被复用：账本里这条是上一条线程的，整条作废。必须排在策略检查
+        // 和任何降级之前——否则复用了该 tid 的新线程会顶着别人的记录
+        // 被 drop_threads 降级
+        let (stale, owned_tag) = crate::lifecycle::rt_lookup(tid, &identity);
+        if stale {
+            crate::lifecycle::forget(tid);
         }
 
         let Some((mode, max)) = cfg.rt.policy(pkg) else {
             // 新配置里这个包已无 RT 资格：只收回自己提升过的线程。
-            // 走到这里 own 里若还有该 tid，身份已核对一致，确实属于当前线程
-            if self.own.contains_key(&tid) {
+            // 走到这里记录若还在，身份已核对一致，确实属于当前线程
+            if owned_tag.is_some() {
                 self.drop_threads(&[tid]);
             }
             return false;
@@ -181,29 +169,22 @@ impl RtState {
         // 1) 记录里的线程是否还在按 RT 运行（退出后 tid 复用 / 外部改回 CFS）
         // 2) 还没接管的线程是否已被系统或其他模块设成 RR/FIFO
         let realtime = is_realtime(tid);
-        let mut owned = self.own.contains_key(&tid);
+        let mut owned = owned_tag.is_some();
         if owned && !realtime {
             // 记录已经失效。直接丢弃，避免把复用了该 tid 的新线程当成自己提升过的
-            self.own.remove(&tid);
+            clear_rt(tid);
             owned = false;
         }
 
         let qualified = eligible(mode, comm, allowed);
-        let used = self.count(pid);
+        let used = rt_count(pid);
         match action(owned, qualified, realtime && !owned, used, max) {
             Action::Keep => {
-                // 线程名会因 rename 变化，规则集合也会随配置变化，
-                // 记录跟着更新，prune 才不会按旧名字旧集合误判
-                if let Some(a) = self.own.get_mut(&tid) {
-                    if a.comm != comm {
-                        a.comm = comm.to_string();
-                    }
-                    a.allowed = *allowed;
-                    a.pkg = pkg.to_string();
-                    a.identity.tgid = pid;
-                    // 配置又允许它了：之前那次撤销作废，别在重试里把它降下去
-                    a.pending_demote = false;
-                }
+                // 线程名会因 rename 变化，规则集合也会随配置变化，记录跟着
+                // 更新，prune 才不会按旧名字旧集合误判。`note_rt` 同时清掉
+                // pending：配置又允许它了，别在重试里把它降下去。
+                // 无条件调用（幂等）：省掉「先比较再决定」反而少一次读写
+                note_rt(identity, pkg, comm, allowed);
                 false
             }
             Action::Drop => {
@@ -216,42 +197,30 @@ impl RtState {
         }
     }
 
-    /// 线程退出：只清记录，不调用 sched_setscheduler（线程已经不存在）
-    pub fn forget(&mut self, tid: i32) {
-        self.own.remove(&tid);
-    }
-
-    /// 进程退出：清理该进程下全部 RT 记录与配额。
-    /// 按 TGID 比对；tgid 未知时（理论上不会）退回 tid，避免把记录永远留下
-    pub fn release_pid(&mut self, pid: i32) {
-        self.own
-            .retain(|&tid, a| a.identity.tgid != pid && tid != pid);
-    }
-
     /// 全量重扫后的对账：只处理自己提升过的线程。
     /// 仍在缓存里且符合当前策略的保留，其余（线程/进程已退出、包被移出配置、
     /// 规则变化后不再符合）放回 CFS。覆盖事件丢失与扫描窗口内的进程消失
     pub fn reconcile(&mut self, cfg: &AppConfig, cache: &ProcCache) {
-        if self.own.is_empty() {
+        let recs = rt_records();
+        if recs.is_empty() {
             return;
         }
-        // 上一轮降级失败的记录先重试：它们的规则已经撤了，等不到事件，
-        // 只有全量扫描这一条路径能再碰它们
-        self.retry_pending();
         let mut demote: Vec<i32> = Vec::new();
         let mut forget: Vec<i32> = Vec::new();
-        for (&tid, a) in &self.own {
-            // 每条自有记录一次 stat：只有几十条，换掉「同进程 TID 复用无法识别」
+        for r in &recs {
+            // 每条自有记录一次 stat：只有几十条，换掉「TID 复用无法识别」
             // 这个缺口是值得的。读不到 = 线程已退出
-            let now = identity_of(tid);
-            match plan(cfg, a, cache.tasks.get(&tid), now) {
+            let now = identity_of(r.tid);
+            match plan(cfg, r, cache.tasks.get(&r.tid), now) {
                 Plan::Keep => {}
-                Plan::Demote => demote.push(tid),
-                Plan::Forget => forget.push(tid),
+                Plan::Demote => demote.push(r.tid),
+                Plan::Forget => forget.push(r.tid),
             }
         }
         for tid in forget {
-            self.own.remove(&tid);
+            // 号已被复用或线程没了：整条账作废。这里不能只清 rt——
+            // 一条被复用的 tid 上的亲和性记录同样是别人的
+            crate::lifecycle::forget(tid);
         }
         let n = self.drop_threads(&demote).0;
         if n > 0 {
@@ -259,38 +228,9 @@ impl RtState {
         }
     }
 
-    /// 降级失败留下的记录，按全量扫描周期再试一次
-    fn retry_pending(&mut self) {
-        let tids: Vec<i32> = self
-            .own
-            .iter()
-            .filter(|(_, a)| a.pending_demote)
-            .map(|(&tid, _)| tid)
-            .collect();
-        if tids.is_empty() {
-            return;
-        }
-        let (ok, _) = self.drop_threads(&tids);
-        if ok > 0 {
-            crate::diag_say!("RT 重试成功，{} 个线程已回到 SCHED_OTHER", ok);
-        }
-    }
-
-    /// 配置切回关闭时把已提升线程放回 CFS
-    pub fn demote_all(&mut self) {
-        if self.own.is_empty() {
-            return;
-        }
-        let tids: Vec<i32> = self.own.keys().copied().collect();
-        let n = self.drop_threads(&tids).0;
-        if n > 0 {
-            crate::diag_say!("RT 回滚 {} 个线程到 SCHED_OTHER", n);
-        }
-    }
-
-    /// 进程正常退出：线程降级并把时间片写回原值
+    /// 进程正常退出：线程由 `release_unmanaged(force)` 一并收回
+    /// （账本现在是唯一所有权来源），这里只剩时间片
     pub fn shutdown(&mut self) {
-        self.demote_all();
         self.restore_timeslice();
     }
 
@@ -300,43 +240,38 @@ impl RtState {
     fn fuse(&mut self, why: &str) {
         crate::diag_warn!("RT {}，RT 已全局关闭", why);
         self.enabled = false;
-        self.demote_all();
+        let tids: Vec<i32> = rt_records().iter().map(|r| r.tid).collect();
+        if !tids.is_empty() {
+            self.drop_threads(&tids);
+        }
         self.restore_timeslice();
-    }
-
-    /// 该进程当前由本模块管理的 RT 线程数
-    fn count(&self, tgid: i32) -> usize {
-        self.own
-            .values()
-            .filter(|a| a.identity.tgid == tgid)
-            .count()
     }
 
     /// 移除并降级。返回（成功降级数, 失败数）。
     ///
-    /// 失败时保留记录：线程可能只是暂时改不动（权限、SELinux 瞬态），
-    /// 直接清掉就等于永远失去它的所有权。成功或线程已退出才删
+    /// 失败时保留记录并打上待重试标记：线程可能只是暂时改不动（权限、
+    /// SELinux 瞬态），直接清掉就等于永远失去它的所有权。成功或线程已退出才删
     fn drop_threads(&mut self, tids: &[i32]) -> (usize, usize) {
         let mut n = 0;
         let mut failed = 0;
         let mut last_err = 0;
         for tid in tids {
-            if !self.own.contains_key(tid) {
+            // 调用方给的列表可能含已经被别人降过的号：账本里没有 RT 记录
+            // 就不该再对内核调一次 setscheduler
+            if rt_owned_raw(*tid).is_none() {
                 continue;
             }
             match demote(*tid) {
                 Demote::Done => {
-                    self.own.remove(tid);
+                    clear_rt(*tid);
                     n += 1;
                 }
-                // 线程已经不在：记录没有任何继续存在的理由
+                // 线程已经不在：整条账都没意义了，亲和性也无从还原
                 Demote::Gone => {
-                    self.own.remove(tid);
+                    crate::lifecycle::forget(*tid);
                 }
                 Demote::Failed(errno) => {
-                    if let Some(a) = self.own.get_mut(tid) {
-                        a.pending_demote = true;
-                    }
+                    mark_rt_pending(*tid);
                     failed += 1;
                     last_err = errno;
                 }
@@ -382,16 +317,7 @@ impl RtState {
             }
             return false;
         }
-        self.own.insert(
-            tid,
-            Owned {
-                identity,
-                pkg: pkg.to_string(),
-                comm: comm.to_string(),
-                allowed: *allowed,
-                pending_demote: false,
-            },
-        );
+        note_rt(identity, pkg, comm, allowed);
         true
     }
 
@@ -538,18 +464,23 @@ enum Plan {
 /// `None` 说明线程已经不存在：只丢记录，不对一个不存在的号调
 /// `sched_setscheduler`。缓存里没有但线程还在，才是「包被移出配置」，
 /// 必须真的撤销
-fn plan(cfg: &AppConfig, a: &Owned, entry: Option<&TaskEntry>, now: Option<TaskIdentity>) -> Plan {
+fn plan(
+    cfg: &AppConfig,
+    r: &RtRecord,
+    entry: Option<&TaskEntry>,
+    now: Option<TaskIdentity>,
+) -> Plan {
     let Some(now) = now else {
         return Plan::Forget;
     };
-    // 同进程内复用 TID 也会被这里拦住：pid 相同、starttime 不同
-    if !a.identity.same_thread(&now) {
+    // 同进程内复用 TID 也会被这里拦住：tgid 相同、starttime 不同
+    if !r.identity.same_thread(&now) {
         return Plan::Forget;
     }
     match entry {
-        Some(e) if e.pid != a.identity.tgid => Plan::Forget,
+        Some(e) if e.pid != r.identity.tgid => Plan::Forget,
         Some(e) => {
-            let ok = e.pkg == a.pkg
+            let ok = e.pkg == r.pkg
                 && cfg
                     .rt
                     .policy(&e.pkg)
@@ -641,6 +572,18 @@ fn demote(tid: i32) -> Demote {
     }
 }
 
+/// 单条撤销。给生命周期账本的恢复流程用：那里已经核对过身份，
+/// 只要一个纯内核操作的结果，失败原因交给调用方翻译成文案。
+///
+/// ESRCH 视为成功——线程都没了，RR 自然也不存在，没必要让账本为它
+/// 进一次恢复失败的重试
+pub fn demote_one(tid: i32) -> Result<(), i32> {
+    match demote(tid) {
+        Demote::Done | Demote::Gone => Ok(()),
+        Demote::Failed(e) => Err(e),
+    }
+}
+
 fn backup_path() -> Option<PathBuf> {
     let dir = env::current_exe().ok()?.parent()?.to_path_buf();
     Some(dir.join(".AppOpt.rt.bak"))
@@ -724,18 +667,6 @@ pub fn note(tid: i32, pid: i32, pkg: &str, comm: &str, allowed: &CpuSet, cfg: &A
     }
 }
 
-pub fn forget(tid: i32) {
-    if let Some(s) = crate::lock_ignore_poison(&RT).as_mut() {
-        s.forget(tid);
-    }
-}
-
-pub fn release_pid(pid: i32) {
-    if let Some(s) = crate::lock_ignore_poison(&RT).as_mut() {
-        s.release_pid(pid);
-    }
-}
-
 /// 进程正常退出前调用，把线程与时间片都还原
 pub fn shutdown() {
     if let Some(s) = crate::lock_ignore_poison(&RT).as_mut() {
@@ -759,10 +690,11 @@ pub fn snapshot() -> RtSnapshot {
     match crate::lock_ignore_poison(&RT).as_ref() {
         Some(s) => RtSnapshot {
             enabled: s.enabled,
-            threads: s
-                .own
+            // 账本是唯一所有权来源。锁顺序固定为「RT → 账本」，
+            // 与 `note` 一致，反向获取会死锁
+            threads: rt_records()
                 .iter()
-                .map(|(&tid, a)| (a.pkg.clone(), tid, a.comm.clone()))
+                .map(|r| (r.pkg.clone(), r.tid, r.comm.clone()))
                 .collect(),
             timeslice_applied: s.applied_ms,
             timeslice_current: current,
@@ -817,15 +749,23 @@ mod tests {
         RtMatch::Names(v.iter().map(|s| (*s).to_string()).collect())
     }
 
-    /// 不走系统调用的状态，测试只验证表结构与配额，不验证内核行为
+    /// 不走系统调用的状态，测试只验证账本内容与配额，不验证内核行为
     fn state() -> RtState {
         RtState {
             enabled: true,
-            own: HashMap::new(),
             pending_restore: None,
             applied_ms: None,
             demoted: 0,
         }
+    }
+
+    /// 账本是全局单例：先抢串行锁再清空，避免并行用例互相清账
+    fn guard() -> std::sync::MutexGuard<'static, ()> {
+        let g = crate::lifecycle::LEDGER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::lifecycle::ledger_clear();
+        g
     }
 
     fn id_of(tid: i32, tgid: i32, start_time: u64) -> TaskIdentity {
@@ -836,32 +776,34 @@ mod tests {
         }
     }
 
-    fn adopt(s: &mut RtState, tid: i32, tgid: i32, pkg: &str, comm: &str, allowed: CpuSet) {
-        adopt_at(s, tid, tgid, 1, pkg, comm, allowed);
+    fn adopt(tid: i32, tgid: i32, pkg: &str, comm: &str, allowed: CpuSet) {
+        adopt_at(tid, tgid, 1, pkg, comm, allowed);
     }
 
     /// 指定 starttime：模拟「同一个号、上一条线程」
-    fn adopt_at(
-        s: &mut RtState,
+    fn adopt_at(tid: i32, tgid: i32, start_time: u64, pkg: &str, comm: &str, allowed: CpuSet) {
+        crate::lifecycle::seed_rt(tid, tgid, start_time, pkg, comm, &allowed);
+    }
+
+    fn rtrec(
         tid: i32,
         tgid: i32,
         start_time: u64,
         pkg: &str,
         comm: &str,
-        allowed: CpuSet,
-    ) {
-        s.own.insert(
+        cores: usize,
+    ) -> RtRecord {
+        RtRecord {
             tid,
-            Owned {
-                identity: id_of(tid, tgid, start_time),
-                pkg: pkg.to_string(),
-                comm: comm.to_string(),
-                allowed,
+            identity: id_of(tid, tgid, start_time),
+            pkg: pkg.to_string(),
+            comm: comm.to_string(),
+            tag: crate::lifecycle::RtTag {
+                allowed: cpus(cores),
                 pending_demote: false,
             },
-        );
+        }
     }
-
     fn entry(pid: i32, pkg: &str, comm: &str, cores: usize) -> TaskEntry {
         TaskEntry {
             pid,
@@ -955,40 +897,41 @@ mod tests {
     }
 
     #[test]
-    fn quota_counts_only_own_threads() {
-        let mut s = state();
-        adopt(&mut s, 10, 100, "com.a", "RenderThread", cpus(2));
-        adopt(&mut s, 11, 100, "com.a", "RenderThread", cpus(2));
-        adopt(&mut s, 12, 200, "com.b", "RenderThread", cpus(2));
-        assert_eq!(s.count(100), 2);
-        assert_eq!(s.count(200), 1);
-        assert_eq!(s.count(300), 0);
+    fn quota_counts_only_adopted_threads() {
+        let _g = guard();
+        adopt(10, 100, "com.a", "RenderThread", cpus(2));
+        adopt(11, 100, "com.a", "RenderThread", cpus(2));
+        adopt(12, 200, "com.b", "RenderThread", cpus(2));
+        assert_eq!(rt_count(100), 2);
+        assert_eq!(rt_count(200), 1);
+        assert_eq!(rt_count(300), 0);
     }
 
     #[test]
     fn forget_releases_quota() {
-        let mut s = state();
-        adopt(&mut s, 10, 100, "com.a", "RenderThread", cpus(2));
-        adopt(&mut s, 11, 100, "com.a", "RenderThread", cpus(2));
+        let _g = guard();
+        adopt(10, 100, "com.a", "RenderThread", cpus(2));
+        adopt(11, 100, "com.a", "RenderThread", cpus(2));
         // 线程退出：配额立即回落到 1，新线程可以占用释放的名额
-        s.forget(10);
-        assert_eq!(s.count(100), 1);
-        assert!(s.own.contains_key(&11));
+        crate::lifecycle::forget(10);
+        assert_eq!(rt_count(100), 1);
+        assert!(crate::lifecycle::ledger_has(11));
     }
 
     #[test]
-    fn release_pid_clears_all_its_threads() {
-        let mut s = state();
-        adopt(&mut s, 10, 100, "com.a", "RenderThread", cpus(2));
-        adopt(&mut s, 11, 100, "com.a", "GLThread", cpus(2));
-        adopt(&mut s, 12, 200, "com.b", "RenderThread", cpus(2));
-        s.release_pid(100);
-        assert_eq!(s.count(100), 0);
-        assert_eq!(s.count(200), 1);
+    fn forget_pid_clears_all_its_threads() {
+        let _g = guard();
+        adopt(10, 100, "com.a", "RenderThread", cpus(2));
+        adopt(11, 100, "com.a", "GLThread", cpus(2));
+        adopt(12, 200, "com.b", "RenderThread", cpus(2));
+        crate::lifecycle::forget_pid(100);
+        assert_eq!(rt_count(100), 0);
+        assert_eq!(rt_count(200), 1);
     }
 
     #[test]
     fn prune_demotes_pkg_disabled_by_switch() {
+        let _g = guard();
         let mut rt = RtConfig {
             scope: RtScope::PerApp,
             ..RtConfig::default()
@@ -1003,68 +946,77 @@ mod tests {
                 },
             );
         }
-        let mut s = state();
-        adopt(&mut s, 10, 100, "com.a", "RenderThread", cpus(2));
-        adopt(&mut s, 20, 200, "com.b", "RenderThread", cpus(2));
+        adopt(10, 100, "com.a", "RenderThread", cpus(2));
+        adopt(20, 200, "com.b", "RenderThread", cpus(2));
 
         rt.apps.get_mut("com.a").unwrap().enabled = false;
         let cfg = cfg_of(rt, &["com.a", "com.b"]);
+        let mut s = state();
         s.prune(&cfg);
-        // com.a 的线程交还所有权，com.b 原样保留；tid 用假值，
-        // 降级系统调用必然失败，但不影响「移出所有权」这一步
-        assert!(s.own.values().all(|a| a.pkg != "com.a"));
-        assert_eq!(s.count(200), 1);
+        // 假 tid 降级拿到 ESRCH，整条账作废；com.b 仍符合策略，原样保留
+        assert!(
+            !crate::lifecycle::ledger_pkgs().iter().any(|p| p == "com.a"),
+            "包被关闭后不能留下 RT 所有权"
+        );
+        assert_eq!(rt_count(200), 1);
     }
 
+    /// 熔断只清理自己提升过的线程，外部 RR/FIFO 不在账本里，碰不到
     #[test]
-    fn foreign_threads_are_never_touched_by_demote_all() {
+    fn fuse_only_touches_own_threads() {
+        let _g = guard();
+        adopt(10, 100, "com.a", "RenderThread", cpus(2));
         let mut s = state();
-        adopt(&mut s, 10, 100, "com.a", "RenderThread", cpus(2));
-        // 不在 own 里的线程（外部模块设置的 RR/FIFO）根本不会被遍历到
-        s.demote_all();
-        assert!(s.own.is_empty());
-        // 假 tid 的降级系统调用失败，说明这段代码只处理自己的记录
+        s.fuse("测试");
+        assert!(!s.enabled);
+        assert!(
+            !crate::lifecycle::ledger_has(10),
+            "熔断必须回滚已提升的线程"
+        );
+        // 假 tid 的降级系统调用返回 ESRCH，不算一次成功回滚
         assert_eq!(s.demoted, 0);
     }
 
     #[test]
     fn quota_slot_reopens_after_exit() {
-        let mut s = state();
-        adopt(&mut s, 10, 100, "com.a", "RenderThread", cpus(2));
-        adopt(&mut s, 11, 100, "com.a", "GLThread", cpus(2));
-        assert_eq!(s.count(100), 2);
-        s.forget(10);
+        let _g = guard();
+        adopt(10, 100, "com.a", "RenderThread", cpus(2));
+        adopt(11, 100, "com.a", "GLThread", cpus(2));
+        assert_eq!(rt_count(100), 2);
+        crate::lifecycle::forget(10);
         // 释放后同 PID 的新线程可以重新占用配额
-        assert!(s.count(100) < 2);
+        assert!(rt_count(100) < 2);
     }
 
-    /// 上限下调：真实走一遍 prune，验证最终所有权表
+    /// 上限下调：真实走一遍 prune，验证最终账本
     #[test]
     fn prune_enforces_lowered_quota() {
+        let _g = guard();
         let mut rt = RtConfig {
             scope: RtScope::Global,
             ..RtConfig::default()
         };
         rt.max_per_app = 1;
         let cfg = cfg_of(rt, &["com.a"]);
-        let mut s = state();
-        adopt(&mut s, 10, 100, "com.a", "RenderThread", cpus(2));
-        adopt(&mut s, 11, 100, "com.a", "RHIThread", cpus(2));
-        adopt(&mut s, 12, 200, "com.a", "RenderThread", cpus(2));
+        adopt(10, 100, "com.a", "RenderThread", cpus(2));
+        adopt(11, 100, "com.a", "RHIThread", cpus(2));
+        adopt(12, 200, "com.a", "RenderThread", cpus(2));
 
+        let mut s = state();
         s.prune(&cfg);
         // 每个 pid 各留 1 个，pid 100 按 tid 升序保留 10
-        assert_eq!(s.count(100), 1);
-        assert!(s.own.contains_key(&10));
-        assert!(!s.own.contains_key(&11));
+        assert_eq!(rt_count(100), 1);
+        assert!(rt_owned_raw(10).is_some());
+        assert!(rt_owned_raw(11).is_none());
         // 另一个 pid 的线程不受影响
-        assert!(s.own.contains_key(&12));
-        assert_eq!(s.count(200), 1);
+        assert!(rt_owned_raw(12).is_some());
+        assert_eq!(rt_count(200), 1);
     }
 
     /// 配额没变时 prune 不能顺手降级
     #[test]
     fn prune_keeps_compliant_threads() {
+        let _g = guard();
         let cfg = cfg_of(
             RtConfig {
                 scope: RtScope::Global,
@@ -1072,11 +1024,11 @@ mod tests {
             },
             &["com.a"],
         );
+        adopt(10, 100, "com.a", "RenderThread", cpus(2));
         let mut s = state();
-        adopt(&mut s, 10, 100, "com.a", "RenderThread", cpus(2));
         s.prune(&cfg);
-        assert!(s.own.contains_key(&10));
-        assert_eq!(s.count(100), 1);
+        assert!(rt_owned_raw(10).is_some());
+        assert_eq!(rt_count(100), 1);
     }
 
     #[test]
@@ -1096,15 +1048,14 @@ mod tests {
         assert!(eligible_in(&named, "com.a", "GLThread", &cpus(8)));
     }
 
+    /// 外部 RR/FIFO 线程不会进账本，因而配额里也数不到
     #[test]
     fn foreign_rt_is_not_recorded() {
-        // 外部 RR/FIFO 线程不会进入 own，因而 demote_all 不会碰它
-        let s = state();
-        assert!(s.own.is_empty());
-        assert_eq!(s.count(1), 0);
+        let _g = guard();
+        assert_eq!(rt_count(1), 0);
     }
 
-    /// 外部已有的 RR/FIFO 一律 Foreign：不接管、不入表、不降级
+    /// 外部已有的 RR/FIFO 一律 Foreign：不接管、不入账、不降级
     #[test]
     fn foreign_threads_are_never_adopted() {
         assert_eq!(action(false, true, true, 0, 2), Action::Foreign);
@@ -1132,19 +1083,12 @@ mod tests {
     /// 提升失败不能留下任何所有权记录
     #[test]
     fn failed_promotion_is_not_recorded() {
-        let cfg = cfg_of(
-            RtConfig {
-                scope: RtScope::Global,
-                ..RtConfig::default()
-            },
-            &["com.a"],
-        );
+        let _g = guard();
         let mut s = state();
         let ok = s.apply(id_of(GHOST, 100, 1), "com.a", "RenderThread", &cpus(2));
-        let _ = cfg;
         assert!(!ok);
-        assert!(s.own.is_empty());
-        assert_eq!(s.count(100), 0);
+        assert!(rt_owned_raw(GHOST).is_none());
+        assert_eq!(rt_count(100), 0);
         // ESRCH 只是线程刚好退出，不能把 RT 全局闸门关掉
         assert!(s.enabled);
     }
@@ -1152,6 +1096,7 @@ mod tests {
     /// 全量重扫后：仍符合条件的保留，已消失的收回
     #[test]
     fn reconcile_keeps_live_and_drops_missing() {
+        let _g = guard();
         let (handle, tid) = spawn_named("RenderThread");
         let id = identity_of(tid).expect("读线程身份");
         let mypid = std::process::id() as i32;
@@ -1162,48 +1107,66 @@ mod tests {
             },
             &["com.a"],
         );
-        let mut s = state();
-        adopt_at(
-            &mut s,
-            tid,
-            mypid,
-            id.start_time,
-            "com.a",
-            "RenderThread",
-            cpus(2),
-        );
-        adopt(&mut s, GHOST, 100, "com.a", "RenderThread", cpus(2));
+        crate::lifecycle::seed_rt(tid, mypid, id.start_time, "com.a", "RenderThread", &cpus(2));
+        adopt(GHOST, 100, "com.a", "RenderThread", cpus(2));
         let mut cache = crate::cache::ProcCache::new();
         cache
             .tasks
             .insert(tid, entry(mypid, "com.a", "RenderThread", 2));
 
+        let mut s = state();
         s.reconcile(&cfg, &cache);
-        assert!(s.own.contains_key(&tid), "仍符合条件的线程不能被降级");
-        assert!(!s.own.contains_key(&GHOST), "缓存里没有的线程必须收回");
-        assert_eq!(s.count(mypid), 1);
+        assert!(rt_owned_raw(tid).is_some(), "仍符合条件的线程不能被降级");
+        assert!(
+            !crate::lifecycle::ledger_has(GHOST),
+            "缓存里没有的线程必须收回"
+        );
+        assert_eq!(rt_count(mypid), 1);
         handle.thread().unpark();
         let _ = handle.join();
     }
 
-    /// 全量扫描时包被移出配置，RT 记录不能留着
+    /// 全量扫描时包被移出配置：只收 RT，亲和性记录不能连带删掉
     #[test]
-    fn reconcile_drops_pkg_removed_from_config() {
-        let cfg = cfg_of(RtConfig::default(), &[]);
-        let mut s = state();
-        adopt(&mut s, GHOST, 100, "com.gone", "RenderThread", cpus(2));
+    fn reconcile_demotes_pkg_removed_from_config() {
+        let _g = guard();
+        let (handle, tid) = spawn_named("RenderThread");
+        let id = identity_of(tid).expect("读线程身份");
+        let mypid = std::process::id() as i32;
+        crate::lifecycle::seed_rt(
+            tid,
+            mypid,
+            id.start_time,
+            "com.gone",
+            "RenderThread",
+            &cpus(2),
+        );
         let mut cache = crate::cache::ProcCache::new();
         cache
             .tasks
-            .insert(GHOST, entry(100, "com.gone", "RenderThread", 2));
+            .insert(tid, entry(mypid, "com.gone", "RenderThread", 2));
+        let cfg = cfg_of(RtConfig::default(), &[]);
 
+        let mut s = state();
         s.reconcile(&cfg, &cache);
-        assert!(s.own.is_empty());
+        assert!(
+            crate::lifecycle::ledger_has(tid),
+            "线程还活着，绑核记录必须留着"
+        );
+        // 降级成功则 rt 清空；失败（EPERM 等）则进待重试，两种环境都算对
+        let left = rt_owned_raw(tid);
+        assert!(
+            left.is_none() || left.unwrap().pending_demote,
+            "撤销后的状态只能是「已清」或「待重试」"
+        );
+        handle.thread().unpark();
+        let _ = handle.join();
     }
 
-    /// tid 被别的进程复用：记录作废，新线程不继承旧所有权
+    /// tid 被复用：旧账作废，新线程不继承旧所有权
     #[test]
     fn reused_tid_does_not_inherit_ownership() {
+        let _g = guard();
         let cfg = cfg_of(
             RtConfig {
                 scope: RtScope::Global,
@@ -1211,18 +1174,21 @@ mod tests {
             },
             &["com.a"],
         );
+        adopt_at(GHOST2, 100, 1, "com.a", "RenderThread", cpus(2));
+        // 同一个 tid，现在属于 pid 200：note 读不到这个号，整条账作废
         let mut s = state();
-        adopt(&mut s, GHOST2, 100, "com.a", "RenderThread", cpus(2));
-        // 同一个 tid，现在属于 pid 200
         let ok = s.note(GHOST2, 200, "com.a", "RenderThread", &cpus(2), &cfg);
-        // 记录作废后按新线程走提升流程，线程不存在时失败，且不留下旧记录
         assert!(!ok);
-        assert!(s.own.is_empty(), "旧 tid 的所有权不能交给新线程");
+        assert!(
+            !crate::lifecycle::ledger_has(GHOST2),
+            "旧 tid 的所有权不能交给新线程"
+        );
     }
 
     /// 对账时缓存里的 pid 对不上：走 Forget，不对现承租人调 sched_setscheduler
     #[test]
     fn reconcile_forgets_reused_tid() {
+        let _g = guard();
         let (handle, tid) = spawn_named("RenderThread");
         let id = identity_of(tid).expect("读线程身份");
         let mypid = std::process::id() as i32;
@@ -1233,16 +1199,7 @@ mod tests {
             },
             &["com.a"],
         );
-        let mut s = state();
-        adopt_at(
-            &mut s,
-            tid,
-            mypid,
-            id.start_time,
-            "com.a",
-            "RenderThread",
-            cpus(2),
-        );
+        crate::lifecycle::seed_rt(tid, mypid, id.start_time, "com.a", "RenderThread", &cpus(2));
         let mut cache = ProcCache::new();
         // 缓存里同一个 tid 属于另一个进程，包与线程名仍然符合规则
         cache
@@ -1251,56 +1208,50 @@ mod tests {
 
         let p = plan(
             &cfg,
-            s.own.get(&tid).unwrap(),
+            &rtrec(tid, mypid, id.start_time, "com.a", "RenderThread", 2),
             cache.tasks.get(&tid),
             Some(id),
         );
         assert!(matches!(p, Plan::Forget));
 
+        let mut s = state();
         s.reconcile(&cfg, &cache);
-        assert!(s.own.is_empty());
+        assert!(!crate::lifecycle::ledger_has(tid));
         handle.thread().unpark();
         let _ = handle.join();
     }
 
-    /// 降级失败留下的记录必须能重试：把 pending 记录指向一个不存在的号，
-    /// 重试时拿到 ESRCH 会清掉它——若没有重试，这条记录会一直占着配额
+    /// 降级失败必须进 RecoveryRequired，由 30 秒通道重试。
+    /// 以前 RT 自己有一个 pending_demote 和「等下次全量扫描」，
+    /// 与账本的恢复重试是同一件事的两份实现
     #[test]
-    fn pending_demote_is_retried_on_reconcile() {
-        let mut s = state();
-        adopt(&mut s, GHOST, 100, "com.a", "RenderThread", cpus(2));
-        s.own.get_mut(&GHOST).unwrap().pending_demote = true;
-        let config = cfg_of(RtConfig::default(), &[]);
-        s.reconcile(&config, &ProcCache::new());
-        assert!(s.own.is_empty(), "待撤销的记录必须被重试并清理");
+    fn pending_demote_enters_recovery_and_is_retried() {
+        let _g = guard();
+        adopt(GHOST, 100, "com.a", "RenderThread", cpus(2));
+        crate::lifecycle::mark_rt_pending(GHOST);
+        assert_eq!(
+            crate::lifecycle::ledger_state(GHOST),
+            Some(crate::lifecycle::ManagedState::RecoveryRequired)
+        );
+        assert_eq!(crate::lifecycle::recovery_required(), 1);
+
+        // 线程不存在：重试时身份检查直接清账，不会留一条永远重试的记录
+        let cfg = cfg_of(RtConfig::default(), &[]);
+        crate::lifecycle::retry_recovery(&cfg);
+        assert!(!crate::lifecycle::ledger_has(GHOST));
     }
 
     /// 缓存缺失仍按撤销处理：包被移出配置时必须真的降级
     #[test]
     fn reconcile_demotes_when_entry_missing() {
-        let (handle, tid) = spawn_named("RenderThread");
-        let id = identity_of(tid).expect("读线程身份");
-        let mypid = std::process::id() as i32;
         let cfg = cfg_of(RtConfig::default(), &[]);
-        let mut s = state();
-        adopt_at(
-            &mut s,
-            tid,
-            mypid,
-            id.start_time,
-            "com.a",
-            "RenderThread",
-            cpus(2),
-        );
         let p = plan(
             &cfg,
-            s.own.get(&tid).unwrap(),
-            Some(&entry(mypid, "com.a", "RenderThread", 2)),
-            Some(id),
+            &rtrec(10, 100, 1, "com.a", "RenderThread", 2),
+            None,
+            Some(id_of(10, 100, 1)),
         );
         assert!(matches!(p, Plan::Demote));
-        handle.thread().unpark();
-        let _ = handle.join();
     }
 
     /// 起一个真实线程并命名。RT 的成败取决于进程权限，用例按实际结果分支断言，
@@ -1331,9 +1282,10 @@ mod tests {
         assert_eq!(raw, unsafe { libc::sched_getscheduler(me) });
     }
 
-    /// 真实线程走一遍：成功则进表并可回滚，失败则不留记录、不改策略
+    /// 真实线程走一遍：成功则进账本并可回滚，失败则不留记录、不改策略
     #[test]
     fn promotion_outcome_matches_kernel_state() {
+        let _g = guard();
         let (handle, tid) = spawn_named("RenderThread");
         let before = sys_getsched(tid);
         let cfg = cfg_of(
@@ -1348,15 +1300,15 @@ mod tests {
         let ok = s.note(tid, 100, "com.a", "RenderThread", &target, &cfg);
 
         if ok {
-            // 有 CAP_SYS_NICE：必须进表，且能被单独回滚
-            assert!(s.own.contains_key(&tid));
+            // 有 CAP_SYS_NICE：必须进账本，且能被单独回滚
+            assert!(rt_owned_raw(tid).is_some());
             assert_eq!(sys_getsched(tid), libc::SCHED_RR);
-            s.demote_all();
-            assert!(!s.own.contains_key(&tid));
+            s.drop_threads(&[tid]);
+            assert!(rt_owned_raw(tid).is_none());
             assert_eq!(sys_getsched(tid), libc::SCHED_OTHER);
         } else {
             // EPERM：不能留记录，线程策略保持原样
-            assert!(s.own.is_empty(), "失败的提升不能留下所有权记录");
+            assert!(rt_owned_raw(tid).is_none(), "失败的提升不能留下所有权记录");
             assert_eq!(sys_getsched(tid), before);
         }
 
@@ -1368,47 +1320,47 @@ mod tests {
     /// 其他 errno 只跳过当前线程。两种环境的断言都成立
     #[test]
     fn promotion_failure_clears_or_keeps_by_errno() {
+        let _g = guard();
         let tid = unsafe { libc::syscall(libc::SYS_gettid) as i32 };
         let mut s = state();
         // 熔断前已经提升过一个线程：熔断必须把它放回 CFS。用不存在的 tid，
         // 避免测试真去改沙箱里 pid 1 的调度策略
-        adopt(&mut s, GHOST, 100, "com.a", "RenderThread", cpus(2));
+        adopt(GHOST, 100, "com.a", "RenderThread", cpus(2));
 
         let ok = s.apply(id_of(tid, 200, 1), "com.a", "RenderThread", &cpus(2));
         if ok {
             // 有 CAP_SYS_NICE 的环境：用例不适用，把自己改回去
-            s.demote_all();
+            s.drop_threads(&[tid]);
             return;
         }
         if s.enabled {
             // 非权限类错误：只跳过该线程，不动已有所有权
-            assert!(s.own.contains_key(&GHOST));
+            assert!(rt_owned_raw(GHOST).is_some());
         } else {
             // 熔断：闸门关闭且残留清零
-            assert!(s.own.is_empty(), "熔断必须回滚已提升的线程");
+            assert!(
+                !crate::lifecycle::ledger_has(GHOST),
+                "熔断必须回滚已提升的线程"
+            );
         }
     }
 
-    /// TID 复用：旧记录 pid 与新线程不符时，必须在任何降级之前丢弃。
-    /// 只比 pid 抓不住这里：同一个进程里 TID 也会被复用，pid 完全一样。
-    /// 用例故意让新旧记录同 pid、只有 starttime 不同
+    /// TID 复用：旧记录与新线程身份不符时，必须在任何降级之前丢弃。
+    /// 只比 tid 抓不住这里：同一个进程里 TID 也会被复用
     #[test]
     fn note_drops_stale_record_before_policy_check() {
+        let _g = guard();
         let (handle, tid) = spawn_named("Worker");
         let mypid = std::process::id() as i32;
-        let mut s = state();
         // 旧记录：同一个 tid、同一个 pid，starttime 是上一条线程的
-        adopt_at(&mut s, tid, mypid, 1, "com.old", "RenderThread", cpus(2));
+        adopt_at(tid, mypid, 1, "com.old", "RenderThread", cpus(2));
         // 新线程所属包没有任何 RT 策略
         let cfg = cfg_of(RtConfig::default(), &[]);
 
+        let mut s = state();
         assert!(!s.note(tid, mypid, "com.new", "Worker", &cpus(2), &cfg));
 
-        assert!(!s.own.contains_key(&tid), "旧记录必须被清除");
-        assert!(
-            !s.own.values().any(|a| a.identity.start_time == 1),
-            "不能留下上一条线程的所有权记录"
-        );
+        assert!(!crate::lifecycle::ledger_has(tid), "旧记录必须被清除");
         assert_eq!(s.demoted, 0, "号被复用的旧记录不能触发降级");
         // 新线程没有策略，不能被提升，也不该被改成别的调度策略
         assert_eq!(sys_getsched(tid), libc::SCHED_OTHER);

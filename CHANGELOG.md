@@ -1,5 +1,44 @@
 # AppOptR 变更记录
 
+## 2.7.0-beta34（2026-11-27）
+
+把 RT 所有权并进生命周期账本。这一轮没有新功能，只做一件事：**同一类状态
+不再存两份**。改完 `rt.rs` 里那张 `own` 表整体消失，`pending_demote` 也不再
+是独立的一套重试。
+
+**合并**
+
+- `ManagedTask` 增加 `rt: Option<RtTag>`（`allowed` + `pending_demote`）。
+  RT 模块不再自己维护 `HashMap<i32, Owned>`，身份、包名、线程名、允许集合
+  全部以账本为准，重复的 3 个字段（`identity` / `comm` / `pkg`）去掉
+- 撤销 RT 失败的重试并进 `RecoveryRequired`。以前 RT 有 `pending_demote` +
+  「等下次全量扫描」，账本有 `RecoveryRequired` + 30 秒重试，是同一件事的
+  两份实现。现在只有一条通道：失败打标记进 `RecoveryRequired`，30 秒后
+  `retry_recovery` 连亲和性一起重试。proc 模式原来最多要等 60 秒，eBPF 模式下
+  更是只在配置变更时才碰——这是实际变快的地方
+- 恢复流程先收 RT 再还亲和性。RT 线程如果降级失败而亲和性已经放开到全核，
+  一个 RR 线程跑满全机，比留在小核更糟；所以降级失败时整条记录进待恢复，
+  下一轮一起重试
+- 线程仍受管、只是 RT 待撤销时，新增 `Verdict::DemoteRt`：只收 RR，不动组与
+  亲和性。以前这种情况会被 `Keep` 直接跳过，RR 永远收不回来
+- 账本里只有 RT、从没接管过亲和性的记录（规则写入失败时会出现），`judge`
+  现在能把 `original_affinity` 为空解释成「只收 RT」，而不是当成「原值未知」
+  一丢了之
+
+**清理**
+
+- `rt::forget` / `rt::release_pid` 删除。两者的活儿已经由 `task_gone` /
+  `purge_pid` 内部的 `lifecycle::forget` / `forget_pid` 完成，调用点全部去掉
+- RT 对账不再自己读 `/proc/<tid>/status` 补 TGID：账本里的身份本来就带着
+
+**验证**
+
+- `cargo test` 303 通过、0 失败、2 ignored（新增：待撤销只收 RT、RT-only 记录
+  可释放、账本 RT 字段在亲和性接管时不被覆盖）
+- 沙箱实测：规则命中 → 绑 0-1；删规则 → `已释放 1 个线程回原组`、亲和性回
+  0-31；开 RT → 时间片不可写时熔断不崩、绑核保持；SIGTERM → 释放并还原
+- 真机才能验的：RT 提升成功后的降级、`DemoteRt` 的最短路径
+
 ## 2.7.0-beta33（2026-11-27）
 
 审计里剩下的六条性能与架构建议（O-01～O-06）。这一轮没有加新功能，全部是

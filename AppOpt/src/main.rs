@@ -424,12 +424,14 @@ fn main() {
 
     loop {
         if SHUTDOWN.load(Ordering::Acquire) {
-            crate::diag::tag("事件", "收到退出信号：先释放接管，再还原 RT 状态");
+            crate::diag::tag("事件", "收到退出信号：先释放接管（含 RT），再还原时间片");
             // 规则还在，但模块要走：线程不该继续留在 AppOpt/<集合> 里被限制。
-            // 身份与组归属两项检查照做，拿不准的一律不动
+            // 身份与组归属两项检查照做，拿不准的一律不动。
+            // RT 所有权也在账本里，release 时同一趟把 RR 收回来
             if let Some(cfg) = lock_ignore_poison(&CURRENT_CONFIG).clone() {
                 crate::lifecycle::release_unmanaged(&cfg, true);
             }
+            // 线程已经由上面那步处理完，这里只剩全局时间片
             rt::shutdown();
             break;
         }
@@ -648,10 +650,9 @@ fn main() {
                 || affinity_deadline.elapsed() >= Duration::from_secs(proc_gap)
                 || cache.force_affinity
             {
-                // ESRCH 的线程同时收回 RT 记录，避免事件漏报时配额一直被占
-                for tid in cache.cache.affinity_sync(&cfg) {
-                    rt::forget(tid);
-                }
+                // ESRCH 的线程由 `affinity_sync` 内部的 `task_gone` 收回账本
+                // （含 RT 所有权），这里只需要驱动一轮同步
+                for _ in cache.cache.affinity_sync(&cfg) {}
                 affinity_deadline = Instant::now();
                 cache.force_affinity = false;
             }

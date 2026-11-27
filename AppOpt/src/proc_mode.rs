@@ -168,7 +168,6 @@ pub fn cache_sync(cfg: &AppConfig, state: &mut ProcScanState) {
         state.tracked_pids.remove(&pid);
         state.cache.purge_pid(pid);
         state.known_tids.retain(|_, owner| *owner != pid);
-        rt::release_pid(pid);
     }
 
     // 已跟踪进程的新线程：新线程会在创建后立刻命名，需在下一个周期内纳入管理。

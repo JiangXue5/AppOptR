@@ -62,6 +62,23 @@ pub enum ManagedState {
     RecoveryRequired,
 }
 
+/// 本模块在这条线程上做过的 RT 提升。
+///
+/// 与 `ManagedState` 分开记：`RecoveryRequired` 说的是「还原没做成，等重试」，
+/// 而一条线程可能压根没提升过 RT。反过来 `pending_demote` 只描述 RT 这一项，
+/// 它出现的原因和亲和性还原失败一样（写入被拒），所以两者共用同一个重试通道
+/// `retry_recovery`——但原因要能分开说，日志里不能把「RR 没降下来」说成
+/// 「亲和性没还回去」
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RtTag {
+    /// 提升时的规则允许集合。配置热更新后据此复核核数条件
+    pub allowed: CpuSet,
+    /// 撤销时 `sched_setscheduler` 失败：记录留着等下一轮重试。
+    /// 以前是先删记录再降级，失败就等于「这条 RT 从此无人认领」——
+    /// 线程一直停在 RR，模块却以为已经放手
+    pub pending_demote: bool,
+}
+
 /// 一次接管的完整上下文。
 pub struct ManagedTask {
     pub identity: TaskIdentity,
@@ -81,6 +98,13 @@ pub struct ManagedTask {
     /// 系统改写亲和性是常态，该还原的仍然还原
     pub last_applied_affinity: CpuSet,
     pub owner_pkg: String,
+    /// 这条线程由本模块提升到 RT 的记录。`None` 表示没提升过，或者已经降回去了。
+    ///
+    /// 放进账本而不是 RT 模块自己存一份：两者记的是同一件事——「我在那条线程上
+    /// 动过手，要负责还回去」。分开存时，撤销 RT 失败的重试（`pending_demote`）
+    /// 和还原亲和性失败的重试（`RecoveryRequired`）各写了一套，同一类失败
+    /// 要维护两个通道，还容易一边成功一边失败留下中间态
+    pub rt: Option<RtTag>,
     pub state: ManagedState,
 }
 
@@ -94,6 +118,7 @@ impl Clone for ManagedTask {
             last_applied_cpuset: self.last_applied_cpuset.clone(),
             last_applied_affinity: self.last_applied_affinity,
             owner_pkg: self.owner_pkg.clone(),
+            rt: self.rt,
             state: self.state,
         }
     }
@@ -108,6 +133,60 @@ static LEDGER: Mutex<Option<Ledger>> = Mutex::new(None);
 fn with_ledger<R>(f: impl FnOnce(&mut Ledger) -> R) -> R {
     let mut guard = lock_ignore_poison(&LEDGER);
     f(guard.get_or_insert_with(HashMap::new))
+}
+
+/// 全局账本是单例：跨模块（lifecycle / rt / cache）的用例都会动它，
+/// 涉及清账的必须串行，否则互相把对方的记录清掉
+#[cfg(test)]
+pub static LEDGER_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// 测试用：直接塞一条「亲和性 + RT」记录。`note_rt` 要读真实 /proc，
+/// 造不出不存在的 tid，而配额、对账这类逻辑只需要表内容
+#[cfg(test)]
+pub fn seed_rt(tid: i32, tgid: i32, start_time: u64, pkg: &str, comm: &str, allowed: &CpuSet) {
+    with_ledger(|l| {
+        l.insert(
+            tid,
+            ManagedTask {
+                identity: TaskIdentity {
+                    tid,
+                    tgid,
+                    start_time,
+                },
+                comm: comm.to_string(),
+                original_cpuset: Some("/top-app".to_string()),
+                original_affinity: CpuSet::default(),
+                last_applied_cpuset: String::new(),
+                last_applied_affinity: CpuSet::default(),
+                owner_pkg: pkg.to_string(),
+                rt: Some(RtTag {
+                    allowed: *allowed,
+                    pending_demote: false,
+                }),
+                state: ManagedState::Managed,
+            },
+        );
+    });
+}
+
+#[cfg(test)]
+pub fn ledger_clear() {
+    with_ledger(|l| l.clear());
+}
+
+#[cfg(test)]
+pub fn ledger_has(tid: i32) -> bool {
+    with_ledger(|l| l.contains_key(&tid))
+}
+
+#[cfg(test)]
+pub fn ledger_pkgs() -> Vec<String> {
+    with_ledger(|l| l.values().map(|m| m.owner_pkg.clone()).collect())
+}
+
+#[cfg(test)]
+pub fn ledger_state(tid: i32) -> Option<ManagedState> {
+    with_ledger(|l| l.get(&tid).map(|m| m.state))
 }
 
 /// 读 `/proc/<tid>/stat` 拿身份。
@@ -187,7 +266,13 @@ pub fn note_managed(
             m.last_applied_cpuset = cpuset_dir.to_string();
             return;
         }
-        // 没登记过，或 tid 被复用：旧账作废，按新线程重新记
+        // 没登记过，或 tid 被复用：旧账作废，按新线程重新记。
+        // RT 提升可能先于亲和性接管发生（RT-only 记录），同一条线程的
+        // 记录必须把 rt 带过来——覆盖成 None 等于账本忘了它还停在 RR
+        let kept_rt = l
+            .get(&tid)
+            .filter(|old| old.identity.same_thread(&identity))
+            .and_then(|old| old.rt);
         l.insert(
             tid,
             ManagedTask {
@@ -198,6 +283,7 @@ pub fn note_managed(
                 last_applied_cpuset: cpuset_dir.to_string(),
                 last_applied_affinity: *applied,
                 owner_pkg: pkg.to_string(),
+                rt: kept_rt,
                 // 登记与接管是同一件事，这里让状态机从「发现」推进到「已接管」
                 state: ManagedState::Discovered,
             },
@@ -218,6 +304,142 @@ pub fn note_applied(tid: i32, applied: &CpuSet, cpuset_dir: &str) {
             m.state = ManagedState::Managed;
         }
     });
+}
+
+/// RT 提升成功。线程可能还没有亲和性接管记录（规则只写了 RT、或亲和性
+/// 那次写入失败），这时补一条只含 RT 的账：撤销 RR 时同样需要知道原样。
+///
+/// 收完整身份而不是自己去读：调用方刚为别的判断读过一次 stat，
+/// 这里再读一遍等于每个新线程多两次 open
+pub fn note_rt(identity: TaskIdentity, pkg: &str, comm: &str, allowed: &CpuSet) {
+    let tid = identity.tid;
+    with_ledger(|l| {
+        match l.get_mut(&tid) {
+            // 同一条线程：只动 rt 这一格，原始状态与最后写入一概不碰。
+            // 线程名与包名要跟着更新——`prune` 按它们判断是否仍符合策略，
+            // 改名后不更新会把「已经不该提升」的线程一直留着
+            Some(m) if m.identity.same_thread(&identity) => {
+                m.comm = comm.to_string();
+                m.owner_pkg = pkg.to_string();
+                m.rt = Some(RtTag {
+                    allowed: *allowed,
+                    pending_demote: false,
+                });
+            }
+            // 没记录，或号被复用：旧账作废，按新线程重记
+            _ => {
+                l.insert(
+                    tid,
+                    ManagedTask {
+                        identity,
+                        comm: comm.to_string(),
+                        // 亲和性从没被我们改过：这两个空值让 `judge` 跳过恢复
+                        original_cpuset: None,
+                        original_affinity: CpuSet::default(),
+                        last_applied_cpuset: String::new(),
+                        last_applied_affinity: CpuSet::default(),
+                        owner_pkg: pkg.to_string(),
+                        rt: Some(RtTag {
+                            allowed: *allowed,
+                            pending_demote: false,
+                        }),
+                        state: ManagedState::Managed,
+                    },
+                );
+            }
+        }
+    });
+}
+
+/// 一次查出「这个号是不是被复用了」和「本线程的 RT 记录」。
+/// 分成两次调用要拿两次锁，而这两件事本来就是同一条记录的两种答案
+pub fn rt_lookup(tid: i32, id: &TaskIdentity) -> (bool, Option<RtTag>) {
+    with_ledger(|l| match l.get(&tid) {
+        Some(m) if !m.identity.same_thread(id) => (true, None),
+        Some(m) => (false, m.rt),
+        None => (false, None),
+    })
+}
+
+/// 不做身份校验的版本。只给「已经核对过身份、或线程已经不在了」的路径用
+pub fn rt_owned_raw(tid: i32) -> Option<RtTag> {
+    with_ledger(|l| l.get(&tid).and_then(|m| m.rt))
+}
+
+/// 降级成功：只清 rt 这一格。记录本身要留着——亲和性可能还被我们握着
+pub fn clear_rt(tid: i32) {
+    with_ledger(|l| {
+        let Some(m) = l.get_mut(&tid) else {
+            return;
+        };
+        let was_pending = m.rt.is_some_and(|r| r.pending_demote);
+        m.rt = None;
+        // RT 待降是这条记录进入 RecoveryRequired 的唯一原因时，降下来
+        // 就该退出来：否则 `recovery_required()` 永远大于 0，30 秒一次
+        // 的重试通道一直空转，还会把日志签名压住
+        if was_pending && m.state == ManagedState::RecoveryRequired {
+            m.state = ManagedState::Managed;
+        }
+        // 只提过 RT、亲和性从没被我们动过的记录，清完 rt 就什么都不剩了。
+        // 留着会让账本越攒越长，`managed_count` 也跟着虚高
+        if m.rt.is_none() && m.original_cpuset.is_none() && m.original_affinity.count() == 0 {
+            l.remove(&tid);
+        }
+    });
+}
+
+/// 撤销 RT 失败：打上待重试标记，交给 `retry_recovery` 的 30 秒通道。
+///
+/// 以前 RT 自己有一个 `pending_demote` 和一套「等下次全量扫描再试」，
+/// 跟账本的 `RecoveryRequired` 是同一件事的两份实现。合并后只有一条重试通道，
+/// 且不必等下一次全量扫描（proc 模式 60 秒、eBPF 只在配置变更时）
+pub fn mark_rt_pending(tid: i32) {
+    with_ledger(|l| {
+        if let Some(m) = l.get_mut(&tid)
+            && let Some(rt) = m.rt.as_mut()
+        {
+            rt.pending_demote = true;
+            m.state = ManagedState::RecoveryRequired;
+        }
+    });
+}
+
+/// 一条 RT 记录的完整快照。对账时要拿去判断策略与配额，但闭包里不能
+/// 直接改账本：降级是系统调用，持锁做几十次 `sched_setscheduler` 会把
+/// web 线程一起卡住
+pub struct RtRecord {
+    pub tid: i32,
+    pub identity: TaskIdentity,
+    pub pkg: String,
+    pub comm: String,
+    pub tag: RtTag,
+}
+
+/// 当前由本模块提升的线程快照
+pub fn rt_records() -> Vec<RtRecord> {
+    with_ledger(|l| {
+        l.iter()
+            .filter_map(|(&tid, m)| {
+                Some(RtRecord {
+                    tid,
+                    identity: m.identity,
+                    pkg: m.owner_pkg.clone(),
+                    comm: m.comm.clone(),
+                    tag: m.rt?,
+                })
+            })
+            .collect()
+    })
+}
+
+/// 某进程名下被提升的线程数。配额判断用，直接数账本，不另存计数器——
+/// 计数器与集合不同步时，配额会算错，且错的方向是「多提升几条」
+pub fn rt_count(tgid: i32) -> usize {
+    with_ledger(|l| {
+        l.values()
+            .filter(|m| m.rt.is_some() && m.identity.tgid == tgid)
+            .count()
+    })
 }
 
 /// 线程退出或缓存清理时删记录。这里只删账，不动内核——线程都没了，无组可还
@@ -260,6 +482,9 @@ enum Verdict {
     /// 可以释放。参数表示线程此刻是否还在我们自己的组里：
     /// 在，才需要迁回原组；不在，只恢复亲和性
     Release(bool),
+    /// 只收 RT，组与亲和性一概不动：线程仍在规则管理下（亲和性该维持），
+    /// 但已经不符合 RT 策略了。整条 Release 会把还在用的绑核一起撤掉
+    DemoteRt,
     /// 只删记录：线程没了、号被复用、组与亲和性都不在我们手里
     Drop(&'static str),
     /// 仍受管，不释放
@@ -285,6 +510,13 @@ fn judge(
         return Verdict::Drop("tid 已被复用");
     }
     if still_managed && !force {
+        // 线程仍受管，但 RT 撤销失败过：只补收 RT，不释放亲和性。
+        // 这是 RT 从自己那套 `pending_demote` 并进账本后的统一重试入口——
+        // 以前它等下一次全量扫描（proc 60 秒、eBPF 只在配置变更时），
+        // 现在走 30 秒通道
+        if rec.rt.is_some_and(|r| r.pending_demote) {
+            return Verdict::DemoteRt;
+        }
         return Verdict::Keep;
     }
     // 之前恢复失败的记录不参与「什么都没留下」的判定：组和亲和性都不在
@@ -302,7 +534,11 @@ fn judge(
     // `ours` 只用来判断「我们有没有在这条线程上留下痕迹」，不再作为
     // 「别人接管了、我们别动」的理由：本模块是唯一的绑核方，系统改写
     // 亲和性是常态（切后台收敛、热插拔、厂商 HAL）。留下的限制一律撤销
-    let ours = affinity.is_none_or(|cur| cur == rec.last_applied_affinity);
+    //
+    // RT 也算痕迹：提升过的线程即使亲和性被系统改写、也从没迁过组，
+    // 撤销时必须先把 RR 收回来。少了这一项，一条只提了 RT 的记录会因为
+    // 「组和亲和性都不在我们手里」被当成空账删掉，线程永久停在 RR
+    let ours = affinity.is_none_or(|cur| cur == rec.last_applied_affinity) || rec.rt.is_some();
     // 组与亲和性都不在我们手里：没留下任何限制，连记录一起清掉
     if !in_own && !ours && !recovering {
         return Verdict::Drop("组与亲和性都不在我们手里");
@@ -311,12 +547,23 @@ fn judge(
         // 组是我们的，规则一撤就得还。迁组时内核会按原组允许集合重算
         // 亲和性，被系统改写过的掩码也就跟着覆盖掉了
         if rec.original_cpuset.is_none() {
+            // 只有 RT 记录、组不是我们迁进来的（规则写入失败的那一类）：
+            // 迁回去没有依据，但 RR 必须收掉
+            if rec.rt.is_some() {
+                return Verdict::Release(false);
+            }
             return Verdict::Hold("接管前的组未知");
         }
         return Verdict::Release(true);
     }
     // 不在我们组里，组从没被我们动过：只把亲和性还原
     if rec.original_affinity.count() == 0 {
+        // 从没接管过亲和性、只提升过 RT：把 RR 收回来就行。
+        // 没有这条，RT 记录会停在「接管前的亲和性未知」上被 Drop，
+        // 而它压根不需要还原亲和性
+        if rec.rt.is_some() {
+            return Verdict::Release(false);
+        }
         return Verdict::Drop("接管前的亲和性未知");
     }
     Verdict::Release(false)
@@ -329,6 +576,9 @@ pub struct ReleaseReport {
     pub dropped: usize,
     pub kept: usize,
     pub failed: usize,
+    /// 只收回了 RT、亲和性仍然维持的线程数。与 `released` 分开：
+    /// 前者是「还在管、只降了 RT」，后者是「彻底还回去了」
+    pub rt_demoted: usize,
 }
 
 /// cgroup 相对路径 → 挂载点下的绝对路径
@@ -343,11 +593,28 @@ fn abs_cgroup(rel: &str) -> String {
     }
 }
 
-/// 把线程还回去：先迁组（需要时），再恢复亲和性。
+/// 把线程还回去：先收 RT，再迁组（需要时），最后恢复亲和性。
 ///
-/// 顺序不能反：`cgroup.procs` 一写，内核会把线程亲和性重置成新组允许的集合，
-/// 先恢复再迁组等于白写
+/// 顺序有两条约束：
+/// 1. RT 必须先收。提升过的线程如果降级失败而我们又把亲和性放开到全核，
+///    一个 RR 线程跑满全机，比留在小核更糟。失败就整条记录置为
+///    `RecoveryRequired`，下一轮连亲和性一起重试
+/// 2. 迁组必须在恢复亲和性之前：`cgroup.procs` 一写，内核会把线程亲和性
+///    重置成新组允许的集合，先恢复再迁组等于白写
 fn restore(rec: &ManagedTask, in_own: bool) -> Result<(), (i32, &'static str)> {
+    // 只做内核操作，不碰账本：`clear_rt` 要再进一次账本的锁，而调用方
+    // 可能在持锁状态里（std 的 Mutex 不可重入）。清账由 `release_list` 负责
+    if rec.rt.is_some() {
+        crate::rt::demote_one(rec.identity.tid).map_err(|errno| {
+            if errno == libc::ESRCH {
+                (errno, "线程已退出")
+            } else if errno == libc::EPERM || errno == libc::EACCES {
+                (errno, "撤销 RT 被拒（权限）")
+            } else {
+                (errno, "撤销 RT 失败")
+            }
+        })?;
+    }
     // 只有线程还在我们组里才谈得上「迁回去」。它从来没被迁进来过
     // （cpuset 不可用 / 熔断期间只写了亲和性）时硬写原组反而是乱搬
     if in_own
@@ -457,8 +724,11 @@ fn release_list(cfg: &AppConfig, force: bool, list: Vec<ManagedTask>) -> Release
             comm.as_str()
         };
         // 仍受管时到此为止：稳态只花两次 open（stat + comm），不读组与亲和性。
-        // 配置变更可能只是一条无关规则，不该为此扫一遍所有受管线程的 cgroup
-        if still && !force {
+        // 配置变更可能只是一条无关规则，不该为此扫一遍所有受管线程的 cgroup。
+        //
+        // 例外是 RT 待撤销：这类线程仍匹配规则（亲和性要维持），但 RR 必须
+        // 收回来。放它过去，下一句 judge 会返回 `DemoteRt`
+        if still && !force && !rec.rt.is_some_and(|r| r.pending_demote) {
             rep.kept += 1;
             continue;
         }
@@ -466,6 +736,17 @@ fn release_list(cfg: &AppConfig, force: bool, list: Vec<ManagedTask>) -> Release
         let affinity = CpuSet::get_affinity(tid);
         match judge(&rec, Some(now), cgroup.as_deref(), affinity, still, force) {
             Verdict::Keep => rep.kept += 1,
+            Verdict::DemoteRt => {
+                match crate::rt::demote_one(tid) {
+                    Ok(()) => {
+                        clear_rt(tid);
+                        rep.rt_demoted += 1;
+                    }
+                    // 线程已退出也会走到这里（Ok），Err 只剩真正的写入失败：
+                    // 标记保持，等下一轮
+                    Err(_) => rep.failed += 1,
+                }
+            }
             Verdict::Drop(reason) => {
                 with_ledger(|l| {
                     l.remove(&tid);
@@ -580,6 +861,12 @@ fn report(
                     ""
                 }
             ),
+        );
+    }
+    if rep.rt_demoted > 0 {
+        crate::diag::tag(
+            "配置",
+            &format!("{} 个线程已撤销 RT（绑核维持不变）", rep.rt_demoted),
         );
     }
     if rep.failed > 0 {
@@ -760,7 +1047,7 @@ mod tests {
     }
 
     /// 全局账本是单例：涉及清账的用例必须串行，否则互相把对方的记录清掉
-    static LEDGER_TEST_LOCK: Mutex<()> = Mutex::new(());
+    use super::LEDGER_TEST_LOCK;
 
     fn rec(orig: Option<&str>, applied: &str, aff: &CpuSet) -> ManagedTask {
         ManagedTask {
@@ -775,6 +1062,7 @@ mod tests {
             last_applied_cpuset: applied.to_string(),
             last_applied_affinity: *aff,
             owner_pkg: "com.test.game".to_string(),
+            rt: None,
             state: ManagedState::Managed,
         }
     }
@@ -941,6 +1229,48 @@ mod tests {
         let left: Vec<i32> = with_ledger(|l| l.keys().copied().collect());
         with_ledger(|l| l.clear());
         assert_eq!(left, vec![102], "只该剩下别的进程那条");
+    }
+
+    /// 线程仍受管、只是 RT 撤销失败过：必须只收 RR，绑核记录不能动。
+    /// 整条 Release 会把还在用的绑核一起撤掉，线程反而跑得更开
+    #[test]
+    fn pending_rt_is_demoted_without_releasing_affinity() {
+        let mut task = rec(Some("/top-app"), "4-6", &set("4-6"));
+        task.rt = Some(RtTag {
+            allowed: set("4-6"),
+            pending_demote: true,
+        });
+        task.state = ManagedState::RecoveryRequired;
+        let id = task.identity;
+        assert_eq!(
+            judge(
+                &task,
+                Some(id),
+                Some("/top-app"),
+                Some(set("4-6")),
+                true,
+                false
+            ),
+            Verdict::DemoteRt
+        );
+
+        // 没打过待撤销标记时，仍受管的线程照旧 Keep
+        task.rt = Some(RtTag {
+            allowed: set("4-6"),
+            pending_demote: false,
+        });
+        task.state = ManagedState::Managed;
+        assert_eq!(
+            judge(
+                &task,
+                Some(id),
+                Some("/top-app"),
+                Some(set("4-6")),
+                true,
+                false
+            ),
+            Verdict::Keep
+        );
     }
 
     /// 30 秒一次的重试只碰待恢复记录：健康记录不参与克隆与判定，
