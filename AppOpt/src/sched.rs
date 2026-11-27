@@ -1456,6 +1456,13 @@ mod tests {
         let mut allowed = CpuSet::new();
         allowed.or(&t.p_core);
         allowed.or(&t.hp_core);
+        if allowed.count() == 0 {
+            // 4 核的 CI 机器只有一个簇，没有 p-core / hp-core 之分。
+            // 这条测的是「shadow 只判定、不动真实亲和性」，与核的档位无关，
+            // 退化成全部核照样成立；本地 8 核以上仍按原样走
+            allowed.or(&t.present_cpus);
+        }
+        let conf = format!("com.test.game={}\n", allowed.to_range_string());
         assert_eq!(
             crate::apply_affinity::affinity_apply(
                 tid,
@@ -1470,7 +1477,7 @@ mod tests {
             AffinityOutcome::Set
         );
 
-        let cfg = cfg_with("shadow_real", "com.test.game=p-core,hp-core\n");
+        let cfg = cfg_with("shadow_real", &conf);
         let mut cache = ProcCache::new();
         cache.tasks.insert(
             tid,

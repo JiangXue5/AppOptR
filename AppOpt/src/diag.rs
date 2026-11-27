@@ -2091,9 +2091,11 @@ mod tests {
     /// 组路径读不到时也要明确说读不到，而不是编一个组名
     #[test]
     fn clip_reason_states_group_values_or_says_unknown() {
-        let line = clip_reason("4-6", "4-5", "-");
+        // 0-1 / 0-0 在 4 核的 CI 机器上也都在线，才能走到「组限制」分支。
+        // 原先写 4-6 / 4-5，4 核上会被判成「核不在线」，测的是另一条分支
+        let line = clip_reason("0-1", "0-0", "-");
         assert!(line.contains("期望"), "{}", line);
-        assert!(line.contains("4-5"), "{}", line);
+        assert!(line.contains("0-0"), "{}", line);
         assert!(
             line.contains("未知组"),
             "读不到 cpuset 时必须直说，不能指向不存在的组：{}",

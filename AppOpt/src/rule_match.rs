@@ -223,7 +223,20 @@ mod tests {
             .expect("启动测试进程失败");
         std::thread::sleep(std::time::Duration::from_millis(300));
         // comm 为首 15 字节，cmdline 可确认真实包名
-        let got = comm_to_pkg(child.id() as i32, "com.test.applic", &cfg);
+        let pid = child.id() as i32;
+        let got = comm_to_pkg(pid, "com.test.applic", &cfg);
+        if got.is_none() {
+            // 这条在本地一直过、CI 上挂过一次。失败时把判据摊开，省得下次
+            // 只看到 None 又去猜：是 cmdline 读不到、属主校验拦了，还是配置里没这个包
+            eprintln!(
+                "诊断 pid={} comm={:?} cmdline={:?} uid={:?} pkgs={:?}",
+                pid,
+                crate::apply_affinity::tid_comm(pid),
+                crate::apply_affinity::read_cmdline(pid),
+                crate::apply_affinity::proc_uid(pid),
+                cfg.pkgs
+            );
+        }
         let _ = child.kill();
         let _ = child.wait();
         assert_eq!(got.as_deref(), Some("com.test.applications"));
@@ -275,7 +288,9 @@ mod tests {
     fn pkg_signature_ignores_rule_order_but_detects_changes() {
         let cfg1 = cfg_with("sig1", "com.a {\n  A=0-1\n  B=2-3\n}\n");
         let cfg2 = cfg_with("sig2", "com.a {\n  B=2-3\n  A=0-1\n}\n");
-        let cfg3 = cfg_with("sig3", "com.a {\n  A=0-1\n  B=2-4\n}\n");
+        // 0-3 而不是 2-4：4 核机器上 4 会被裁掉，归一化后与 2-3 相同，
+        // 这条「签名能感知变化」的断言就永远不成立
+        let cfg3 = cfg_with("sig3", "com.a {\n  A=0-1\n  B=0-3\n}\n");
         assert_eq!(cfg1.pkg_sig["com.a"], cfg2.pkg_sig["com.a"]);
         assert_ne!(cfg1.pkg_sig["com.a"], cfg3.pkg_sig["com.a"]);
     }
@@ -389,31 +404,35 @@ mod tests {
         }
     }
 
-    /// 跨档冲突时的预期行为：精确规则胜出，不再被通配规则稀释
+    /// 跨档冲突时的预期行为：精确规则胜出，不再被通配规则稀释。
+    ///
+    /// 核号只用 0-3：CI 的构建机是 4 核，写 `6-7` 会被当成离线核裁掉，
+    /// 规则变成空掩码后「精确优先」根本没机会被验证——本地 32 核能过、
+    /// CI 上挂掉的就是这个
     #[test]
     fn exact_rule_beats_star_rule_instead_of_union() {
         let cfg = cfg_with(
             "spec_conflict",
-            "com.x {\n  RenderThread=6-7\n  Render*=0-3\n}\n",
+            "com.x {\n  RenderThread=2-3\n  Render*=0-1\n}\n",
         );
         let r = thread_affinity("com.x", "RenderThread", &cfg).unwrap();
-        assert_eq!(r.cpus.to_range_string(), "6-7", "精确规则必须独占");
+        assert_eq!(r.cpus.to_range_string(), "2-3", "精确规则必须独占");
         assert_eq!(r.spec, crate::config::MatchSpecificity::Exact);
         assert_eq!(r.hits, 1);
         assert_eq!(r.hit_pattern, Some("RenderThread"));
 
         // 只命中通配的线程仍按通配走
         let r = thread_affinity("com.x", "RenderFoo", &cfg).unwrap();
-        assert_eq!(r.cpus.to_range_string(), "0-3");
+        assert_eq!(r.cpus.to_range_string(), "0-1");
         assert_eq!(r.spec, crate::config::MatchSpecificity::StarWildcard);
     }
 
     /// 同档多条规则继续 OR：这是用户已经依赖的语义，不能被优先级改掉
     #[test]
     fn same_tier_rules_still_union() {
-        let cfg = cfg_with("spec_same", "com.x {\n  Unity*=4-5\n  Unity*=6-7\n}\n");
+        let cfg = cfg_with("spec_same", "com.x {\n  Unity*=0-1\n  Unity*=2-3\n}\n");
         let r = thread_affinity("com.x", "UnityMain", &cfg).unwrap();
-        assert_eq!(r.cpus.to_range_string(), "4-7");
+        assert_eq!(r.cpus.to_range_string(), "0-3");
         assert_eq!(r.hits, 2, "两条同档规则都应参与");
         assert_eq!(r.spec, crate::config::MatchSpecificity::StarWildcard);
     }
