@@ -384,6 +384,32 @@ impl Pmu {
 static PMU: Mutex<Option<Pmu>> = Mutex::new(None);
 static SNAPSHOT: Mutex<Option<PmuSnapshot>> = Mutex::new(None);
 
+/// 配额行上次打印时的判断依据：最空层、匹配度、时间。
+///
+/// 真机上 9 分钟打了 18 行，几乎每行都是「p-core 偏空 3x 个点」，差别只在
+/// 实际占比的小数点。真正变化的时刻（忽然从 83% 掉到 34%）反而埋在中间。
+/// 只在「最空层换了」「匹配度变化 ≥15 个百分点」「距上次 5 分钟」时再报
+static QUOTA_LOG: Mutex<Option<(Option<usize>, f64, Instant)>> = Mutex::new(None);
+
+fn quota_should_log(plan: &crate::pmu_allocator::ShadowPlan) -> bool {
+    const FIT_STEP: f64 = 0.15;
+    const QUIET: Duration = Duration::from_secs(300);
+    let mut guard = lock_ignore_poison(&QUOTA_LOG);
+    let now = Instant::now();
+    let changed = match *guard {
+        None => true,
+        Some((layer, fit, at)) => {
+            layer != plan.starved
+                || (plan.fit - fit).abs() >= FIT_STEP
+                || now.duration_since(at) >= QUIET
+        }
+    };
+    if changed {
+        *guard = Some((plan.starved, plan.fit, now));
+    }
+    changed
+}
+
 /// 当前快照。未启用过时返回默认值（state = 「未启用」）
 pub fn snapshot() -> PmuSnapshot {
     lock_ignore_poison(&SNAPSHOT)
@@ -841,6 +867,7 @@ fn log_line(p: &Pmu, cfg: &AppConfig) {
     // 配额单独一行：和采样行挤在一起会超过终端宽度，也看不清对照关系
     if cfg.pmu_alloc
         && let Some(plan) = crate::pmu_allocator::snapshot()
+        && quota_should_log(&plan)
     {
         crate::diag::tag("配额", &plan.log_text());
     }

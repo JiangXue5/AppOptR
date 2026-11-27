@@ -423,6 +423,9 @@ fn build_policy_sig(
     screen_relax: bool,
     group_own: bool,
     foreground_demote: bool,
+    auto_assign: bool,
+    pmu_observe: bool,
+    pmu_alloc: bool,
     blacklist: &HashSet<String>,
     exempt: &HashSet<String>,
     rt: &RtConfig,
@@ -439,6 +442,11 @@ fn build_policy_sig(
     group_own.hash(&mut h);
     // 降档开关同理：一开就要重算全部已绑线程，不能等规则变化
     foreground_demote.hash(&mut h);
+    // 这三项不影响绑核，但都会改写启动块里那行「策略」。不进指纹的话，
+    // 在 WebUI 里拨一下开关只会看到「规则未变」，等于没给反馈
+    auto_assign.hash(&mut h);
+    pmu_observe.hash(&mut h);
+    pmu_alloc.hash(&mut h);
     // 名单按排序后哈希，与书写顺序无关。新增黑名单要触发 release_unmanaged，
     // 新增豁免要让已迁组的线程退回「只写掩码」，两者都必须整轮重扫
     let mut bl: Vec<&String> = blacklist.iter().collect();
@@ -846,6 +854,111 @@ fn parse_rt_app(arg: &str, default_max: u8) -> Option<(String, AppRt)> {
 /// 日志后面每一句「期望 4-6」都是从这张表推出来的。不打印它，用户拿着
 /// 自己写的配置去核对时只能靠记忆——真机上出现过「我写的是 4-7」与
 /// 「日志说期望 4-6」对不上的争执，实际是规则里另有更窄的一条线程规则
+/// 包级规则多于一条的包名（排序），用于判断「并集提示」要不要重打
+fn multi_pkgs(rules: &[AffinityRule]) -> Vec<String> {
+    use std::collections::BTreeMap;
+    let mut cnt: BTreeMap<&str, usize> = BTreeMap::new();
+    for r in rules.iter().filter(|r| r.thread.is_empty()) {
+        *cnt.entry(r.pkg.as_str()).or_default() += 1;
+    }
+    cnt.into_iter()
+        .filter(|(_, n)| *n > 1)
+        .map(|(k, _)| k.to_string())
+        .collect()
+}
+
+/// 规则落在哪几个核、进哪个组。热重载比较的就是这一串
+fn rule_sig(r: &AffinityRule) -> String {
+    let mut s = r.cpus.to_range_string();
+    if !r.cpuset_dir.is_empty() {
+        s.push_str(&format!(" 组 {}", r.cpuset_dir));
+    }
+    s
+}
+
+/// 新旧两份规则按「包名 + 线程」对齐，给出新增 / 修改 / 删除三类描述。
+///
+/// 同一个 key 可能对应多条规则（包级规则按并集生效），所以值用有序 join
+/// 比较：集合变了就算修改，不区分「换了一条」还是「多了一条」
+fn rule_diff(
+    old: &[AffinityRule],
+    new: &[AffinityRule],
+) -> (Vec<String>, Vec<String>, Vec<String>) {
+    use std::collections::BTreeMap;
+    type Key = (String, String);
+    let index = |rs: &[AffinityRule]| {
+        let mut m: BTreeMap<Key, Vec<String>> = BTreeMap::new();
+        for r in rs {
+            m.entry((r.pkg.clone(), r.thread.clone()))
+                .or_default()
+                .push(rule_sig(r));
+        }
+        m
+    };
+    let before = index(old);
+    let after = index(new);
+    fn label(thread: &str) -> &str {
+        if thread.is_empty() { "all" } else { thread }
+    }
+
+    let mut added: Vec<String> = Vec::new();
+    let mut changed: Vec<String> = Vec::new();
+    let mut removed: Vec<String> = Vec::new();
+    for ((pkg, thread), v) in &after {
+        let name = format!("{pkg} {}", label(thread));
+        match before.get(&(pkg.clone(), thread.clone())) {
+            None => added.push(format!("{name} → {}", v.join(" ＋ "))),
+            Some(o) if o != v => {
+                changed.push(format!("{name}  {} → {}", o.join(" ＋ "), v.join(" ＋ ")))
+            }
+            Some(_) => {}
+        }
+    }
+    for ((pkg, thread), v) in &before {
+        if !after.contains_key(&(pkg.clone(), thread.clone())) {
+            removed.push(format!("{pkg} {}（原 {}）", label(thread), v.join(" ＋ ")));
+        }
+    }
+    (added, changed, removed)
+}
+
+/// 热重载：只打印这一次改动的规则。
+///
+/// 之前每次保存都把「配置」「规则 ×12」「策略」整块重打一遍，真机上一次调
+/// 三个开关就刷出五十多行，用户改的那一行反而要自己去找。这里按「包名 + 线程」
+/// 对齐新旧两份配置，只报新增 / 修改 / 删除；策略行由 `policy_sig` 决定要不要重打
+fn report_reload(config_file: &str, old: &AppConfig, rules: &[AffinityRule], pkgs: usize) {
+    let (added, changed, removed) = rule_diff(&old.rules, rules);
+    let mut head = format!(
+        "{} 已重载 ｜ {} 条规则 ｜ {} 个包",
+        config_file,
+        rules.len(),
+        pkgs
+    );
+    let total = added.len() + changed.len() + removed.len();
+    if total == 0 {
+        head.push_str(" ｜ 规则未变");
+    } else {
+        head.push_str(&format!(
+            " ｜ 新增 {} 修改 {} 删除 {}",
+            added.len(),
+            changed.len(),
+            removed.len()
+        ));
+    }
+    crate::diag::tag("配置", &head);
+
+    const SHOW: usize = 6;
+    for (mark, list) in [("+", &added), ("~", &changed), ("-", &removed)] {
+        for line in list.iter().take(SHOW) {
+            crate::diag::tag("规则", &format!("{mark} {line}"));
+        }
+        if list.len() > SHOW {
+            crate::diag::tag("规则", &format!("{mark} 另有 {} 条", list.len() - SHOW));
+        }
+    }
+}
+
 fn report_rule_list(rules: &[AffinityRule], topo: &CpuTopology) {
     const CAP: usize = 12;
     for r in rules.iter().take(CAP) {
@@ -870,22 +983,30 @@ fn report_rule_list(rules: &[AffinityRule], topo: &CpuTopology) {
             line.push_str(&format!("  {}", kind));
         }
         crate::diag::tag("规则", line.trim_end());
-        // 包名只能由字母、数字、下划线、点组成。含冒号几乎一定是想写
-        // `pkg:thread=cpus`——这种写法会被整串当成包名，规则永远匹配不到进程，
-        // 而且日志里看起来「规则已加载」，不警告就只能靠用户自己发现绑没上
-        if r.thread.is_empty() && r.pkg.contains(':') {
-            crate::diag::tag(
-                "警告",
-                &format!(
-                    "「{}」不是合法包名，线程规则请写成 pkg{{thread}}=cpus；\
-                     按现在这条写，它会被当成一个叫这个名字的包，永远匹配不到任何进程",
-                    r.pkg
-                ),
-            );
-        }
     }
     if rules.len() > CAP {
         crate::diag::tag("规则", &format!("另有 {} 条未列出", rules.len() - CAP));
+    }
+    // 带冒号的是 Android 的子进程名（`com.tencent.mobileqq:MSF`），cmdline 的第一段
+    // 就是它，按进程名能精确命中。以前这里逐条报「不是合法包名」，真机日志里
+    // 一边报警告、一边又按这条规则绑到了 0-3，等于让用户去怀疑一个没发生的问题
+    let mut subs: Vec<&str> = rules
+        .iter()
+        .filter(|r| r.thread.is_empty() && r.pkg.contains(':'))
+        .map(|r| r.pkg.as_str())
+        .collect();
+    subs.sort_unstable();
+    subs.dedup();
+    if !subs.is_empty() {
+        let sample = subs.iter().take(3).copied().collect::<Vec<_>>().join("、");
+        crate::diag::tag(
+            "规则",
+            &format!(
+                "{} 个包名带子进程后缀（{}），只作用于该子进程，不含主进程",
+                subs.len(),
+                sample
+            ),
+        );
     }
 }
 
@@ -949,6 +1070,26 @@ pub fn load_config(
     config_file: &str,
     topo: &CpuTopology,
     last_mtime: &mut i64,
+) -> Option<AppConfig> {
+    load_config_with(config_file, topo, last_mtime, None)
+}
+
+/// 热重载入口。带上一份配置，只为算出「这次到底改了什么」——
+/// 把四十几条规则重打一遍，用户真正想看的「我改的那一行生效了没有」反而被埋掉
+pub fn reload_config(
+    config_file: &str,
+    topo: &CpuTopology,
+    last_mtime: &mut i64,
+    prev: &AppConfig,
+) -> Option<AppConfig> {
+    load_config_with(config_file, topo, last_mtime, Some(prev))
+}
+
+fn load_config_with(
+    config_file: &str,
+    topo: &CpuTopology,
+    last_mtime: &mut i64,
+    prev: Option<&AppConfig>,
 ) -> Option<AppConfig> {
     let metadata = fs::metadata(config_file).ok()?;
     let mtime = metadata
@@ -1226,19 +1367,27 @@ pub fn load_config(
         screen_relax,
         group_own,
         foreground_demote,
+        auto_assign,
+        pmu_observe,
+        pmu_alloc,
         &blacklist,
         &exempt,
         &rt,
     );
 
-    // 同一包多条包级规则按并集生效，顺序无关；只提示不改变语义
+    // 同一包多条包级规则按并集生效，顺序无关；只提示不改变语义。
+    // 热重载时这条结论没变就不再重复——它是配置的性质，不是这次改动
     let mut multi: Vec<&str> = rule_index
         .iter()
         .filter(|(_, v)| v.pkg_rules.len() > 1)
         .map(|(k, _)| k.as_str())
         .collect();
-    if !multi.is_empty() {
-        multi.sort_unstable();
+    multi.sort_unstable();
+    let multi_before: Vec<String> = match prev {
+        Some(p) => multi_pkgs(&p.rules),
+        None => Vec::new(),
+    };
+    if !multi.is_empty() && multi != multi_before {
         let sample = multi.iter().take(3).copied().collect::<Vec<_>>().join(", ");
         crate::diag::tag(
             "警告",
@@ -1260,17 +1409,23 @@ pub fn load_config(
     } else {
         pkg_list.join("、")
     };
-    crate::diag::tag(
-        "配置",
-        &format!(
-            "{} ｜ {} 条规则 ｜ {} 个包：{} ｜ 只处理这些包的线程（cmdline+属主双校验），其余进程不读不写",
-            config_file,
-            num_rules,
-            pkg_list.len(),
-            shown
-        ),
-    );
-    report_rule_list(&rules, topo);
+    match prev {
+        None => {
+            crate::diag::tag(
+                "配置",
+                &format!(
+                    "{} ｜ {} 条规则 ｜ {} 个包：{} ｜ 只处理这些包的线程（cmdline+属主双校验），其余进程不读不写",
+                    config_file,
+                    num_rules,
+                    pkg_list.len(),
+                    shown
+                ),
+            );
+            report_rule_list(&rules, topo);
+        }
+        // 热重载只说「改了什么」：四十几条规则重打一遍，用户改的那一行会被埋掉
+        Some(old) => report_reload(config_file, old, &rules, pkgs.len()),
+    }
     report_offline_rules(&rules, topo);
     if fail_cnt > 0 {
         // 指令写错也走这条路（`@screen=dim` 之类），只说「规则」会让人回头
@@ -1343,60 +1498,64 @@ pub fn load_config(
     } else {
         format!(" ｜ {}", extra.join(" ｜ "))
     };
-    crate::diag::tag(
-        "策略",
-        &format!(
-            "未匹配={} ｜ 系统分组={} ｜ {} ｜ {}{}",
-            if unmatched_all {
-                "all（设为全核）"
-            } else {
-                "keep（保持原样）"
-            },
-            if sysgroup_respect {
-                "respect（后台组不硬抢）"
-            } else {
-                "takeover（拉进 AppOpt 组，费电）"
-            },
-            scope_desc,
-            sched_desc,
-            extra_desc
-        ),
-    );
-    if !rt.is_off() {
+    // 策略没变就不重念一遍：热重载时用户只想知道自己刚改的那一项生效了没有
+    let policy_changed = prev.is_none_or(|p| p.policy_sig != policy_sig);
+    if policy_changed {
         crate::diag::tag(
             "策略",
             &format!(
-                "RT {} ｜ 每应用上限 {} ｜ RR 时间片 {} ms",
-                rt.label(),
-                rt.max_per_app,
-                rt.timeslice_ms
+                "未匹配={} ｜ 系统分组={} ｜ {} ｜ {}{}",
+                if unmatched_all {
+                    "all（设为全核）"
+                } else {
+                    "keep（保持原样）"
+                },
+                if sysgroup_respect {
+                    "respect（后台组不硬抢）"
+                } else {
+                    "takeover（拉进 AppOpt 组，费电）"
+                },
+                scope_desc,
+                sched_desc,
+                extra_desc
             ),
         );
-        // per_app 里配了但没有任何亲和性规则的包不会进入决策路径，提前说明比事后排查省事
-        if rt.scope == RtScope::PerApp {
-            let mut orphan: Vec<&str> = rt
-                .apps
-                .iter()
-                .filter(|(p, a)| a.enabled && !pkgs.contains(*p))
-                .map(|(p, _)| p.as_str())
-                .collect();
-            if !orphan.is_empty() {
-                orphan.sort_unstable();
-                let sample = orphan
+        if !rt.is_off() {
+            crate::diag::tag(
+                "策略",
+                &format!(
+                    "RT {} ｜ 每应用上限 {} ｜ RR 时间片 {} ms",
+                    rt.label(),
+                    rt.max_per_app,
+                    rt.timeslice_ms
+                ),
+            );
+            // per_app 里配了但没有任何亲和性规则的包不会进入决策路径，提前说明比事后排查省事
+            if rt.scope == RtScope::PerApp {
+                let mut orphan: Vec<&str> = rt
+                    .apps
                     .iter()
-                    .take(3)
-                    .copied()
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                crate::diag::tag(
-                    "警告",
-                    &format!(
-                        "{} 个应用配置了 RT 但没有亲和性规则，不会生效：{}{}",
-                        orphan.len(),
-                        sample,
-                        if orphan.len() > 3 { " 等" } else { "" }
-                    ),
-                );
+                    .filter(|(p, a)| a.enabled && !pkgs.contains(*p))
+                    .map(|(p, _)| p.as_str())
+                    .collect();
+                if !orphan.is_empty() {
+                    orphan.sort_unstable();
+                    let sample = orphan
+                        .iter()
+                        .take(3)
+                        .copied()
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    crate::diag::tag(
+                        "警告",
+                        &format!(
+                            "{} 个应用配置了 RT 但没有亲和性规则，不会生效：{}{}",
+                            orphan.len(),
+                            sample,
+                            if orphan.len() > 3 { " 等" } else { "" }
+                        ),
+                    );
+                }
             }
         }
     }
@@ -1531,7 +1690,7 @@ fn config_reload(last_mtime: &mut i64) {
         // 内容确实变了：绕过 mtime 门。两次写入落在同一时间戳精度内时，
         // mtime 会相等，光靠它会把真实修改挡在门外
         *last_mtime = -1;
-        let Some(new_cfg) = load_config(&file, &cfg.topo, last_mtime) else {
+        let Some(new_cfg) = reload_config(&file, &cfg.topo, last_mtime, cfg.as_ref()) else {
             return;
         };
         RELOAD_SIG.store(sig, Ordering::Relaxed);
@@ -1544,7 +1703,7 @@ fn config_reload(last_mtime: &mut i64) {
         return;
     }
     // 读不到内容（正在被写、被删）：按老路走一次，失败就等下一次事件
-    let Some(new_cfg) = load_config(&file, &cfg.topo, last_mtime) else {
+    let Some(new_cfg) = reload_config(&file, &cfg.topo, last_mtime, cfg.as_ref()) else {
         return;
     };
     {
@@ -1818,6 +1977,47 @@ mod tests {
         let topo = topo_of(&[0, 1, 2, 3], &[4, 5], &[6, 7]);
         let mut mtime = -1i64;
         load_config(&path, &topo, &mut mtime).expect("配置应能加载")
+    }
+
+    #[test]
+    fn reload_diff_reports_only_what_changed() {
+        let old = cfg_of("rd_old", "com.a=4-5\ncom.a{RenderThread}=6\ncom.b=0-1\n");
+        let new = cfg_of("rd_new", "com.a=4-5\ncom.a{RenderThread}=6-7\ncom.c=0-1\n");
+        let (added, changed, removed) = rule_diff(&old.rules, &new.rules);
+        assert_eq!(added, vec!["com.c all → 0-1".to_string()]);
+        assert_eq!(changed.len(), 1);
+        assert!(changed[0].contains("com.a RenderThread"), "{changed:?}");
+        assert!(changed[0].contains("6 → 6-7"), "{changed:?}");
+        assert_eq!(removed, vec!["com.b all（原 0-1）".to_string()]);
+        // 没动的规则一条都不该出现
+        assert!(
+            !added
+                .iter()
+                .chain(&changed)
+                .any(|l| l.contains("com.a all"))
+        );
+    }
+
+    #[test]
+    fn reload_diff_is_empty_for_identical_rules() {
+        let a = cfg_of("rd_same1", "com.a=4-5\ncom.a{RenderThread}=6\n");
+        let b = cfg_of("rd_same2", "com.a=4-5\ncom.a{RenderThread}=6\n");
+        let (added, changed, removed) = rule_diff(&a.rules, &b.rules);
+        assert!(added.is_empty() && changed.is_empty() && removed.is_empty());
+    }
+
+    /// 子进程名带冒号（`com.x:sub`）是 Android 的正常写法，cmdline 第一段就是它。
+    /// 以前启动时逐条警告「不是合法包名，永远匹配不到」，真机上却明明绑上了
+    #[test]
+    fn subprocess_package_rules_are_applied() {
+        let cfg = cfg_of("subproc", "com.a:remote=0-1\ncom.a=4-5\n");
+        assert!(cfg.pkgs.contains("com.a:remote"));
+        let r = crate::rule_match::thread_affinity("com.a:remote", "binder:1_1", &cfg)
+            .expect("子进程规则应命中");
+        assert_eq!(r.cpus, set(&[0, 1]));
+        // 主进程不能被子进程规则影响
+        let main = crate::rule_match::thread_affinity("com.a", "binder:1_1", &cfg).unwrap();
+        assert_eq!(main.cpus, set(&[4, 5]));
     }
 
     #[test]

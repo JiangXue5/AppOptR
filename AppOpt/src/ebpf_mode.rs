@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::fs;
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -41,6 +41,10 @@ pub static DROPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// kprobe 改写监听的状态，供 Web 诊断展示：0 未尝试、1 已挂上、2 不可用
 pub static AFFINITY_PROBE: AtomicU8 = AtomicU8::new(0);
+
+/// 上次写进 TARGET_COMM_MAP 的键数。热重载时包名没变也会重写一遍 map，
+/// 但这行「白名单已配置」只在键数真的变了时才有信息量
+static COMM_KEYS_SEEN: AtomicU32 = AtomicU32::new(u32::MAX);
 
 /// 用户态注入内核的 tracepoint 字段偏移，布局需与内核态 TracepointOffsets 一致
 #[repr(C)]
@@ -219,11 +223,13 @@ pub fn comm_map_init(bpf: &mut Ebpf, pkgs: &HashSet<String>, comm_capacity: u32)
         return true;
     }
 
-    crate::diag_say!(
-        "eBPF 白名单已配置，{} 个包名 → {} 个 comm 键（各取包名前 15/末 15 字节，重复的合并）",
-        pkgs.len(),
-        count
-    );
+    if COMM_KEYS_SEEN.swap(count as u32, Ordering::Relaxed) != count as u32 {
+        crate::diag_say!(
+            "eBPF 白名单已配置，{} 个包名 → {} 个 comm 键（各取包名前 15/末 15 字节，重复的合并）",
+            pkgs.len(),
+            count
+        );
+    }
     false
 }
 
