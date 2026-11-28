@@ -75,7 +75,7 @@ impl Owner {
 /// λmod 没被采纳的原因
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Veto {
-    /// 执行闸门未开（验收未过，默认态）
+    /// 该线程所属的包没有开启 λmod（默认态；per_app 下按包逐个判）
     Disabled,
     /// RT 线程：迁走会丢缓存并与渲染抢核
     Rt,
@@ -96,7 +96,7 @@ pub enum Veto {
 impl Veto {
     pub fn label(self) -> &'static str {
         match self {
-            Veto::Disabled => "闸门未开",
+            Veto::Disabled => "本包未开",
             Veto::Rt => "RT 线程",
             Veto::NotMovable => "角色不可迁",
             Veto::NotConverged => "未收敛",
@@ -225,7 +225,7 @@ pub fn arbitrate(ctx: &Context) -> Verdict {
 
 fn lambda_veto(ctx: &Context, h: &Hint) -> Option<Veto> {
     // 顺序有讲究：先判「这条线程本来就不该动」，最后才判闸门。
-    // 反过来的话，默认关闭时所有线程都记成「闸门未开」，真正有信号的
+    // 反过来的话，没开 λmod 的包会把所有线程都记成「本包未开」，真正有信号的
     // 越界/未收敛比例会被这个常数淹没
     if !ctx.movable {
         return Some(Veto::NotMovable);
@@ -353,7 +353,7 @@ pub fn summary() -> String {
     if s.vetoed > 0 {
         let mut parts: Vec<String> = Vec::new();
         for (n, v) in [
-            (s.disabled, "闸门未开"),
+            (s.disabled, "本包未开"),
             (s.not_converged, "未收敛"),
             (s.outside_rule, "越界"),
             (s.not_movable, "角色"),

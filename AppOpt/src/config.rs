@@ -173,6 +173,55 @@ impl Default for RtConfig {
     }
 }
 
+/// λmod 层配额的生效范围。与 RT 同构（off / global / per_app），
+/// 但不需要匹配方式与线程上限——λmod 给的是「整层」，粒度由层定义决定
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum LambdaScope {
+    /// 不采纳：模型照算、面板照显示，绑核仍由规则 / S7 / 降档决定
+    #[default]
+    Off,
+    /// 全部受管应用
+    Global,
+    /// 只对 `@lambda.app` 里列出的包生效
+    PerApp,
+}
+
+impl LambdaScope {
+    pub fn name(self) -> &'static str {
+        match self {
+            LambdaScope::Off => "off",
+            LambdaScope::Global => "global",
+            LambdaScope::PerApp => "per_app",
+        }
+    }
+}
+
+/// λmod 分应用配置。只有「开 / 不开」两态：层与代价由模型自己算，
+/// 用户唯一需要决定的是「这个包允许按建议改绑核吗」
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct LambdaConfig {
+    pub scope: LambdaScope,
+    /// per_app 模式下生效的包
+    pub apps: HashSet<String>,
+}
+
+impl LambdaConfig {
+    /// 这个包的线程是否允许按 λmod 建议改绑核。
+    /// 逐包问而不是查全局布尔：全局开关一开就把所有包一起放开，
+    /// 而用户往往只想让一两个游戏试水
+    pub fn enabled(&self, pkg: &str) -> bool {
+        match self.scope {
+            LambdaScope::Off => false,
+            LambdaScope::Global => true,
+            LambdaScope::PerApp => self.apps.contains(pkg),
+        }
+    }
+
+    pub fn is_off(&self) -> bool {
+        self.scope == LambdaScope::Off
+    }
+}
+
 impl RtConfig {
     pub fn is_off(&self) -> bool {
         self.scope == RtScope::Off
@@ -264,9 +313,9 @@ pub struct AppConfig {
     /// 拿本窗口的采样算重/中/轻与各簇建议承载，**只算不执行**，
     /// 输出只有日志和诊断面板
     pub pmu_alloc: bool,
-    /// λmod 执行闸门：`@lambda=apply` 打开，默认 false（只裁决不采纳）。
+    /// λmod 层配额的生效范围：`@lambda=off|global|per_app`，默认 off。
     /// 方案 16.4 的验收没过之前不开：层配额会改写真实绑核，错了就是掉帧
-    pub lambda_apply: bool,
+    pub lambda: LambdaConfig,
     pub topo: CpuTopology,
 }
 
@@ -370,7 +419,7 @@ impl AppConfig {
             auto_assign: false,
             pmu_observe: false,
             pmu_alloc: true,
-            lambda_apply: false,
+            lambda: LambdaConfig::default(),
             topo: CpuTopology::empty(),
         }
     }
@@ -430,7 +479,7 @@ fn build_policy_sig(
     auto_assign: bool,
     pmu_observe: bool,
     pmu_alloc: bool,
-    lambda_apply: bool,
+    lambda: &LambdaConfig,
     blacklist: &HashSet<String>,
     exempt: &HashSet<String>,
     rt: &RtConfig,
@@ -452,8 +501,13 @@ fn build_policy_sig(
     auto_assign.hash(&mut h);
     pmu_observe.hash(&mut h);
     pmu_alloc.hash(&mut h);
-    // 执行闸门一开就要重算全部已绑线程，不能等规则变化
-    lambda_apply.hash(&mut h);
+    // 生效范围一改就要重算全部已绑线程，不能等规则变化。
+    // apps 是 HashSet，必须先排序再 hash——迭代顺序不稳定，
+    // 直接 hash 会让同一份配置算出不同指纹，每次热载都触发全量重算
+    lambda.scope.name().hash(&mut h);
+    let mut lp: Vec<&String> = lambda.apps.iter().collect();
+    lp.sort();
+    lp.hash(&mut h);
     // 名单按排序后哈希，与书写顺序无关。新增黑名单要触发 release_unmanaged，
     // 新增豁免要让已迁组的线程退回「只写掩码」，两者都必须整轮重扫
     let mut bl: Vec<&String> = blacklist.iter().collect();
@@ -1194,8 +1248,9 @@ fn load_config_with(
     // 配额 shadow 默认开：它只是把已采到的数据算一遍，不发任何写操作。
     // 显式写 @pmu_alloc=off 才关
     let mut pmu_alloc = true;
-    // λmod 执行默认关：裁决照跑、结论不采纳
-    let mut lambda_apply = false;
+    // λmod 生效范围默认 off：模型照算、结论不采纳
+    let mut lambda_scope = LambdaScope::Off;
+    let mut lambda_apps: Vec<String> = Vec::new();
     let mut rt = RtConfig::default();
     // 分应用条目先收集原文，等 @rt.max 解析完再统一构造，避免配置行顺序影响缺省上限
     let mut rt_apps: Vec<String> = Vec::new();
@@ -1243,8 +1298,15 @@ fn load_config_with(
                 ("pmu", "off") => pmu_observe = false,
                 ("pmu_alloc", "shadow" | "on") => pmu_alloc = true,
                 ("pmu_alloc", "off") => pmu_alloc = false,
-                ("lambda", "apply" | "on") => lambda_apply = true,
-                ("lambda", "shadow" | "off") => lambda_apply = false,
+                ("lambda", "apply" | "on" | "global") => lambda_scope = LambdaScope::Global,
+                ("lambda", "shadow" | "off") => lambda_scope = LambdaScope::Off,
+                ("lambda", "per_app" | "per-app" | "perapp") => lambda_scope = LambdaScope::PerApp,
+                // 分应用名单可写多行，累加；`@lambda=per_app` 才真正生效，
+                // 名单先写好再切模式，避免切过去的一瞬间全部包都被放开
+                ("lambda.app", v) if !v.is_empty() => match split_names(v) {
+                    Some(names) => lambda_apps.extend(names),
+                    None => fails.hit(no, line),
+                },
                 // 名单可写多行、逗号或空格分隔；空值不算错误，等价于本行无效
                 ("blacklist", v) | ("exempt", v) if v.is_empty() => {}
                 ("blacklist", v) | ("exempt", v) => match split_names(v) {
@@ -1435,6 +1497,12 @@ fn load_config_with(
     let trunc_keys = build_trunc_keys(&pkgs);
     let rule_index = build_rule_index(&rules);
     let pkg_sig = build_pkg_sig(&rules);
+    // 名单去重后定型：`@lambda.app` 允许多行、允许同一包写两次，
+    // 指纹只认集合，重复项不该改变指纹
+    let lambda = LambdaConfig {
+        scope: lambda_scope,
+        apps: lambda_apps.iter().cloned().collect(),
+    };
     let policy_sig = build_policy_sig(
         unmatched_all,
         sysgroup_respect,
@@ -1445,7 +1513,7 @@ fn load_config_with(
         auto_assign,
         pmu_observe,
         pmu_alloc,
-        lambda_apply,
+        &lambda,
         &blacklist,
         &exempt,
         &rt,
@@ -1583,8 +1651,13 @@ fn load_config_with(
             extra.push("PMU 配额=on".to_string());
         }
     }
-    if lambda_apply {
-        extra.push("λmod 执行=on（层配额参与绑核）".to_string());
+    if !lambda.is_off() {
+        let n = match lambda.scope {
+            LambdaScope::Global => "全部应用".to_string(),
+            LambdaScope::PerApp => format!("按应用 {} 个", lambda.apps.len()),
+            LambdaScope::Off => String::new(),
+        };
+        extra.push(format!("λmod 执行={}（{}）", n, "层配额参与绑核"));
     }
     if !blacklist.is_empty() {
         extra.push(format!("黑名单 {} 个包（完全不管理）", blacklist.len()));
@@ -1681,7 +1754,7 @@ fn load_config_with(
         auto_assign,
         pmu_observe,
         pmu_alloc,
-        lambda_apply,
+        lambda,
         topo: topo.clone(),
     })
 }
@@ -2226,6 +2299,36 @@ mod tests {
             }
             other => panic!("期望名字列表，得到 {:?}", other),
         }
+    }
+
+    /// λmod 的三档范围与分应用名单
+    #[test]
+    fn lambda_scope_parses_and_defaults_off() {
+        // 默认 off：不写任何指令时一个包都不放开
+        let d = cfg_of("l_def", "com.a=0-1\n");
+        assert!(d.lambda.is_off());
+        assert!(!d.lambda.enabled("com.a"));
+
+        // 旧写法兼容：apply / on 等同 global
+        let g = cfg_of("l_apply", "@lambda=apply\ncom.a=0-1\n");
+        assert_eq!(g.lambda.scope, LambdaScope::Global);
+        assert!(g.lambda.enabled("com.a"));
+        assert!(g.lambda.enabled("com.never"));
+        // shadow 等同 off
+        let sh = cfg_of("l_shadow", "@lambda=shadow\ncom.a=0-1\n");
+        assert!(sh.lambda.is_off());
+
+        // per_app：多行名单累加，未列出的包不生效
+        let p = cfg_of(
+            "l_per",
+            "@lambda=per_app\n@lambda.app=com.a,com.b\n@lambda.app=com.c\ncom.a=0-1\n",
+        );
+        assert_eq!(p.lambda.scope, LambdaScope::PerApp);
+        assert!(p.lambda.enabled("com.a"));
+        assert!(p.lambda.enabled("com.c"));
+        assert!(!p.lambda.enabled("com.d"));
+        // 名单里的包即使没有规则也算「启用」：规则后加时不必再勾一次
+        assert!(p.lambda.enabled("com.b"));
     }
 
     #[test]

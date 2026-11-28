@@ -333,8 +333,9 @@ impl ProcCache {
         // λmod 只是候选：裁决层会让位给降档、RT 与已有 S7 落点
         let hint = crate::pmu_lambda::hint(tid);
         // RT 查询要拿账本锁，只在真会采纳 λmod 时才查；默认闸门关闭时零成本
-        let rt =
-            cfg.lambda_apply && cfg.rt_active() && crate::lifecycle::rt_owned_raw(tid).is_some();
+        // 逐包判定：per_app 模式下只有名单里的包才去查 RT 账本
+        let lambda_on = cfg.lambda.enabled(pkg);
+        let rt = lambda_on && cfg.rt_active() && crate::lifecycle::rt_owned_raw(tid).is_some();
         let (target, keep) = plan(&Entry {
             rule: &result.cpus,
             landing: self.landing_of(tid),
@@ -344,7 +345,7 @@ impl ProcCache {
             migrate,
             floor: floor.as_ref(),
             hint,
-            lambda_apply: cfg.lambda_apply,
+            lambda_apply: lambda_on,
             rt,
             movable: crate::roles::role_of(thread_name).movable(),
             cooling_ok: crate::arbiter::cooling_ok(tid, std::time::Instant::now()),
@@ -549,9 +550,8 @@ impl ProcCache {
             // S7 接管过的线程按落点维持，不按规则原值重算：`want` 是规则集，
             // 直接拿它算会把刚迁到 4-7 的线程拉回 0-7，迁移白做
             let hint = crate::pmu_lambda::hint(*tid);
-            let rt = cfg.lambda_apply
-                && cfg.rt_active()
-                && crate::lifecycle::rt_owned_raw(*tid).is_some();
+            let lambda_on = cfg.lambda.enabled(&e.pkg);
+            let rt = lambda_on && cfg.rt_active() && crate::lifecycle::rt_owned_raw(*tid).is_some();
             let (target, keep) = plan(&Entry {
                 rule: &e.want,
                 landing: landings.get(tid).copied(),
@@ -561,7 +561,7 @@ impl ProcCache {
                 migrate,
                 floor: floor.as_ref(),
                 hint,
-                lambda_apply: cfg.lambda_apply,
+                lambda_apply: lambda_on,
                 rt,
                 movable: crate::roles::role_of(&e.comm).movable(),
                 cooling_ok: crate::arbiter::cooling_ok(*tid, std::time::Instant::now()),

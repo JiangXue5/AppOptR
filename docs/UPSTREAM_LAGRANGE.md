@@ -31,7 +31,8 @@
 2. **不执行**。`tier_target` / `pick_tier` 原样保留但 `#[allow(dead_code)]`，
    `policy` / `sched` / `apply_affinity` 不读。执行要等方案 16.4 的验收
    （3 游戏 × 2 拓扑 × 重复测试 × 帧时间 / 1% low / 迁移次数 / 大核驻留 / 功耗）。
-   执行闸门已就位：`@lambda=apply`，默认 `shadow`（裁决照跑、结论不采纳）。
+   执行闸门已就位：`@lambda=off|global|per_app`（默认 `off`，裁决照跑、结论不采纳），
+   `per_app` 下由 `@lambda.app=<包名,...>` 逐包决定，与 RT 的分应用同构。
 3. **`REF_MISS = 0.01`（上游 0.05）**。上游 `c_llc` 是 LLC miss **率**
    （`miss/llc_ref`）；本仓库只有 `PERF_COUNT_HW_CACHE_MISSES / 指令数`，
    典型值低一个数量级。公式一字未改，只换常数——照抄 0.05 会让 `pressure/ref`

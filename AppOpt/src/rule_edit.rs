@@ -680,10 +680,10 @@ impl BehaviorKey {
             (BehaviorKey::Pmu, false) => "off",
             (BehaviorKey::PmuAlloc, true) => "shadow",
             (BehaviorKey::PmuAlloc, false) => "off",
-            // 关不是 `off` 而是 `shadow`：λmod 的求解始终在跑，
-            // 关掉的只是「按它的结论改绑核」这一步
-            (BehaviorKey::Lambda, true) => "apply",
-            (BehaviorKey::Lambda, false) => "shadow",
+            // 布尔开关只覆盖「全部应用 / 关闭」两态；按应用开启要写
+            // `@lambda=per_app` 与 `@lambda.app`，走 lambda_set/lambda_app_set
+            (BehaviorKey::Lambda, true) => "global",
+            (BehaviorKey::Lambda, false) => "off",
         }
     }
 }
@@ -789,6 +789,49 @@ pub fn rt_app_set(path: &str, pkg: &str, spec: &str) -> RuleEdit {
     file_write(path, &lines)
 }
 
+/// 写 `@lambda=off|global|per_app`。λmod 的生效范围
+pub fn lambda_set(path: &str, scope: &str) -> RuleEdit {
+    let _guard = crate::lock_ignore_poison(&WRITE_LOCK);
+    let Ok(mut lines) = read_conf(path) else {
+        return RuleEdit::IoErr;
+    };
+    directive_put(&mut lines, "lambda", Some(scope));
+    file_write(path, &lines)
+}
+
+/// 增删 `@lambda.app` 名单里的一个包。
+///
+/// 两条以上的名单行会在增删后合并成一行：分多行写时，「删掉最后一个包」
+/// 要判断哪一行空、剩下的行要不要并回去，一处算错就会留下只有逗号的空行。
+/// 行内注释一并丢弃——`#` 会被 `split_names` 切成包名，注释文字从此成为
+/// 名单里的两个假包，而这类错误没有任何提示
+pub fn lambda_app_set(path: &str, pkg: &str, on: bool) -> RuleEdit {
+    let _guard = crate::lock_ignore_poison(&WRITE_LOCK);
+    let Ok(mut lines) = read_conf(path) else {
+        return RuleEdit::IoErr;
+    };
+    let mut names: Vec<String> = Vec::new();
+    for l in &lines {
+        if let Some(("lambda.app", v)) = directive_parts(l) {
+            for n in v.split([',', ' ', '\t']) {
+                let n = n.trim();
+                if !n.is_empty() && !n.starts_with('#') && !names.iter().any(|x| x == n) {
+                    names.push(n.to_string());
+                }
+            }
+        }
+    }
+    names.retain(|n| n != pkg);
+    if on {
+        names.push(pkg.to_string());
+    }
+    // 排序：同一份名单每次写出来顺序一致，用户看文件时不会以为被动过
+    names.sort();
+    let spec = (!names.is_empty()).then(|| names.join(","));
+    directive_put(&mut lines, "lambda.app", spec.as_deref());
+    file_write(path, &lines)
+}
+
 /// 是否还存在启用的 `@rt.app=` 条目。省略状态时与解析一致按 on 处理
 fn any_rt_enabled(lines: &[String]) -> bool {
     lines
@@ -875,6 +918,49 @@ mod tests {
     /// 行为开关只改自己那一个键：规则、注释、其它指令都要原样留着。
     /// 另外 `group` 的 on/off 映射到 `own`/`mask` 是反直觉的（on=own），
     /// 写错了会把默认行为翻过去，所以逐个断言
+    /// 名单行合并成一条、删到空时整行消失，并且不动其它指令
+    #[test]
+    fn lambda_apps_merge_and_disappear_when_empty() {
+        let dir = format!("/tmp/appopt_lambda_app_{}", std::process::id());
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let conf = format!("{}/applist.conf", dir);
+        fs::write(
+            &conf,
+            "# 头部注释\n@lambda=per_app\n@lambda.app=com.b\n@lambda.app=com.a\ncom.a=0-3\n",
+        )
+        .unwrap();
+
+        assert!(matches!(lambda_app_set(&conf, "com.c", true), RuleEdit::Ok));
+        let out = fs::read_to_string(&conf).unwrap();
+        // 两行合并成一行，且按名字排序：顺序稳定，文件才不会每次都变
+        assert_eq!(
+            out.matches("@lambda.app=").count(),
+            1,
+            "名单应只剩一行: {out}"
+        );
+        assert!(out.contains("@lambda.app=com.a,com.b,com.c"), "{out}");
+        assert!(out.contains("@lambda=per_app"), "不能动模式行: {out}");
+        assert!(out.contains("com.a=0-3"), "不能动规则: {out}");
+
+        assert!(matches!(
+            lambda_app_set(&conf, "com.a", false),
+            RuleEdit::Ok
+        ));
+        let out = fs::read_to_string(&conf).unwrap();
+        assert!(out.contains("@lambda.app=com.b,com.c"), "{out}");
+
+        // 删到空：整行消失，不留 `@lambda.app=` 这样的空指令
+        for p in ["com.b", "com.c"] {
+            assert!(matches!(lambda_app_set(&conf, p, false), RuleEdit::Ok));
+        }
+        let out = fs::read_to_string(&conf).unwrap();
+        assert!(!out.contains("@lambda.app"), "空名单不应留行: {out}");
+        assert!(out.contains("@lambda=per_app"), "{out}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn behavior_set_touches_only_target_directive() {
         let dir = format!("/tmp/appopt_behavior_{}", std::process::id());
@@ -917,9 +1003,9 @@ mod tests {
         assert_eq!(BehaviorKey::Screen.value(false), "off");
         assert_eq!(BehaviorKey::Group.value(true), "own");
         assert_eq!(BehaviorKey::Group.value(false), "mask");
-        // λmod 关掉是回到 shadow，不是 off：求解一直在跑，关的只是执行
-        assert_eq!(BehaviorKey::Lambda.value(true), "apply");
-        assert_eq!(BehaviorKey::Lambda.value(false), "shadow");
+        // 布尔开关对应「全部应用 / 关闭」；per_app 由 lambda_set 单独写
+        assert_eq!(BehaviorKey::Lambda.value(true), "global");
+        assert_eq!(BehaviorKey::Lambda.value(false), "off");
 
         let _ = fs::remove_dir_all(&dir);
     }

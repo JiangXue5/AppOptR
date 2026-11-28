@@ -296,7 +296,7 @@ pub fn plan(e: &Entry<'_>) -> (Target, Option<CpuSet>) {
             }
             // 回落到规则值时把「为什么没听 λmod」写进 reason：日志里
             // 「规则 0-7」看不出是没建议还是被否决，这句能省一轮排查
-            // 「闸门未开」不是一次裁决结论（默认态），不该覆盖规则原因
+            // 「本包未开」不是一次裁决结论（默认态），不该覆盖规则原因
             if matches!(verdict.veto, Some(v) if v != crate::arbiter::Veto::Disabled) {
                 t.reason = verdict.why;
             }

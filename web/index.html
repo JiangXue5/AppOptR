@@ -1907,6 +1907,23 @@
                   </div>
                 </details>
               </div>
+              <div class="card pad" id="c-lambda">
+                <div class="h2" style="margin-top: 0">λmod 层配额</div>
+                <div class="seg" id="seg-lm">
+                  <button data-lm="off">关闭</button><button data-lm="global">全部应用</button
+                  ><button data-lm="per_app">按应用开启</button>
+                </div>
+                <div class="seg-note" id="lm-state">—</div>
+                <div id="lm-apps"></div>
+                <details class="more">
+                  <summary>ⓘ 说明</summary>
+                  <div class="mb">
+                    按缓存亲和力给每条线程一个建议层：常 miss 大 L2 的线程留在能装下它的层，不常
+                    miss 的让到小核。关闭时模型照算、诊断面板照显示，只是不按建议改绑核。
+                    收敛、越界、角色、RT 与后台降档都会先否决它，实际改绑的线程数写在日志的「λmod 否决」里。
+                  </div>
+                </details>
+              </div>
               <div class="card" id="c-sg">
                 <div class="h2" style="margin: 8px 14px 0">系统分组</div>
                 <div class="gi" style="border-top: none">
@@ -1991,7 +2008,8 @@
                 </div>
                 <div id="l-body"></div>
                 <div class="sub" style="padding: 0 14px 12px">
-                  影子价格 λ 越高，说明该层越挤。分配按线程数占比计，容量是该层核数占比；两者对齐即收敛。只做对照，不改变绑核。
+                  影子价格 λ 越高，说明该层越挤。分配按线程数占比计，容量是该层核数占比；两者对齐即收敛。
+                  是否按它改绑核，由调度页的 λmod 模式决定：按应用开启时，只对勾选的应用生效。
                 </div>
               </div>
               <div class="card">
@@ -2167,22 +2185,6 @@
                         data-on="shadow"
                         aria-checked="false"
                         aria-label="各层负载估算"
-                      ></button
-                    ></span>
-                  </div>
-                </div>
-                <div class="gi">
-                  <div class="lb">
-                    λmod 层配额<small>按缓存亲和力给每条线程一个建议层；开启后才会照建议改绑核</small>
-                  </div>
-                  <div class="rt2">
-                    <span class="sw"
-                      ><button
-                        role="switch"
-                        data-bk="lambda"
-                        data-on="apply"
-                        aria-checked="false"
-                        aria-label="λmod 层配额执行"
                       ></button
                     ></span>
                   </div>
@@ -3490,7 +3492,6 @@
         if (k === "foreground_demote") return !!c.demote;
         if (k === "auto_assign") return !!c.auto_assign;
         if (k === "pmu") return !!c.pmu;
-        if (k === "lambda") return !!c.lambda_apply;
         return !!c.pmu_alloc;
       }
       document.querySelectorAll("[data-bk]").forEach((b) => {
@@ -4107,7 +4108,59 @@
       function renderSched() {
         renderRt();
         renderS7();
+        renderLambdaApps();
         renderSg();
+      }
+
+      /* λmod 与 RT 同构（off / global / per_app），但没有匹配方式与上限：
+         用户只需要决定「这个包允许按建议改绑核吗」。
+         名单在 off 模式下也允许先配好，切到按应用时立即生效 */
+      function renderLambdaApps() {
+        const c = S.cfg;
+        if (!c) return;
+        const L = c.lambda || { mode: "off", apps: [] };
+        document
+          .querySelectorAll("#seg-lm button")
+          .forEach((b) => b.classList.toggle("on", b.dataset.lm === L.mode));
+        const on = (L.apps || []).filter((a) => a.enabled).length;
+        $("lm-state").textContent =
+          {
+            off: "关闭：只计算建议，不改绑核",
+            global: "全部应用：所有受管应用都按建议改绑核",
+            per_app: on ? "按应用开启：" + on + " 个应用生效" : "按应用开启：还没有应用勾选",
+          }[L.mode] || "—";
+        if (L.mode !== "per_app") {
+          mount($("lm-apps"), "", "hidden");
+          return;
+        }
+        const list = L.apps || [];
+        if (!list.length) {
+          mount(
+            $("lm-apps"),
+            '<div class="sub" style="padding:10px 0 4px">还没有受管应用。先在规则页添加应用，再回来勾选。</div>',
+            "0",
+          );
+          return;
+        }
+        const html = list
+          .map(
+            (a) =>
+              '<div class="rtrow" data-lmp="' +
+              esc(a.pkg) +
+              '"><div class="m"><span class="pk mono">' +
+              esc(a.pkg) +
+              '</span><span class="sw"><button role="switch" aria-checked="' +
+              (a.enabled ? "true" : "false") +
+              '" aria-label="' +
+              esc(a.pkg) +
+              ' λmod" data-lmon="' +
+              esc(a.pkg) +
+              '" class="' +
+              (a.enabled ? "on" : "") +
+              '"></button></span></div></div>',
+          )
+          .join("");
+        mount($("lm-apps"), html, html);
       }
       function renderRt() {
         const d = S.rt,
@@ -4347,6 +4400,39 @@
           const a = ((S.rt && S.rt.apps) || []).find((x) => x.pkg === mv.dataset.rtmv);
           if (a && v !== num(a.max)) putRt(a.pkg, { max: v });
           else mv.value = num(a && a.max);
+        }
+      });
+      $("seg-lm").addEventListener("click", async (e) => {
+        const b = e.target.closest("[data-lm]");
+        if (!b) return;
+        try {
+          await api("/api/lambda", { mode: b.dataset.lm });
+          toast("已切换");
+          await loadCfg(true);
+          renderLambdaApps();
+        } catch (err) {
+          toast(err.message, { type: "err" });
+          /* 失败要拉回服务端现状，别让分段停在没写进配置的那一档 */
+          await loadCfg(true).catch(() => {});
+          renderLambdaApps();
+        }
+      });
+      $("lm-apps").addEventListener("click", async (e) => {
+        const b = e.target.closest("[data-lmon]");
+        if (!b) return;
+        const pkg = b.dataset.lmon;
+        // 先算意图再改 class：setSw 会把 on 翻过去，之后读 class 得到的
+        // 恰好是相反值，两个包连着点时就会一个开一个关
+        const want = !b.classList.contains("on");
+        setSw(b, want);
+        try {
+          await api("/api/lambda/app", { pkg: pkg, enabled: want });
+          await loadCfg(true);
+          renderLambdaApps();
+        } catch (err) {
+          toast(err.message, { type: "err" });
+          await loadCfg(true).catch(() => {});
+          renderLambdaApps();
         }
       });
       $("seg-rt").addEventListener("click", async (e) => {
@@ -4653,7 +4739,7 @@
         if (box.textContent !== evTxt) box.textContent = evTxt;
         if ($("d-autosc").checked) box.scrollTop = box.scrollHeight;
       }
-      /* λmod 面板：只在 PMU 与 Shadow 配额都开着时才有内容 */
+      /* λmod 面板：模型有输出（至少两层、有活跃线程）时才显示 */
       function renderLambda(l) {
         const card = $("card-lambda");
         if (!card) return;

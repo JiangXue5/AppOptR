@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 
 use crate::apply_affinity::{read_cmdline, reset_cpuset_dir_cache, task_tids};
 use crate::cache::ProcCache;
+use crate::config::LambdaScope;
 use crate::config::{
     CHECK_INTERVAL, CONFIG_FILE, CURRENT_CONFIG, FORCE_RELOAD, PARSE_FAILS, RT_MAX_LIMIT,
     RT_TIMESLICE_LIMIT, config_reload_now, parse_fail_lines, spec_like,
@@ -24,8 +25,8 @@ use crate::diag;
 use crate::ebpf_mode::ebpf_probe;
 use crate::rt;
 use crate::rule_edit::{
-    BehaviorKey, RuleEdit, adv_configure, behavior_set, rt_app_set, rt_configure, rt_toggle,
-    rule_delete, rule_delete_pkg, rule_rename, rule_upsert, sched_set,
+    BehaviorKey, RuleEdit, adv_configure, behavior_set, lambda_app_set, lambda_set, rt_app_set,
+    rt_configure, rt_toggle, rule_delete, rule_delete_pkg, rule_rename, rule_upsert, sched_set,
 };
 use crate::sched::SCHED_SNAPSHOT;
 use crate::{EBPF_GAVE_UP, MAX_PKG_LEN, MAX_THREAD_LEN, lock_ignore_poison};
@@ -571,6 +572,8 @@ fn dispatch(out: &mut TcpStream, req: &Request) {
         ("POST", "/api/rt") => rt_api(req),
         ("POST", "/api/rt/app") => rt_app_api(req),
         ("POST", "/api/rt/toggle") => rt_toggle_api(req),
+        ("POST", "/api/lambda") => lambda_api(req),
+        ("POST", "/api/lambda/app") => lambda_app_api(req),
         ("POST", "/api/sched") => sched_api(req),
         ("POST", "/api/behavior") => behavior_api(req),
         ("POST", "/api/adv") => adv_api(req),
@@ -1096,9 +1099,22 @@ fn config_json() -> String {
     let auto_assign = cfg.as_ref().is_some_and(|c| c.auto_assign);
     let pmu = cfg.as_ref().is_some_and(|c| c.pmu_observe);
     let pmu_alloc = cfg.as_ref().is_some_and(|c| c.pmu_alloc && c.pmu_observe);
-    // 执行闸门取配置真值。不跟着 pmu_alloc 联动：用户关掉估算后开关自己
-    // 跳回去，会让人以为没保存上；真正会不会迁移写在日志的「λmod 否决」里
-    let lambda_apply = cfg.as_ref().is_some_and(|c| c.lambda_apply);
+    // λmod 的生效范围与分应用名单。名单以「所有受管包」为底而不是只列
+    // `@lambda.app` 里已有的：用户要在面板上直接勾选，不该先去配置文件
+    // 抄一遍包名；per_app 之外的模式下 enabled 算出来是恒真/恒假，
+    // 前端据此决定是显示名单还是显示一句话
+    let (lambda_mode, lambda_apps) = match cfg.as_ref() {
+        Some(c) => {
+            let mut v: Vec<serde_json::Value> = c
+                .pkgs
+                .iter()
+                .map(|p| json!({ "pkg": p, "enabled": c.lambda.enabled(p) }))
+                .collect();
+            v.sort_by(|a, b| a["pkg"].as_str().cmp(&b["pkg"].as_str()));
+            (c.lambda.scope.name(), v)
+        }
+        None => ("off", Vec::new()),
+    };
     let snap = lock_ignore_poison(&SCHED_SNAPSHOT)
         .clone()
         .unwrap_or_default();
@@ -1133,7 +1149,7 @@ fn config_json() -> String {
         "auto_assign": auto_assign,
         "pmu": pmu,
         "pmu_alloc": pmu_alloc,
-        "lambda_apply": lambda_apply,
+        "lambda": { "mode": lambda_mode, "apps": lambda_apps },
         "sched_mode": sched_mode,
         "sched_state": s_state,
         "sched_ticks": s_ticks,
@@ -1500,6 +1516,61 @@ fn rt_app_api(req: &Request) -> (u16, String) {
 
     let file = lock_ignore_poison(&CONFIG_FILE).clone();
     match rt_app_set(&file, pkg, &spec) {
+        RuleEdit::Ok => {
+            config_reload_now();
+            (200, json!({ "ok": true }).to_string())
+        }
+        RuleEdit::Malformed => err_json(409, "配置文件存在未闭合块，请修复后重试"),
+        _ => err_json(500, "配置文件写入失败"),
+    }
+}
+
+/// 切换 λmod 的生效范围：off / global / per_app。
+///
+/// 切到 per_app 但名单为空时不报错：允许「先切模式、再逐个勾选」的顺序，
+/// 面板会写明「还没有应用启用」。反过来先勾选也允许——名单在 off 模式下
+/// 就已经写进配置，切过去立即生效，不用二次等待
+fn lambda_api(req: &Request) -> (u16, String) {
+    let Ok(v) = serde_json::from_slice::<Value>(&req.body) else {
+        return err_json(400, "请求体不是合法 JSON");
+    };
+    let Some(mode) = v["mode"].as_str() else {
+        return err_json(400, "缺少 mode 字段");
+    };
+    if !matches!(mode, "off" | "global" | "per_app") {
+        return err_json(400, "无效的模式");
+    }
+    let file = lock_ignore_poison(&CONFIG_FILE).clone();
+    match lambda_set(&file, mode) {
+        RuleEdit::Ok => {
+            config_reload_now();
+            (200, json!({ "ok": true }).to_string())
+        }
+        RuleEdit::Malformed => err_json(409, "配置文件存在未闭合块，请修复后重试"),
+        _ => err_json(500, "配置文件写入失败"),
+    }
+}
+
+/// 单个应用的 λmod 开关。
+///
+/// global 模式下拒绝：名单仍会被写进配置，但 `enabled()` 恒真，界面会显示
+/// 「这个包没开」而实际所有包都在跑——宁可让用户先切模式
+fn lambda_app_api(req: &Request) -> (u16, String) {
+    let Ok(v) = serde_json::from_slice::<Value>(&req.body) else {
+        return err_json(400, "请求体不是合法 JSON");
+    };
+    let Some(pkg) = v["pkg"].as_str().map(str::trim) else {
+        return err_json(400, "缺少 pkg 字段");
+    };
+    if !token_ok(pkg, MAX_PKG_LEN) || pkg.chars().any(char::is_whitespace) {
+        return err_json(400, "包名含有非法字符");
+    }
+    if current_cfg().is_some_and(|c| c.lambda.scope == LambdaScope::Global) {
+        return err_json(409, "当前为「全部应用」模式，请先切到「按应用开启」");
+    }
+    let enabled = v["enabled"].as_bool().unwrap_or(true);
+    let file = lock_ignore_poison(&CONFIG_FILE).clone();
+    match lambda_app_set(&file, pkg, enabled) {
         RuleEdit::Ok => {
             config_reload_now();
             (200, json!({ "ok": true }).to_string())
