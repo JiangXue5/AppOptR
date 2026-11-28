@@ -10,11 +10,14 @@
       /* tokens */
       :root {
         --accent: #0a9d98;
+        --accent-fill: #067a76;
         --accent-ink: #07807c;
         --accent-fg: #fff;
         --rt: #ff9500;
         --ok: #34c759;
         --warn: #ff9f0a;
+        --ok-t: #1d7a37;
+        --warn-t: #a35a00;
         --err: #ff453a;
         --e: #34c759;
         --p: #0a84ff;
@@ -35,8 +38,11 @@
       }
       :root[data-theme="dark"] {
         --accent: #3dd6cf;
+        --accent-fill: #3dd6cf;
         --accent-ink: #4fe0d8;
         --accent-fg: #03201f;
+        --ok-t: #34c759;
+        --warn-t: #ff9f0a;
         --bg: #0e1013;
         --card: #181b20;
         --line: rgba(255, 255, 255, 0.09);
@@ -95,6 +101,8 @@
       .app {
         display: flex;
         flex-direction: column;
+        height: 100%;
+        height: 100vh;
         height: 100dvh;
         overflow: hidden;
       }
@@ -109,8 +117,9 @@
         display: flex;
         align-items: center;
         gap: 8px;
-        height: 48px;
-        padding: 0 16px;
+        height: calc(48px + env(safe-area-inset-top));
+        padding: env(safe-area-inset-top) calc(14px + env(safe-area-inset-right)) 0
+          calc(14px + env(safe-area-inset-left));
         flex-shrink: 0;
         background: var(--card);
         border-bottom: 1px solid var(--line);
@@ -159,10 +168,14 @@
         height: 100%;
         overflow: auto;
         -webkit-overflow-scrolling: touch;
-        padding: 12px 14px calc(24px + env(safe-area-inset-bottom));
+        padding: 12px calc(14px + env(safe-area-inset-right)) calc(24px + env(safe-area-inset-bottom))
+          calc(14px + env(safe-area-inset-left));
       }
       .page.on {
         display: block;
+      }
+      #pg-rules {
+        padding-bottom: calc(96px + env(safe-area-inset-bottom));
       }
 
       /* components */
@@ -323,7 +336,7 @@
         opacity: 0.45;
       }
       .btn {
-        background: var(--accent);
+        background: var(--accent-fill);
         color: var(--accent-fg);
         padding: 11px 16px;
         border-radius: 10px;
@@ -516,7 +529,7 @@
         align-items: center;
       }
       .pk-chip.on {
-        background: var(--accent);
+        background: var(--accent-fill);
         color: var(--accent-fg);
         font-weight: 600;
       }
@@ -600,6 +613,7 @@
       .sheet {
         background: var(--card);
         width: 100%;
+        max-height: 92vh;
         max-height: 92dvh;
         border-radius: 16px 16px 0 0;
         display: flex;
@@ -669,6 +683,7 @@
         .sheet {
           max-width: 480px;
           border-radius: 16px;
+          max-height: 82vh;
           max-height: 82dvh;
         }
         .sf {
@@ -764,6 +779,7 @@
           order: -1;
           flex-direction: column;
           width: 72px;
+          height: 100vh;
           height: 100dvh;
           border-top: 0;
           border-right: 1px solid var(--line);
@@ -855,7 +871,7 @@
         flex-shrink: 0;
       }
       :root[data-theme="dark"] .att .n {
-        color: var(--warn);
+        color: var(--warn-t);
       }
       .att .a {
         margin-left: auto;
@@ -968,7 +984,7 @@
         align-items: center;
       }
       .fchip.on {
-        background: var(--accent);
+        background: var(--accent-fill);
         border-color: transparent;
         color: var(--accent-fg);
         font-weight: 600;
@@ -1031,7 +1047,7 @@
         width: 56px;
         height: 56px;
         border-radius: 50%;
-        background: var(--accent);
+        background: var(--accent-fill);
         color: var(--accent-fg);
         z-index: 7;
         display: flex;
@@ -1049,7 +1065,7 @@
       }
       @media (min-width: 900px) {
         .fab {
-          right: calc(50% - 400px);
+          right: 24px;
           bottom: 28px;
         }
       }
@@ -1641,6 +1657,15 @@
       .gate input:focus {
         border-color: var(--accent);
       }
+      .gate input.bad {
+        border-color: var(--err);
+      }
+      .tok-err {
+        color: var(--err);
+        font-size: 12.5px;
+        line-height: 1.5;
+        margin-top: 8px;
+      }
       @media (prefers-reduced-motion: reduce) {
         * {
           animation: none !important;
@@ -1765,7 +1790,7 @@
                   <button data-s7="off">关闭</button><button data-s7="shadow">观察</button
                   ><button data-s7="on">开启</button>
                 </div>
-                <div class="seg-note" id="s7-tip" hidden style="color: var(--warn)">
+                <div class="seg-note" id="s7-tip" hidden style="color: var(--warn-t)">
                   该机型核心层不足，不会生效
                 </div>
                 <div class="kv" id="s7-kv"></div>
@@ -1866,8 +1891,9 @@
                 <div class="h2" style="margin: 0; padding: 12px 14px 0">线程绑定状态</div>
                 <div style="display: flex; gap: 6px; align-items: center; padding: 10px 12px">
                   <div class="fchips" id="d-tf" style="padding: 0; flex: 1">
-                    <button class="fchip on" data-tf="bad">仅异常</button
-                    ><button class="fchip" data-tf="all">全部</button>
+                    <button class="fchip on" data-tf="bad">仅异常<span id="d-badn"></span></button
+                    ><button class="fchip" data-tf="all">全部</button
+                    ><span class="sub" id="d-bgn" hidden></span>
                   </div>
                   <input
                     id="d-q"
@@ -2200,6 +2226,7 @@
           autocapitalize="off"
         />
         <div style="display: flex; gap: 8px"><button class="btn wide" id="tok-ok">确定</button></div>
+        <div class="tok-err" id="tok-err" role="alert" hidden></div>
       </div>
     </div>
     <div class="toast" id="toast"><span class="msg"></span></div>
@@ -2265,8 +2292,10 @@
       function setToken(t) {
         TOKEN = (t || "").trim().toLowerCase();
         try {
-          if (TOK_RE.test(TOKEN)) localStorage.setItem(TOK_KEY, TOKEN);
-          else {
+          if (TOK_RE.test(TOKEN)) {
+            localStorage.setItem(TOK_KEY, TOKEN);
+            hideGate();
+          } else {
             localStorage.removeItem(TOK_KEY);
             TOKEN = "";
           }
@@ -2348,8 +2377,14 @@
         if (TOKEN) return;
         showGate();
       }
-      let authRetried = false;
+      /* 令牌就绪闸门：boot 时赋值为 initToken()，所有 api 调用先等它。
+         initToken / autoToken 内部只用 fetch，绝不走 api，避免自锁。 */
+      let tokenReady = null;
+      let booted = false;
+      let authTried = false;
+      let authWait = null;
       async function api(path, body, opt) {
+        if (tokenReady && !booted) await tokenReady.catch(() => {});
         const ctl = new AbortController();
         const tm = setTimeout(() => ctl.abort(), (opt && opt.timeout) || 8e3);
         const send = () => {
@@ -2377,15 +2412,20 @@
           );
         }
         if (r.status === 401) {
-          if (!authRetried) {
-            authRetried = true;
-            const t = await autoToken();
-            if (t && t !== TOKEN) {
+          if (!authTried) {
+            authTried = true;
+            authWait = (async () => {
+              const t = await autoToken();
+              if (!t || t === TOKEN) return false;
               setToken(t);
-              try {
-                r = await send();
-              } catch (e) {}
-            }
+              return true;
+            })().catch(() => false);
+          }
+          const fresh = authWait ? await authWait : false;
+          if (fresh) {
+            try {
+              r = await send();
+            } catch (e) {}
           }
           if (r.status === 401) {
             clearTimeout(tm);
@@ -2492,7 +2532,7 @@
         }
       }
       setInterval(() => {
-        if (document.hidden) return;
+        if (document.hidden || !booted) return;
         const now = Date.now();
         for (const j of JOBS) {
           if (j.pg !== "*" && j.pg !== S.tab) continue;
@@ -2587,6 +2627,8 @@
           (o.allowEmpty ? "留空=无规则，或输入 0-3,6" : "CPU 范围，如 0-3,6") +
           '">' +
           '<div class="pk-hint"></div>';
+        let onChg = o.onChange || null,
+          ready = false;
         const chips = el.querySelector(".pk-chips"),
           grid = el.querySelector(".pk-grid"),
           inp = el.querySelector(".pk-in"),
@@ -2613,16 +2655,21 @@
           }
           mount(grid, gs, gs);
           if (inp.value !== spec && document.activeElement !== inp) inp.value = spec;
-          const bad = !!spec && specSet(spec).size === 0 && !/^(all|e|p|hp)-core$/.test(spec);
+          const maxCore = CORE.all.size ? Math.max(...CORE.all) : -1;
+          const over = maxCore >= 0 && [...set].some((i) => i > maxCore);
+          const bad = (!!spec && set.size === 0 && !/^(all|e|p|hp)-core$/.test(spec)) || over;
           inp.classList.toggle("bad", bad);
           hint.classList.toggle("bad", bad);
-          hint.textContent = bad
-            ? "无法解析的 CPU 范围"
-            : spec
-              ? CORE.all.size && specSet(spec).size === CORE.all.size
-                ? "全部核心"
-                : fmtRanges(specSet(spec))
-              : "";
+          hint.textContent = over
+            ? "超出本机核心数（0-" + maxCore + "）"
+            : bad
+              ? "无法解析的 CPU 范围"
+              : spec
+                ? CORE.all.size && set.size === CORE.all.size
+                  ? "全部核心"
+                  : fmtRanges(set)
+                : "";
+          if (ready && onChg) onChg(spec);
         }
         chips.addEventListener("click", (e) => {
           const b = e.target.closest("[data-c]");
@@ -2673,6 +2720,7 @@
           paint();
         });
         paint();
+        ready = true;
         return {
           el: el,
           get: () => {
@@ -2682,6 +2730,9 @@
           set(v) {
             spec = String(v || "");
             paint();
+          },
+          setOnChange(fn) {
+            onChg = fn;
           },
           focus() {
             inp.focus();
@@ -2949,7 +3000,8 @@
         const st = await api("/api/status");
         S.status = st;
         setTopo(st);
-        jStatus.ms = Math.max(2e3, num(st.interval) * 1e3 || 2e3);
+        /* 界面刷新节奏与扫描间隔脱钩：扫描间隔可到 600s，状态点不能 10 分钟才更新 */
+        jStatus.ms = Math.min(5, Math.max(2, num(st.interval) || 2)) * 1e3;
         setDot(true);
         $("top-sub").textContent = modeShort(st.mode) + " · v" + (st.version || "?");
         if (S.tab === "over") renderOver();
@@ -2990,7 +3042,7 @@
         const iss = issues();
         const hl = $("o-health");
         hl.textContent = iss.length ? iss.length + " 项需注意" : "正常";
-        hl.style.color = iss.length ? "var(--warn)" : "var(--ok)";
+        hl.style.color = iss.length ? "var(--warn-t)" : "var(--ok-t)";
         $("o-att-card").hidden = !iss.length;
         mount(
           $("o-att"),
@@ -3051,6 +3103,10 @@
         S.theme = b.dataset.th;
         ls.set("appopt_theme", S.theme);
         applyTheme();
+      });
+      job("cfgset", "set", 1e4, async () => {
+        await loadCfg(true);
+        renderCfg();
       });
       async function loadCfg(quiet) {
         try {
@@ -3323,6 +3379,7 @@
             thread: it.thread,
             spec: it.spec,
             picker: null,
+            open: false,
           })),
           pkgSpec: pkgIt ? pkgIt.spec : "",
           pkgPicker: null,
@@ -3368,7 +3425,7 @@
             $("e-pkgpick").appendChild(edit.pkgPicker.el);
             renderEditRows();
             $("e-add").onclick = () => {
-              edit.rows.push({ thread: "", spec: "", picker: null });
+              edit.rows.push({ thread: "", spec: "", picker: null, open: true });
               renderEditRows();
               sheetDirty = true;
               const box = $("e-rows");
@@ -3391,15 +3448,31 @@
             '"><button class="icon danger" aria-label="删除">' +
             ICO_DEL +
             "</button></div>" +
-            '<div class="sum"><span class="strip">' +
+            '<div class="sum" role="button" tabindex="0"><span class="strip">' +
             stripHTML(r.spec || "") +
             "</span>" +
             '<span class="sub mono">' +
             (r.spec ? esc(r.spec) : "未设置") +
             '</span><span class="sub">⌄</span></div>' +
-            '<div class="pkbox" hidden></div>';
+            '<div class="pkbox"></div>';
           const inp = el.querySelector("input");
           const boxEl = el.querySelector(".pkbox");
+          const syncSum = () => {
+            el.querySelector(".strip").innerHTML = stripHTML(r.spec || "");
+            el.querySelector(".sub.mono").textContent = r.spec || "未设置";
+          };
+          const onChange = (v) => {
+            r.spec = v ?? r.spec;
+            syncSum();
+            sheetDirty = true;
+          };
+          /* 重建 DOM 后 picker.el 是既有节点，必须重新挂回本行的 pkbox，
+             否则该行的选择器再也打不开；展开状态也按 r.open 还原。 */
+          if (r.picker) {
+            r.picker.setOnChange(onChange);
+            boxEl.appendChild(r.picker.el);
+          }
+          boxEl.hidden = !r.open;
           inp.addEventListener("input", () => {
             r.thread = inp.value;
             inp.classList.remove("bad");
@@ -3413,17 +3486,15 @@
               inp.value = v;
             },
           });
-          el.querySelector(".sum").onclick = () => {
+          const toggle = () => {
             if (!r.picker) {
-              r.picker = picker(r.spec, {});
-              r.picker.el.addEventListener("click", () => {
-                sheetDirty = true;
-                refreshSum(el, r);
-              });
+              r.picker = picker(r.spec, { onChange: onChange });
               boxEl.appendChild(r.picker.el);
             }
-            boxEl.hidden = !boxEl.hidden;
+            r.open = boxEl.hidden;
+            boxEl.hidden = !r.open;
           };
+          el.querySelector(".sum").onclick = toggle;
           el.querySelector(".icon").onclick = () => {
             edit.rows.splice(i, 1);
             renderEditRows();
@@ -3431,10 +3502,6 @@
           };
           box.appendChild(el);
         });
-      }
-      function refreshSum(el, r) {
-        el.querySelector(".strip").innerHTML = stripHTML(r.spec || "");
-        el.querySelector(".sub.mono").textContent = r.spec || "未设置";
       }
       function collectEdit() {
         const jobs = [];
@@ -3475,23 +3542,27 @@
         }
         if (!c.jobs.length) return toast("请至少配置一条规则", { type: "err" });
         busy(btn, true, "保存中…");
+        let failAt = -1,
+          failName = "";
         try {
-          if (edit.oldPkg && pkg !== edit.oldPkg) await api("/api/rule/rename", { old: edit.oldPkg, new: pkg });
-          const cur = new Set(c.jobs.map((j) => j.thread));
-          if (edit.oldPkg) {
-            for (const th of edit.oldThreads)
-              if (!cur.has(th)) await api("/api/rule/del", { pkg: pkg, thread: th });
-            if (edit.hadPkg && !cur.has("")) await api("/api/rule/del", { pkg: pkg, thread: "" });
+          if (edit.oldPkg && pkg !== edit.oldPkg) {
+            await api("/api/rule/rename", { old: edit.oldPkg, new: pkg });
+            edit.oldPkg = pkg; // 改名已生效，重试时不再对旧名 rename
           }
+          /* 先全部写、后删除：中途失败不会出现「删完旧规则、新规则没写进去」的空窗 */
           for (let i = 0; i < c.jobs.length; i++) {
             const j = c.jobs[i];
-            try {
-              await api("/api/rule", { pkg: pkg, thread: j.thread, cpus: j.cpus });
-            } catch (e) {
-              return toast("第 " + (i + 1) + " 条（" + (j.thread || "包级") + "）失败：" + e.message, {
-                type: "err",
-              });
+            failAt = i;
+            failName = j.thread || "包级";
+            await api("/api/rule", { pkg: pkg, thread: j.thread, cpus: j.cpus });
+          }
+          failAt = -1;
+          const cur = new Set(c.jobs.map((j) => j.thread));
+          if (edit.oldPkg) {
+            for (const th of [...edit.oldThreads]) {
+              if (!cur.has(th)) await api("/api/rule/del", { pkg: pkg, thread: th });
             }
+            if (edit.hadPkg && !cur.has("")) await api("/api/rule/del", { pkg: pkg, thread: "" });
           }
           sheetDirty = false;
           closeSheet(true);
@@ -3499,7 +3570,20 @@
           await loadRules();
           kick("sched");
         } catch (e) {
-          toast(e.message, { type: "err" });
+          /* 半成功：按服务端现状重建基线，重试时只会补写缺的那几条 */
+          await loadRules().catch(() => {});
+          if (edit) {
+            const g = ((S.rules && S.rules.rules) || []).find((x) => x.pkg === pkg);
+            edit.oldPkg = g ? g.pkg : "";
+            edit.oldThreads = new Set(g ? g.items.filter((it) => it.thread).map((it) => it.thread) : []);
+            edit.hadPkg = !!(g && g.items.some((it) => !it.thread));
+          }
+          toast(
+            failAt >= 0
+              ? "第 " + (failAt + 1) + " 条（" + failName + "）失败：" + e.message
+              : "保存未完成：" + e.message,
+            { type: "err" },
+          );
         } finally {
           busy(btn, false);
         }
@@ -3663,7 +3747,7 @@
             (d.timeslice_current != null &&
               d.timeslice_applied != null &&
               d.timeslice_current !== d.timeslice_applied)
-              ? "var(--warn)"
+              ? "var(--warn-t)"
               : "";
           renderRtApps(d);
           $("rt-th-n").textContent = th;
@@ -4129,12 +4213,18 @@
         const all = (S.diag && S.diag.threads) || [];
         const q = DF.q.trim().toLowerCase();
         return all.filter((t) => {
-          if (DF.f === "bad" && t.ok) return false;
+          if (DF.f === "bad" && (t.ok || t.bg)) return false;
           if (q && !((t.comm || "") + " " + (t.pkg || "") + " " + t.tid).toLowerCase().includes(q)) return false;
           return true;
         });
       }
       function renderThreads() {
+        const all = (S.diag && S.diag.threads) || [];
+        const badN = all.filter((t) => !t.ok && !t.bg).length;
+        const bgN = all.filter((t) => t.bg && !t.ok).length;
+        $("d-badn").textContent = badN ? " " + badN : "";
+        $("d-bgn").hidden = !bgN;
+        $("d-bgn").textContent = "后台受限 " + bgN + " 条（正常）";
         const rows = threadRows();
         const show = rows.slice(0, DF.page * 50);
         mount(
@@ -4162,10 +4252,10 @@
                     "</span>" +
                     (t.bg ? '<span class="chip">后台</span>' : "") +
                     (!t.ok
-                      ? '<span class="chip" style="color:var(--warn)">未落位</span>'
-                      : t.bg
-                        ? '<span class="chip">被限制</span>'
-                        : "") +
+                      ? t.bg
+                        ? '<span class="chip" style="color:var(--warn-t)">受限</span>'
+                        : '<span class="chip" style="color:var(--warn-t)">未落位</span>'
+                      : "") +
                     "</div></div>"
                   );
                 })
@@ -4306,24 +4396,9 @@
         document.querySelectorAll(".page").forEach((p) => p.classList.toggle("on", p.dataset.pg === t));
         $("r-add").hidden = t !== "rules";
         if (t === "over") renderOver();
-        if (t === "rules") {
-          loadRules();
-          loadCand();
-        }
-        if (t === "sched") {
-          renderSched();
-          loadRt(true).catch(() => {});
-          loadCfg(true).catch(() => {});
-        }
-        if (t === "diag") {
-          renderDiag();
-          getDiag(true)
-            .then(renderDiag)
-            .catch(() => {});
-        }
-        if (t === "set") {
-          loadCfg(true).catch(() => {});
-        }
+        if (t === "rules") loadCand();
+        if (t === "sched") renderSched();
+        if (t === "diag") renderDiag();
         kick(t);
       }
       $("tabbar").addEventListener("click", (e) => {
@@ -4331,19 +4406,51 @@
         if (b) switchTab(b.dataset.tab);
       });
       $("tok-ok").onclick = async () => {
-        const v = $("tok").value.trim();
-        if (!/^[0-9a-fA-F]{32}$/.test(v)) return toast("令牌应为 32 位十六进制", { type: "err" });
+        const el = $("tok");
+        const err = $("tok-err");
+        const btn = $("tok-ok");
+        const v = el.value.trim().toLowerCase();
+        const bad = (m) => {
+          err.textContent = m;
+          err.hidden = false;
+          el.classList.add("bad");
+          el.focus();
+        };
+        err.hidden = true;
+        el.classList.remove("bad");
+        if (!TOK_RE.test(v)) return bad("应为 32 位十六进制字符");
+        busy(btn, true, "验证中…");
+        let ok = false,
+          netErr = "";
+        const ctl = new AbortController();
+        const tm = setTimeout(() => ctl.abort(), 6e3);
+        try {
+          const r = await fetch(API_BASE + "/api/status", {
+            headers: { "X-AppOpt-Token": v },
+            signal: ctl.signal,
+          });
+          ok = r.ok;
+        } catch (e) {
+          netErr = e && e.name === "AbortError" ? "验证超时，请重试" : "无法连接本机服务";
+        }
+        clearTimeout(tm);
+        busy(btn, false);
+        if (!ok) return bad(netErr || "令牌无效，请核对后重试");
         setToken(v);
-        hideGate();
-        authRetried = false;
+        authTried = false;
+        authWait = null;
         for (const j of JOBS) j.due = 0;
-        kick(S.tab);
         toast("已保存令牌");
+        kick(S.tab);
         try {
           await refreshStatus();
         } catch (e) {}
         if (S.tab !== "over") switchTab(S.tab);
       };
+      $("tok").addEventListener("input", () => {
+        $("tok").classList.remove("bad");
+        $("tok-err").hidden = true;
+      });
       $("tok").addEventListener("keydown", (e) => {
         if (e.key === "Enter") $("tok-ok").click();
       });
@@ -4354,9 +4461,13 @@
       if (!["auto", "light", "dark"].includes(S.theme)) S.theme = "auto";
       applyTheme();
       const qtab = new URLSearchParams(location.search).get("tab");
-      switchTab(qtab || ls.get("appopt_tab", "over"));
       (async () => {
-        await initToken();
+        tokenReady = initToken();
+        try {
+          await tokenReady;
+        } catch (e) {}
+        booted = true;
+        switchTab(qtab || ls.get("appopt_tab", "over"));
         kick("*");
         try {
           await refreshStatus();
