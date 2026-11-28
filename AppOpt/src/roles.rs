@@ -44,7 +44,19 @@ const LATENCY: &[&str] = &[
 ///
 /// `hwuiTask*` 是 RenderThread 拉起来的并行绘制任务：迁走会让一帧的绘制
 /// 跨簇分叉，比不动更慢，所以归 Latency（`movable()` 为 false）而不是 Worker
-const LATENCY_PREFIX: &[&str] = &["hwuiTask", "MediaCodec", "Chrome_"];
+/// Flutter 的 UI 与 Raster 线程必须挡在 Worker 之前：comm 上限 15 字符，
+/// `io.flutter.worker` 被截成 `io.flutter.work`，与 `io.flutter.ui` 只差几个
+/// 字符。用 `io.flutter` 当前缀会把渲染线程一并判成可迁，直接掉帧
+const LATENCY_PREFIX: &[&str] = &[
+    "hwuiTask",
+    "MediaCodec",
+    "Chrome_",
+    "io.flutter.ui",
+    "io.flutter.rast",
+    // V8 的编译/GC 线程池。迁走会让 JS 侧下次编译落在小核
+    "V8 DefaultWorke",
+    "SurfaceFlinger",
+];
 
 /// 前缀表：这类名字带序号，精确比较覆盖不到
 const WORKER_PREFIX: &[&str] = &[
@@ -57,6 +69,12 @@ const WORKER_PREFIX: &[&str] = &[
     "Task-",
     "Loading-",
     "ForkJoinPool",
+    // Flutter/Dart 的后台 isolate（真机日志里的 `io.flutter.work` 是
+    // `io.flutter.worker` 被截到 15 字符），与 UI/Raster 线程不同，可让位
+    "io.flutter.work",
+    "DartWorker",
+    // 微信 Mars 的异步日志线程，纯写文件
+    "mars::xlog",
 ];
 
 const BACKGROUND_PREFIX: &[&str] = &["bg", "Bg", "BG", "Background", "background"];
@@ -228,6 +246,21 @@ mod tests {
         // hwui 并行绘制任务归 Latency：不可迁，但也不再算「未知」
         assert_eq!(role_of("hwuiTask0"), Role::Latency);
         assert_eq!(role_of("hwuiTask12"), Role::Latency);
+    }
+
+    /// 真机日志里实际出现的命名。Flutter 的 ui/raster 与 worker 只差几个
+    /// 字符，判错一个就是渲染线程被迁走
+    #[test]
+    fn flutter_threads_are_split_by_role() {
+        assert_eq!(role_of("io.flutter.work"), Role::Worker);
+        assert_eq!(role_of("io.flutter.ui"), Role::Latency);
+        assert_eq!(role_of("io.flutter.rast"), Role::Latency);
+        assert_eq!(role_of("DartWorker"), Role::Worker);
+        assert_eq!(role_of("mars::xlog"), Role::Worker);
+        assert_eq!(role_of("V8 DefaultWorke"), Role::Latency);
+        assert_eq!(role_of("SurfaceFlinger"), Role::Latency);
+        // 没有 `io.flutter` 这种宽前缀，未知变体仍不动
+        assert_eq!(role_of("io.flutter.foo"), Role::Unknown);
     }
 
     #[test]

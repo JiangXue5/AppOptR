@@ -2171,6 +2171,22 @@
                     ></span>
                   </div>
                 </div>
+                <div class="gi">
+                  <div class="lb">
+                    λmod 层配额<small>按缓存亲和力给每条线程一个建议层；开启后才会照建议改绑核</small>
+                  </div>
+                  <div class="rt2">
+                    <span class="sw"
+                      ><button
+                        role="switch"
+                        data-bk="lambda"
+                        data-on="apply"
+                        aria-checked="false"
+                        aria-label="λmod 层配额执行"
+                      ></button
+                    ></span>
+                  </div>
+                </div>
               </div>
               <div class="h2">访问</div>
               <div class="gl">
@@ -3474,6 +3490,7 @@
         if (k === "foreground_demote") return !!c.demote;
         if (k === "auto_assign") return !!c.auto_assign;
         if (k === "pmu") return !!c.pmu;
+        if (k === "lambda") return !!c.lambda_apply;
         return !!c.pmu_alloc;
       }
       document.querySelectorAll("[data-bk]").forEach((b) => {

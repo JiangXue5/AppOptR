@@ -1,6 +1,19 @@
 # AppOptR 变更记录
 
-## 2.7.0-beta36（2026-11-28）
+## 2.7.0-beta37（2026-11-28）
+
+**beta36 实测反馈**
+
+- 设置页补 λmod 开关（`@lambda=apply|shadow`）。此前只有后端闸门与诊断卡片，
+  配置文件里能写、界面里找不到。关掉回到 shadow 而不是 off——求解始终在跑，
+  关的只是「按结论改绑核」这一步
+- 角色表第二轮：beta36 日志里未识别的名字是 `io.flutter.work`、`DartWorker`、
+  `mars::xlog`、`V8 DefaultWorke`、`SurfaceFlinger`，第一轮加的 Java 线程池
+  命名在这台 Flutter 设备上一条都没命中。`io.flutter.ui` / `io.flutter.rast`
+  显式判 Latency 且排在 Worker 之前——comm 上限 15 字符，`io.flutter.worker`
+  被截成 `io.flutter.work`，用 `io.flutter` 当宽前缀会把渲染线程卷进可迁集合
+- 统计口径拆分与未识别采样确认生效：周期行已分成「组限制/λmod 优先」与
+  「后台降档优先」两列，并输出 top5 未识别名字
 
 **S7 候选池与统计口径**
 

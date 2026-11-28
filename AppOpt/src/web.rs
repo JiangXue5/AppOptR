@@ -1096,6 +1096,9 @@ fn config_json() -> String {
     let auto_assign = cfg.as_ref().is_some_and(|c| c.auto_assign);
     let pmu = cfg.as_ref().is_some_and(|c| c.pmu_observe);
     let pmu_alloc = cfg.as_ref().is_some_and(|c| c.pmu_alloc && c.pmu_observe);
+    // 执行闸门取配置真值。不跟着 pmu_alloc 联动：用户关掉估算后开关自己
+    // 跳回去，会让人以为没保存上；真正会不会迁移写在日志的「λmod 否决」里
+    let lambda_apply = cfg.as_ref().is_some_and(|c| c.lambda_apply);
     let snap = lock_ignore_poison(&SCHED_SNAPSHOT)
         .clone()
         .unwrap_or_default();
@@ -1130,6 +1133,7 @@ fn config_json() -> String {
         "auto_assign": auto_assign,
         "pmu": pmu,
         "pmu_alloc": pmu_alloc,
+        "lambda_apply": lambda_apply,
         "sched_mode": sched_mode,
         "sched_state": s_state,
         "sched_ticks": s_ticks,
@@ -1585,6 +1589,7 @@ fn behavior_api(req: &Request) -> (u16, String) {
         Some("auto_assign") => BehaviorKey::AutoAssign,
         Some("pmu") => BehaviorKey::Pmu,
         Some("pmu_alloc") => BehaviorKey::PmuAlloc,
+        Some("lambda") => BehaviorKey::Lambda,
         Some(_) => return err_json(400, "未知的开关名"),
         None => return err_json(400, "缺少 key 字段"),
     };

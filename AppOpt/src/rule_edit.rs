@@ -644,6 +644,8 @@ pub enum BehaviorKey {
     Pmu,
     /// PMU 配额 shadow（只算不执行）
     PmuAlloc,
+    /// λmod 层配额是否参与绑核。默认 shadow：照算、采纳结论但不执行
+    Lambda,
 }
 
 impl BehaviorKey {
@@ -655,6 +657,7 @@ impl BehaviorKey {
             BehaviorKey::AutoAssign => "auto_assign",
             BehaviorKey::Pmu => "pmu",
             BehaviorKey::PmuAlloc => "pmu_alloc",
+            BehaviorKey::Lambda => "lambda",
         }
     }
 
@@ -677,6 +680,10 @@ impl BehaviorKey {
             (BehaviorKey::Pmu, false) => "off",
             (BehaviorKey::PmuAlloc, true) => "shadow",
             (BehaviorKey::PmuAlloc, false) => "off",
+            // 关不是 `off` 而是 `shadow`：λmod 的求解始终在跑，
+            // 关掉的只是「按它的结论改绑核」这一步
+            (BehaviorKey::Lambda, true) => "apply",
+            (BehaviorKey::Lambda, false) => "shadow",
         }
     }
 }
@@ -910,6 +917,9 @@ mod tests {
         assert_eq!(BehaviorKey::Screen.value(false), "off");
         assert_eq!(BehaviorKey::Group.value(true), "own");
         assert_eq!(BehaviorKey::Group.value(false), "mask");
+        // λmod 关掉是回到 shadow，不是 off：求解一直在跑，关的只是执行
+        assert_eq!(BehaviorKey::Lambda.value(true), "apply");
+        assert_eq!(BehaviorKey::Lambda.value(false), "shadow");
 
         let _ = fs::remove_dir_all(&dir);
     }
