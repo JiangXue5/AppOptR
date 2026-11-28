@@ -24,6 +24,8 @@ pub enum PolicySource {
     S7,
     /// 前后台降档
     Background,
+    /// λmod 层配额
+    Lambda,
 }
 
 impl PolicySource {
@@ -32,6 +34,7 @@ impl PolicySource {
             PolicySource::UserRule => "规则",
             PolicySource::S7 => "S7 落点",
             PolicySource::Background => "后台降档",
+            PolicySource::Lambda => "λmod 层",
         }
     }
 }
@@ -196,6 +199,125 @@ pub fn demote(base: &CpuSet, floor: &CpuSet) -> Option<CpuSet> {
 /// 返回的第二个值是该 S7 落点是否仍然有效，调用方据此决定要不要删除记录。
 /// 「落点有效」的判据有两条：仍在规则集合内，且这次规划没有把它裁小
 /// （迁不进自己的组时，被裁小的落点 S7 自己也维持不住，交回规则更稳定）
+/// 一条线程进入规划所需的全部输入。
+///
+/// 之所以用结构体：`plan_entry` 原来七个位置参数已经很难读，再塞 λmod 的
+/// 提示、RT 标记与冷却状态就是十一个——调用点写成一行谁也不知道第几位是什么
+pub struct Entry<'a> {
+    pub rule: &'a CpuSet,
+    pub landing: Option<CpuSet>,
+    pub group: SysGroup,
+    pub eff: Option<&'a str>,
+    pub respect: bool,
+    pub migrate: bool,
+    pub floor: Option<&'a CpuSet>,
+    /// λmod 对这条线程的建议（可能为空）
+    pub hint: Option<crate::arbiter::Hint>,
+    /// λmod 执行闸门
+    pub lambda_apply: bool,
+    /// 已被 RT 提升：任何自动迁移都不碰
+    pub rt: bool,
+    /// 角色是否允许自动迁移
+    pub movable: bool,
+    /// 该线程是否已过 λmod 冷却
+    pub cooling_ok: bool,
+    /// 线程当前实际绑着的集合
+    pub current: Option<CpuSet>,
+    /// 当前目标是否由 λmod 定的
+    pub owned_lambda: bool,
+}
+
+/// 规划：先由裁决层决定「听谁的」，再把选中的集合换算成机器做得到的集合。
+///
+/// 两层分开的原因：裁决是纯策略（谁优先），`plan_target` 是纯能力（组限制、
+/// 迁移与否）。混在一起时，一个「S7 落点被组裁小」的失败会被误读成「S7 输了」。
+pub fn plan(e: &Entry<'_>) -> (Target, Option<CpuSet>) {
+    let demoted = e.floor.and_then(|f| demote(e.rule, f));
+    let s7 = if demoted.is_none() {
+        landing_for(e.rule, e.landing)
+    } else {
+        None
+    };
+    let ctx = crate::arbiter::Context {
+        rule: e.rule,
+        demoted: demoted.as_ref(),
+        s7: s7.as_ref(),
+        hint: e.hint.as_ref(),
+        rt: e.rt,
+        movable: e.movable,
+        apply: e.lambda_apply,
+        cooling_ok: e.cooling_ok,
+        err_ok: crate::arbiter::CONVERGED_ERR,
+    };
+    let verdict = crate::arbiter::arbitrate(&ctx);
+    let source = match verdict.owner {
+        crate::arbiter::Owner::Demote => PolicySource::Background,
+        crate::arbiter::Owner::S7 => PolicySource::S7,
+        crate::arbiter::Owner::Lambda => PolicySource::Lambda,
+        crate::arbiter::Owner::Rule => PolicySource::UserRule,
+    };
+    let mut t = plan_target(&verdict.cpus, e.group, e.eff, e.respect, e.migrate, source);
+    match verdict.owner {
+        // 降档即使被组拦住也照原样返回：调用方据此整条跳过，
+        // 不能偷偷回落到规则值——那等于把用户的前后台约束丢了
+        crate::arbiter::Owner::Demote => (t, None),
+        crate::arbiter::Owner::S7 => {
+            // 落点必须写得住：被组裁小又迁不进自有组时，S7 自己也维持不住，
+            // 交回规则值更稳定（与 2.7.0 之前的行为一致）
+            if !t.blocked && (t.cpus == verdict.cpus || e.migrate) {
+                return (t, Some(verdict.cpus));
+            }
+            rule_target(e, demoted.as_ref())
+        }
+        crate::arbiter::Owner::Lambda => {
+            if !t.blocked && (t.cpus == verdict.cpus || e.migrate) {
+                return (t, None);
+            }
+            rule_target(e, demoted.as_ref())
+        }
+        crate::arbiter::Owner::Rule => {
+            // 冷却不是「回退」：这条线程本来就落在 λmod 给的层上，冷却期内
+            // 保持不动。否则冷却一到就按规则值拉回去，60 秒后再抬上来——
+            // 一次防抖变成一次周期性抖动
+            if matches!(verdict.veto, Some(crate::arbiter::Veto::Cooling))
+                && e.owned_lambda
+                && let Some(cur) = e.current.filter(|c| c.count() > 0 && c.subset_of(e.rule))
+            {
+                let mut t = plan_target(
+                    &cur,
+                    e.group,
+                    e.eff,
+                    e.respect,
+                    e.migrate,
+                    PolicySource::Lambda,
+                );
+                t.reason = "λmod 层（冷却保持）";
+                return (t, None);
+            }
+            // 回落到规则值时把「为什么没听 λmod」写进 reason：日志里
+            // 「规则 0-7」看不出是没建议还是被否决，这句能省一轮排查
+            // 「闸门未开」不是一次裁决结论（默认态），不该覆盖规则原因
+            if matches!(verdict.veto, Some(v) if v != crate::arbiter::Veto::Disabled) {
+                t.reason = verdict.why;
+            }
+            (t, None)
+        }
+    }
+}
+
+fn rule_target(e: &Entry<'_>, demoted: Option<&CpuSet>) -> (Target, Option<CpuSet>) {
+    let (base, source) = match demoted {
+        Some(small) => (*small, PolicySource::Background),
+        None => (*e.rule, PolicySource::UserRule),
+    };
+    (
+        plan_target(&base, e.group, e.eff, e.respect, e.migrate, source),
+        None,
+    )
+}
+
+/// 兼容旧调用点与既有单测：无 λmod、无 RT、无冷却约束时等价于规则 → 落点
+#[cfg(test)]
 pub fn plan_entry(
     rule: &CpuSet,
     landing: Option<CpuSet>,
@@ -205,28 +327,22 @@ pub fn plan_entry(
     migrate: bool,
     floor: Option<&CpuSet>,
 ) -> (Target, Option<CpuSet>) {
-    // 降档成立时，落点直接作废：落点是为「规则原集合」挑的簇，降档后的
-    // 小核集合与它没有关系，留着只会在下一轮被 `landing_for` 判成有效
-    let demoted = floor.and_then(|f| demote(rule, f));
-    // 第一档：S7 落点。它已经是规则子集，不再叠加降档——S7 自己会按负载
-    // 选簇，再降一次会把「让位」和「降档」两个意图混在一起，日志说不清
-    if demoted.is_none()
-        && let Some(s) = landing_for(rule, landing)
-    {
-        let t = plan_target(&s, group, eff, respect, migrate, PolicySource::S7);
-        if !t.blocked && (t.cpus == s || migrate) {
-            return (t, Some(s));
-        }
-    }
-    // 第二档：规则值，按需降档
-    let (base, source) = match demoted {
-        Some(small) => (small, PolicySource::Background),
-        None => (*rule, PolicySource::UserRule),
-    };
-    (
-        plan_target(&base, group, eff, respect, migrate, source),
-        None,
-    )
+    plan(&Entry {
+        rule,
+        landing,
+        group,
+        eff,
+        respect,
+        migrate,
+        floor,
+        hint: None,
+        lambda_apply: false,
+        rt: false,
+        movable: true,
+        cooling_ok: true,
+        current: None,
+        owned_lambda: false,
+    })
 }
 
 #[cfg(test)]
@@ -359,6 +475,85 @@ mod tests {
         assert_eq!(t.cpus, range("4-5"));
         assert!(matches!(t.source, PolicySource::S7));
         assert_eq!(keep, Some(range("4-5")));
+    }
+
+    fn lambda_hint(cpus: CpuSet, err: f64) -> crate::arbiter::Hint {
+        crate::arbiter::Hint { cpus, err }
+    }
+
+    fn entry_lambda<'a>(rule: &'a CpuSet, hint: crate::arbiter::Hint, apply: bool) -> Entry<'a> {
+        Entry {
+            rule,
+            landing: None,
+            group: SysGroup::Own,
+            eff: None,
+            respect: true,
+            migrate: true,
+            floor: None,
+            hint: Some(hint),
+            lambda_apply: apply,
+            rt: false,
+            movable: true,
+            cooling_ok: true,
+            current: None,
+            owned_lambda: false,
+        }
+    }
+
+    /// 闸门打开、提示层落在规则内：采纳 λmod 的层
+    #[test]
+    fn lambda_tier_is_used_when_gate_open() {
+        let rule = range("0-7");
+        let e = entry_lambda(&rule, lambda_hint(range("4-7"), 0.02), true);
+        let (t, keep) = plan(&e);
+        assert_eq!(t.cpus, range("4-7"));
+        assert!(matches!(t.source, PolicySource::Lambda));
+        assert_eq!(keep, None);
+    }
+
+    /// 闸门关（默认）：照跑裁决但退回规则值，不能偷偷改绑核
+    #[test]
+    fn lambda_tier_is_ignored_when_gate_closed() {
+        let rule = range("0-7");
+        let e = entry_lambda(&rule, lambda_hint(range("4-7"), 0.02), false);
+        let (t, _) = plan(&e);
+        assert_eq!(t.cpus, rule);
+        assert!(matches!(t.source, PolicySource::UserRule));
+    }
+
+    /// 冷却期内保持 λmod 落点，不回退规则值：否则 60 秒一次来回抖
+    #[test]
+    fn lambda_landing_is_kept_during_cooldown() {
+        let rule = range("0-7");
+        let mut e = entry_lambda(&rule, lambda_hint(range("0-3"), 0.02), true);
+        e.cooling_ok = false;
+        e.owned_lambda = true;
+        e.current = Some(range("4-7"));
+        let (t, keep) = plan(&e);
+        assert_eq!(t.cpus, range("4-7"));
+        assert!(matches!(t.source, PolicySource::Lambda));
+        assert_eq!(t.reason, "λmod 层（冷却保持）");
+        assert_eq!(keep, None);
+    }
+
+    /// RT 线程即使闸门开着也不采纳：迁走就是一次丢缓存
+    #[test]
+    fn rt_thread_ignores_lambda() {
+        let rule = range("0-7");
+        let mut e = entry_lambda(&rule, lambda_hint(range("4-7"), 0.02), true);
+        e.rt = true;
+        let (t, _) = plan(&e);
+        assert_eq!(t.cpus, rule);
+        assert!(matches!(t.source, PolicySource::UserRule));
+    }
+
+    /// 提示层越出规则集合：整层不能写，否则越过用户规则
+    #[test]
+    fn lambda_tier_outside_rule_falls_back() {
+        let rule = range("0-3");
+        let e = entry_lambda(&rule, lambda_hint(range("4-7"), 0.02), true);
+        let (t, _) = plan(&e);
+        assert_eq!(t.cpus, rule);
     }
 
     /// 迁组路径不受组生效集合裁剪：迁进自己的组后组就是我们建的那一个

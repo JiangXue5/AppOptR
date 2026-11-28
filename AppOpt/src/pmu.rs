@@ -700,6 +700,7 @@ pub fn tick(cfg: &AppConfig, cache: &ProcCache) {
         if fresh.is_empty() {
             crate::pmu_allocator::clear();
             crate::pmu_lambda::clear();
+            crate::arbiter::clear();
         } else {
             crate::pmu_allocator::update(&fresh, &cfg.topo);
             // λmod 与配额并行跑：一个报「簇间平不平衡」，一个报「谁该上大核」。
@@ -748,6 +749,7 @@ pub fn pause() {
         // 息屏期间的数据不代表前台体验，配额结论也一并作废
         crate::pmu_allocator::clear();
         crate::pmu_lambda::clear();
+        crate::arbiter::clear();
         // 亮屏后的第一个窗口不能按「息屏了多久」算速率
         p.last_tick = None;
         publish(p, "息屏暂停".to_string());
@@ -763,6 +765,7 @@ fn shutdown() {
     p.close_all();
     crate::pmu_allocator::clear();
     crate::pmu_lambda::clear();
+    crate::arbiter::clear();
     *lock_ignore_poison(&LOADS) = None;
     *lock_ignore_poison(&SNAPSHOT) = Some(PmuSnapshot {
         state: "未启用".to_string(),
@@ -905,7 +908,12 @@ fn log_line(p: &Pmu, cfg: &AppConfig) {
         && let Some(lp) = crate::pmu_lambda::snapshot()
         && lambda_should_log(&lp)
     {
-        crate::diag::tag("λmod", &lp.log_text());
+        // 追加裁决摘要：λmod 的结论采纳了几条、被谁否决几条，
+        // 这决定了「该不该开执行闸门」，不能只看模型收敛
+        crate::diag::tag(
+            "λmod",
+            &format!("{} ｜ {}", lp.log_text(), crate::arbiter::summary()),
+        );
     }
 }
 

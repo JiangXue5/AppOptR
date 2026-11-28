@@ -22,7 +22,8 @@ use crate::config::{AppConfig, SchedMode};
 use crate::cpuset::{CpuSet, CpuTopology};
 use crate::diag;
 use crate::lock_ignore_poison;
-use crate::roles::role_of;
+use crate::policy::PolicySource;
+use crate::roles::{Role, role_of};
 use crate::rule_match::thread_affinity;
 
 /// 采样周期。与 eBPF 主循环的 `recv_timeout(1s)` 同源
@@ -77,10 +78,13 @@ pub const SKIP_QUOTA: usize = 5;
 /// 采样本身拿不到（`/proc/stat` 读失败、计数器回绕）：与「负载不达标」分开，
 /// 前者该降频，后者是正常判定结果
 pub const SKIP_SAMPLE: usize = 6;
-/// 被其他策略否决：与所在组无交集（`blocked`）或正在后台降档。这类线程
-/// 的落点由 `policy::plan_entry` 决定，S7 再迁一次就是两个策略互相踩
-pub const SKIP_POLICY: usize = 7;
-pub const SKIP_LABELS: [&str; 8] = [
+/// 被所在组裁小、或已被 λmod 接管：落点由 `policy::plan` 决定，
+/// S7 再迁一次就是两个策略互相踩
+pub const SKIP_GROUP: usize = 7;
+/// 后台降档优先。与上一项分开计数：降档是「已经有人管了」，不是
+/// 「S7 被拦」，混在一起会让人误以为判据有问题
+pub const SKIP_DEMOTE: usize = 8;
+pub const SKIP_LABELS: [&str; 9] = [
     "允许集合不足两层",
     "线程角色不可迁移",
     "目标没有明显更空",
@@ -88,7 +92,8 @@ pub const SKIP_LABELS: [&str; 8] = [
     "冷却中",
     "目标簇配额已满",
     "负载采样不可用",
-    "降档/组限制优先",
+    "组限制/λmod 优先",
+    "后台降档优先",
 ];
 
 const CLUSTER_NAME: [&str; 3] = ["e-core", "p-core", "hp-core"];
@@ -223,8 +228,11 @@ fn judge(
     if base < 0 {
         return Action::Skip(SKIP_SAMPLE);
     }
-    let Some(target) = pick_target(&load, allow, st.cur) else {
-        return Action::Skip(SKIP_LOAD);
+    let Some(target) = pick_target(&load, allow, st.cur, placed, topo) else {
+        // 有可用的簇但都被配额占满：这跟「目标没有明显更空」不是一回事，
+        // 混在一个计数里会让人以为负载判据太严
+        let any = (1..3).any(|i| allow[i] && load[i] >= 0);
+        return Action::Skip(if any { SKIP_QUOTA } else { SKIP_LOAD });
     };
     if Some(target) == st.cur {
         st.clear_streak();
@@ -304,7 +312,9 @@ pub struct SchedSnapshot {
     /// 因角色、目标簇核数等约束被拒的线程次
     pub blocked: u64,
     /// 各跳过原因计数，下标见 `SKIP_LABELS`
-    pub skip: [u64; 8],
+    pub skip: [u64; 9],
+    /// 角色表认不出的线程名 top 5（名字, 探测次数）。日志据此提示该补哪条命名
+    pub unknown: Vec<(String, u32)>,
     /// 被反悔冷却拦住的次数
     pub bounced: u64,
     /// 抖动过多被冻结的线程数
@@ -325,10 +335,13 @@ pub struct SchedState {
     moved: u64,
     failed: u64,
     blocked: u64,
-    skip: [u64; 8],
+    skip: [u64; 9],
     bounced: u64,
     frozen: u64,
     threads: HashMap<i32, ThreadState>,
+    /// 角色未知的线程名 → 探测次数。上限 256 条：真机上线程名可能上千，
+    /// 不封顶会让一个跑了几小时的后台进程把这张表撑成内存泄漏
+    unknown: HashMap<String, u32>,
     /// 上一轮每簇累计时间，用于差分
     prev: Option<[ClusterTimes; 3]>,
     /// 上一轮簇负载
@@ -369,10 +382,11 @@ impl SchedState {
             moved: 0,
             failed: 0,
             blocked: 0,
-            skip: [0; 8],
+            skip: [0; 9],
             bounced: 0,
             frozen: 0,
             threads: HashMap::new(),
+            unknown: HashMap::new(),
             prev: None,
             load: [-1; 3],
             active: HashMap::new(),
@@ -647,7 +661,21 @@ impl SchedState {
         self.ring.push_back(line);
     }
 
+    /// 记一条「角色表认不出」的线程名。只在 `Unknown` 上调用：
+    /// Critical/Latency 是认出来的，不需要补命名
+    fn note_unknown(&mut self, comm: &str) {
+        if self.unknown.len() >= 256 && !self.unknown.contains_key(comm) {
+            return;
+        }
+        *self.unknown.entry(comm.to_string()).or_insert(0) += 1;
+    }
+
     pub fn snapshot(&self) -> SchedSnapshot {
+        let mut unknown: Vec<(String, u32)> =
+            self.unknown.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        // 次数多的在前，同次数按名字排：日志每次顺序一致才能 diff
+        unknown.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        unknown.truncate(5);
         SchedSnapshot {
             mode: self.mode as u8,
             state: self.state,
@@ -661,6 +689,7 @@ impl SchedState {
             bounced: self.bounced,
             frozen: self.frozen,
             load: self.load,
+            unknown,
             last: self.ring.back().cloned().unwrap_or_default(),
         }
     }
@@ -710,19 +739,22 @@ impl SchedState {
             if cfg.is_exempt(&entry.pkg) {
                 continue;
             }
-            // 被组拦住、或正在后台降档的线程同样不参与：这两类落点由
-            // `policy::plan_entry` 决定（优先级：降档 > S7 落点 > 规则值）。
-            // S7 在这里再迁一次，就会把刚降到小核的线程拽回大核，下一轮
-            // 同步再降回来——两轮一抖，日志上还会同时出现两个来源
-            if entry.blocked
-                || crate::background::should_demote(
-                    cfg.foreground_demote,
-                    entry.is_thread_rule,
-                    entry.pid,
-                    entry.group,
-                )
-            {
-                self.skip[SKIP_POLICY] += 1;
+            // 被组拦住、或已被 λmod 接管：落点由 `policy::plan` 决定
+            // （优先级：降档 > S7 落点 > λmod 层 > 规则值），S7 再迁一次
+            // 就会把刚定好的线程拽走
+            if entry.blocked || matches!(entry.source, PolicySource::Lambda) {
+                self.skip[SKIP_GROUP] += 1;
+                continue;
+            }
+            // 后台降档单独计数：这类线程确实有人管，不属于「S7 被拦」。
+            // 与上一项混在一起时，日志里 38% 的跳过看着像判据失效
+            if crate::background::should_demote(
+                cfg.foreground_demote,
+                entry.is_thread_rule,
+                entry.pid,
+                entry.group,
+            ) {
+                self.skip[SKIP_DEMOTE] += 1;
                 continue;
             }
 
@@ -744,6 +776,11 @@ impl SchedState {
 
             let role = role_of(&entry.comm);
             if !role.movable() {
+                // 名字没进角色表的线程单独记账：日志里「角色不可迁移 2000」
+                // 看不出该补哪条命名，把真实 comm 采回来才有得改
+                if role == Role::Unknown {
+                    self.note_unknown(&entry.comm);
+                }
                 self.blocked += 1;
                 self.skip[SKIP_ROLE] += 1;
                 continue;
@@ -763,6 +800,11 @@ impl SchedState {
                 } else {
                     let base = if st.own {
                         st.cur.map(|c| load[c as usize]).unwrap_or(-1)
+                    } else if let Some(c) = current_cluster(&entry.cpus, &cfg.topo) {
+                        // 线程已经落在单簇上（规则只给一簇、或上次被绑定）：
+                        // 拿它所在的簇做基准，「值不值得迁」比的是它现在的处境，
+                        // 而不是被核数加权平均抹平后的一个数
+                        load[c as usize]
                     } else {
                         weighted_avg(&load, &allow, &cfg.topo)
                     };
@@ -932,6 +974,14 @@ fn diff_load(prev: &[ClusterTimes; 3], cur: &[ClusterTimes; 3]) -> [i32; 3] {
     out
 }
 
+/// 集合只覆盖一个簇时返回该簇下标。规则写 4-7（p+hp）这类跨簇集合返回
+/// None：线程此刻在哪一簇由内核决定，替它假设会把基准算错
+fn current_cluster(cpus: &CpuSet, topo: &CpuTopology) -> Option<u8> {
+    let m = cluster_mask(cpus, topo);
+    let hit: Vec<usize> = (0..3).filter(|i| m[*i]).collect();
+    (hit.len() == 1).then(|| hit[0] as u8)
+}
+
 fn cluster_mask(cpus: &CpuSet, topo: &CpuTopology) -> [bool; 3] {
     let mut m = [false; 3];
     for (i, set) in [topo.e_core, topo.p_core, topo.hp_core].iter().enumerate() {
@@ -973,12 +1023,27 @@ fn weighted_avg(load: &[i32; 3], allow: &[bool; 3], topo: &CpuTopology) -> i32 {
 }
 
 /// 负载最低的可用簇。当前簇已是最低时保持不动，避免同负载下来回跳。
-fn pick_target(load: &[i32; 3], allow: &[bool; 3], cur: Option<u8>) -> Option<u8> {
+///
+/// 两个簇都允许时会**上下都考虑**：线程在 hp、p 更空，就退回 p 给渲染腾出
+/// 超大核；反过来 p 空、线程在 hp 也不会被拉下来。方向由负载决定，
+/// 不按「只能往上」预设——那是 e-core 的历史约束，不是 p 与 hp 之间的约束
+fn pick_target(
+    load: &[i32; 3],
+    allow: &[bool; 3],
+    cur: Option<u8>,
+    placed: &[u16; 3],
+    topo: &CpuTopology,
+) -> Option<u8> {
     let mut best: Option<(i32, u8)> = None;
     // 只在小核之上的两层里挑。e-core 是最低层，迁进去没有收益，
     // 若先按全表选出 e-core 再被 target_ok 否决，整个线程这轮就白跑了
     for i in 1..3 {
         if !allow[i] || load[i] < 0 {
+            continue;
+        }
+        // 已满配额的簇不再接收。以前是「挑出最低 → 被 quota 拦 → 整轮跳过」，
+        // 多 Worker 场景下 hp 一满，所有线程都卡在这里，而 p 明明还空着
+        if placed[i] >= quota(i as u8, topo) && cur != Some(i as u8) {
             continue;
         }
         match best {
@@ -1261,16 +1326,73 @@ mod tests {
     #[test]
     fn pick_target_ignores_unavailable_and_prefers_idle() {
         let allow = [true, true, true];
-        assert_eq!(pick_target(&[500, 200, 300], &allow, None), Some(1));
-        assert_eq!(pick_target(&[-1, 400, 300], &allow, None), Some(2));
-        assert_eq!(pick_target(&[-1, -1, -1], &allow, None), None);
+        assert_eq!(
+            pick_target(&[500, 200, 300], &allow, None, &[0; 3], &topo()),
+            Some(1)
+        );
+        assert_eq!(
+            pick_target(&[-1, 400, 300], &allow, None, &[0; 3], &topo()),
+            Some(2)
+        );
+        assert_eq!(
+            pick_target(&[-1, -1, -1], &allow, None, &[0; 3], &topo()),
+            None
+        );
+    }
+
+    /// 更空的簇配额已满时，退到次优簇而不是整轮跳过。
+    /// 单核 hp 只放 1 个：多 Worker 场景里 hp 一满，p 还空着
+    #[test]
+    fn pick_target_falls_back_when_best_is_full() {
+        let t = topo();
+        let allow = [false, true, true];
+        // hp 更空（100）但已满 1 个，p 还有位置
+        assert_eq!(
+            pick_target(&[-1, 200, 100], &allow, None, &[0, 0, 1], &t),
+            Some(1)
+        );
+        // 两簇都满：没有候选，由调用方记 SKIP_QUOTA
+        assert_eq!(
+            pick_target(&[-1, 200, 100], &allow, None, &[0, 6, 1], &t),
+            None
+        );
+        // 自己就在满额的那一簇：允许留下，不能把已在里面的线程赶走
+        assert_eq!(
+            pick_target(&[-1, 300, 100], &allow, Some(2), &[0, 0, 1], &t),
+            Some(2)
+        );
+    }
+
+    /// hp→p 是合法方向：线程在超大核、p 更空时退回 p，给渲染腾地方
+    #[test]
+    fn pick_target_moves_down_from_hp_to_p() {
+        let t = topo();
+        let allow = [false, true, true];
+        assert_eq!(
+            pick_target(&[-1, 120, 400], &allow, Some(2), &[0, 0, 0], &t),
+            Some(1)
+        );
+    }
+
+    /// 基准只在线程确实落在单簇时用它，跨簇规则不能替内核假设位置
+    #[test]
+    fn current_cluster_requires_single_cluster() {
+        let t = topo();
+        assert_eq!(current_cluster(&t.p_core, &t), Some(1));
+        assert_eq!(current_cluster(&t.hp_core, &t), Some(2));
+        let mut both = t.p_core;
+        both.or(&t.hp_core);
+        assert_eq!(current_cluster(&both, &t), None);
     }
 
     #[test]
     fn pick_target_keeps_current_when_tied() {
         let allow = [false, true, true];
         // 当前在 hp，与 p 同负载时保持不动
-        assert_eq!(pick_target(&[-1, 300, 300], &allow, Some(2)), Some(2));
+        assert_eq!(
+            pick_target(&[-1, 300, 300], &allow, Some(2), &[0; 3], &topo()),
+            Some(2)
+        );
     }
 
     #[test]
@@ -1761,9 +1883,58 @@ mod tests {
         );
     }
 
-    /// 单核簇配额为 1：已有线程占住 hp 时，第二个线程必须被挡住
+    /// 端到端：真机上最常见的那类线程（Java 线程池命名）在包级 all 规则下
+    /// 应该真的被 S7 迁到 p-core。改动前三件事各自都对，但没有一条线程
+    /// 走得到判定，这个用例锁的是「候选池真的非空」
     #[test]
-    fn single_core_cluster_quota_blocks_second_thread() {
+    fn pool_worker_in_cross_cluster_rule_moves() {
+        let cfg = cfg_with("pool", "com.test.game=e-core,p-core\n");
+        let t = topo();
+        let mut cpus = t.e_core;
+        cpus.or(&t.p_core);
+        let cache = cache_with("com.test.game", "pool-3-thread-1", cpus);
+        let mut st = state_for(&cache, SchedMode::On);
+        let now = Instant::now();
+        st.threads.get_mut(&1001).unwrap().first_seen = now - Duration::from_secs(5);
+        let mut moved = Vec::new();
+        for _ in 0..4 {
+            moved = st.tick_at(&cfg, &cache, [452, 126, 80], now);
+            if !moved.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(moved.len(), 1, "线程池线程应被迁出");
+        assert_eq!(moved[0].cpus.to_range_string(), "4-6");
+        assert_eq!(st.skip[SKIP_ROLE], 0, "pool-* 不该再算角色不可迁");
+    }
+
+    /// 认不出的名字要落在快照里，供日志提示「该补哪条命名」。
+    /// 系统线程（Signal Catcher）不该被扩表误收成 Worker
+    #[test]
+    fn unknown_comm_is_sampled_for_diagnostics() {
+        let cfg = cfg_with("unknown", "com.test.game=e-core,p-core\n");
+        let t = topo();
+        let mut cpus = t.e_core;
+        cpus.or(&t.p_core);
+        let cache = cache_with("com.test.game", "Signal Catcher", cpus);
+        let mut st = state_for(&cache, SchedMode::On);
+        let now = Instant::now();
+        for _ in 0..3 {
+            let _ = st.tick_at(&cfg, &cache, [452, 126, 80], now);
+        }
+        let snap = st.snapshot();
+        assert!(
+            snap.unknown.iter().any(|(n, _)| n == "Signal Catcher"),
+            "未识别线程名没有被采样：{:?}",
+            snap.unknown
+        );
+        assert!(st.skip[SKIP_ROLE] > 0);
+    }
+
+    /// 单核簇配额为 1：hp 已被占住时，第二个线程退到 p，绝不挤进同一核。
+    /// 旧行为是整轮跳过——线程干等，而 p 明明空着
+    #[test]
+    fn full_single_core_cluster_sends_thread_to_p() {
         let cfg = cfg_with("quota", "com.test.game=p-core,hp-core\n");
         let t = topo();
         let mut cpus = CpuSet::new();
@@ -1792,6 +1963,50 @@ mod tests {
             let th = st.threads.get_mut(&1002).unwrap();
             th.cur = Some(2);
             th.own = true;
+            // applied 必须与缓存一致，否则会被判成「外部改写」而整条重置，
+            // 占位随之消失，配额断言就成了假通过
+            th.applied = cpus;
+        }
+        for _ in 0..4 {
+            for th in st.threads.values_mut() {
+                th.first_seen = now - Duration::from_secs(5);
+            }
+            let _ = st.tick_at(&cfg, &cache, [-1, 50, 700], now);
+        }
+        // 关键断言：hp 配额为 1 已被 1002 占住，1001 绝不能挤进去。
+        // 至于它最终落在 p 还是保持原样，取决于负载差是否够 LOAD_GAP，
+        // 那是判据的事，配额只负责「不许超额」
+        assert_ne!(st.threads[&1001].cur, Some(2), "hp 满额时不得挤入");
+        assert_eq!(st.threads[&1002].cur, Some(2));
+    }
+
+    /// 两个候选簇都满额才记 SKIP_QUOTA：这才是「配额拦住了」，
+    /// 与「目标没有明显更空」必须分开，否则日志读不出瓶颈
+    #[test]
+    fn quota_skip_only_when_every_cluster_is_full() {
+        let cfg = cfg_with("quota2", "com.test.game=p-core,hp-core\n");
+        let t = topo();
+        let mut cpus = CpuSet::new();
+        cpus.or(&t.p_core);
+        cpus.or(&t.hp_core);
+        let cache = cache_with("com.test.game", "Thread-7", cpus);
+        let mut st = state_for(&cache, SchedMode::On);
+        let now = Instant::now();
+        {
+            let th = st.threads.get_mut(&1001).unwrap();
+            th.first_seen = now - Duration::from_secs(5);
+        }
+        // 先用 6 个线程把 p 占满，再把 hp 也占满
+        for tid in 2000..2008 {
+            st.threads.insert(
+                tid,
+                ThreadState {
+                    cur: Some(if tid < 2006 { 1 } else { 2 }),
+                    own: true,
+                    first_seen: now - Duration::from_secs(5),
+                    ..ThreadState::new(now)
+                },
+            );
         }
         for _ in 0..4 {
             for th in st.threads.values_mut() {
@@ -1799,8 +2014,8 @@ mod tests {
             }
             let _ = st.tick_at(&cfg, &cache, [-1, 700, 50], now);
         }
-        assert!(st.skip[SKIP_QUOTA] >= 1, "单核簇配额没有生效");
-        assert!(st.threads[&1001].cur.is_none());
+        assert!(st.skip[SKIP_QUOTA] >= 1, "两簇都满时应记配额跳过");
+        assert_eq!(st.threads[&1001].cur, None, "没有位置时不应强行迁移");
     }
 
     #[test]

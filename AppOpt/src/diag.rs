@@ -24,7 +24,7 @@ use crate::diag_fmt::{
 };
 use crate::lock_ignore_poison;
 use crate::roles::{Role, role_of};
-use crate::sched::{SKIP_ALLOW, SKIP_LABELS, SchedSnapshot};
+use crate::sched::{SKIP_ALLOW, SKIP_LABELS, SKIP_ROLE, SchedSnapshot};
 
 /// 事件环上限。比 S7 的 8 条更宽一点，够看清一次抖动的前后因果
 const EVENT_CAP: usize = 12;
@@ -1607,6 +1607,20 @@ fn sched_period_line(
     };
     if !skip.is_empty() {
         line.push_str(&format!("；跳过：{}", skip));
+    }
+    // 角色不可迁移占了三成以上时，把真实线程名带上：只说「角色不可迁移 2000」
+    // 没法判断该补哪条命名，也没法区分「表太严」和「本来就全是系统线程」
+    let role_skip = match prev {
+        Some(p) => d(cur.skip[SKIP_ROLE], p.skip[SKIP_ROLE]),
+        None => cur.skip[SKIP_ROLE],
+    };
+    if probed > 0 && role_skip * 10 >= probed * 3 && !cur.unknown.is_empty() {
+        let names: Vec<String> = cur
+            .unknown
+            .iter()
+            .map(|(n, c)| format!("{} {}", n, c))
+            .collect();
+        line.push_str(&format!("；未识别线程名：{}", names.join("、")));
     }
     // 一次都没动、且跳过几乎全是「允许集合不足两层」时，问题不在负载也不在策略，
     // 而是规则本身没跨簇。不明说这一句，用户只能看到「开着 S7 却完全没动」

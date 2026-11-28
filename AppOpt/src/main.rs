@@ -3,6 +3,7 @@
 compile_error!("AppOpt requires 64-bit target due to cpu_set_t binary layout assumptions");
 
 mod apply_affinity;
+mod arbiter;
 mod auto_assign;
 mod background;
 mod cache;

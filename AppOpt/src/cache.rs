@@ -106,7 +106,7 @@ fn resolve_group(path: Option<&str>, prev: Option<&TaskEntry>) -> SysGroup {
 ///
 /// 具体判据在 `policy::plan_entry`——那里是纯函数，这套判断错一次，
 /// 日志里就会多出几百行 EINVAL 或几百次无效重绑，必须能脱离真机单测
-use crate::policy::{PolicySource, plan_entry};
+use crate::policy::{Entry, PolicySource, plan};
 
 /// S7 落点。带上完整线程身份：tid 会被内核复用，只凭号码判断会把
 /// 上一条线程的落点套到刚创建的新线程上——新线程会被绑进一个更小的簇，
@@ -330,15 +330,33 @@ impl ProcCache {
         } else {
             None
         };
-        let (target, keep) = plan_entry(
-            &result.cpus,
-            self.landing_of(tid),
+        // λmod 只是候选：裁决层会让位给降档、RT 与已有 S7 落点
+        let hint = crate::pmu_lambda::hint(tid);
+        // RT 查询要拿账本锁，只在真会采纳 λmod 时才查；默认闸门关闭时零成本
+        let rt =
+            cfg.lambda_apply && cfg.rt_active() && crate::lifecycle::rt_owned_raw(tid).is_some();
+        let (target, keep) = plan(&Entry {
+            rule: &result.cpus,
+            landing: self.landing_of(tid),
             group,
-            eff.as_deref(),
-            cfg.sysgroup_respect,
+            eff: eff.as_deref(),
+            respect: cfg.sysgroup_respect,
             migrate,
-            floor.as_ref(),
-        );
+            floor: floor.as_ref(),
+            hint,
+            lambda_apply: cfg.lambda_apply,
+            rt,
+            movable: crate::roles::role_of(thread_name).movable(),
+            cooling_ok: crate::arbiter::cooling_ok(tid, std::time::Instant::now()),
+            current: prev.map(|p| p.cpus),
+            owned_lambda: prev.is_some_and(|p| matches!(p.source, PolicySource::Lambda)),
+        });
+        // 目标变了才重新计时：稳态复核不算一次迁移
+        if matches!(target.source, PolicySource::Lambda)
+            && prev.is_none_or(|p| p.cpus != target.cpus)
+        {
+            crate::arbiter::note_applied(tid, std::time::Instant::now());
+        }
         if keep.is_none() {
             self.sched.remove(&tid);
         }
@@ -530,15 +548,29 @@ impl ProcCache {
             };
             // S7 接管过的线程按落点维持，不按规则原值重算：`want` 是规则集，
             // 直接拿它算会把刚迁到 4-7 的线程拉回 0-7，迁移白做
-            let (target, keep) = plan_entry(
-                &e.want,
-                landings.get(tid).copied(),
+            let hint = crate::pmu_lambda::hint(*tid);
+            let rt = cfg.lambda_apply
+                && cfg.rt_active()
+                && crate::lifecycle::rt_owned_raw(*tid).is_some();
+            let (target, keep) = plan(&Entry {
+                rule: &e.want,
+                landing: landings.get(tid).copied(),
                 group,
-                eff.as_deref(),
+                eff: eff.as_deref(),
                 respect,
                 migrate,
-                floor.as_ref(),
-            );
+                floor: floor.as_ref(),
+                hint,
+                lambda_apply: cfg.lambda_apply,
+                rt,
+                movable: crate::roles::role_of(&e.comm).movable(),
+                cooling_ok: crate::arbiter::cooling_ok(*tid, std::time::Instant::now()),
+                current: Some(e.cpus),
+                owned_lambda: matches!(e.source, PolicySource::Lambda),
+            });
+            if matches!(target.source, PolicySource::Lambda) && e.cpus != target.cpus {
+                crate::arbiter::note_applied(*tid, std::time::Instant::now());
+            }
             if keep.is_none() && landings.contains_key(tid) {
                 // 落点已不可达（切后台、组收紧、规则改小）：接管作废
                 stale.push(*tid);

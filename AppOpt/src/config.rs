@@ -264,6 +264,9 @@ pub struct AppConfig {
     /// 拿本窗口的采样算重/中/轻与各簇建议承载，**只算不执行**，
     /// 输出只有日志和诊断面板
     pub pmu_alloc: bool,
+    /// λmod 执行闸门：`@lambda=apply` 打开，默认 false（只裁决不采纳）。
+    /// 方案 16.4 的验收没过之前不开：层配额会改写真实绑核，错了就是掉帧
+    pub lambda_apply: bool,
     pub topo: CpuTopology,
 }
 
@@ -367,6 +370,7 @@ impl AppConfig {
             auto_assign: false,
             pmu_observe: false,
             pmu_alloc: true,
+            lambda_apply: false,
             topo: CpuTopology::empty(),
         }
     }
@@ -426,6 +430,7 @@ fn build_policy_sig(
     auto_assign: bool,
     pmu_observe: bool,
     pmu_alloc: bool,
+    lambda_apply: bool,
     blacklist: &HashSet<String>,
     exempt: &HashSet<String>,
     rt: &RtConfig,
@@ -447,6 +452,8 @@ fn build_policy_sig(
     auto_assign.hash(&mut h);
     pmu_observe.hash(&mut h);
     pmu_alloc.hash(&mut h);
+    // 执行闸门一开就要重算全部已绑线程，不能等规则变化
+    lambda_apply.hash(&mut h);
     // 名单按排序后哈希，与书写顺序无关。新增黑名单要触发 release_unmanaged，
     // 新增豁免要让已迁组的线程退回「只写掩码」，两者都必须整轮重扫
     let mut bl: Vec<&String> = blacklist.iter().collect();
@@ -1187,6 +1194,8 @@ fn load_config_with(
     // 配额 shadow 默认开：它只是把已采到的数据算一遍，不发任何写操作。
     // 显式写 @pmu_alloc=off 才关
     let mut pmu_alloc = true;
+    // λmod 执行默认关：裁决照跑、结论不采纳
+    let mut lambda_apply = false;
     let mut rt = RtConfig::default();
     // 分应用条目先收集原文，等 @rt.max 解析完再统一构造，避免配置行顺序影响缺省上限
     let mut rt_apps: Vec<String> = Vec::new();
@@ -1234,6 +1243,8 @@ fn load_config_with(
                 ("pmu", "off") => pmu_observe = false,
                 ("pmu_alloc", "shadow" | "on") => pmu_alloc = true,
                 ("pmu_alloc", "off") => pmu_alloc = false,
+                ("lambda", "apply" | "on") => lambda_apply = true,
+                ("lambda", "shadow" | "off") => lambda_apply = false,
                 // 名单可写多行、逗号或空格分隔；空值不算错误，等价于本行无效
                 ("blacklist", v) | ("exempt", v) if v.is_empty() => {}
                 ("blacklist", v) | ("exempt", v) => match split_names(v) {
@@ -1434,6 +1445,7 @@ fn load_config_with(
         auto_assign,
         pmu_observe,
         pmu_alloc,
+        lambda_apply,
         &blacklist,
         &exempt,
         &rt,
@@ -1571,6 +1583,9 @@ fn load_config_with(
             extra.push("PMU 配额=on".to_string());
         }
     }
+    if lambda_apply {
+        extra.push("λmod 执行=on（层配额参与绑核）".to_string());
+    }
     if !blacklist.is_empty() {
         extra.push(format!("黑名单 {} 个包（完全不管理）", blacklist.len()));
     }
@@ -1666,6 +1681,7 @@ fn load_config_with(
         auto_assign,
         pmu_observe,
         pmu_alloc,
+        lambda_apply,
         topo: topo.clone(),
     })
 }
