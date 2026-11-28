@@ -7,20 +7,19 @@ wait_sys_boot_completed() {
 }
 wait_sys_boot_completed
 MODDIR=${0%/*}
-cd $MODDIR
+cd "$MODDIR" || exit 0
 
-# 旧版安装脚本把主程序权限压成 0644（set_perm_recursive 把多路径当成了一个
-# 参数），升级上来的设备不会重跑 customize.sh 的恢复逻辑，这里兜一次。
-# 失败不阻塞：真正的原因是安装包有问题，日志里会看到 Permission denied
-[ -x "${MODDIR}/AppOpt" ] || chmod 0755 "${MODDIR}/AppOpt" 2>/dev/null
+# 启停逻辑与 hotinstall.sh / action.sh 共用一份：权限兜底、日志轮转、
+# 单实例判断都在 daemon.sh 里，避免三处各写一套后走样
+. "${MODDIR}/daemon.sh"
 
-# 日志写入模块目录，超过 1 MiB 时启动前轮转一次，避免无限增长
-LOG_FILE=${MODDIR}/appopt.log
-LOG_MAX_KB=1024
-if [ -f "$LOG_FILE" ] && [ "$(wc -c < "$LOG_FILE")" -gt $((LOG_MAX_KB * 1024)) ]; then
-	mv -f "$LOG_FILE" "${LOG_FILE}.1"
+# 已经在跑就别再起一个。AppOpt 自带 flock 单实例锁，第二个进程会静默退出，
+# 但先判断一次能少一条「已有实例」的误导日志（热安装刚跑过时会走到这里）
+if daemon_running; then
+	echo "[$(date '+%F %T')] 守护进程已在运行（pid $(cat "$PIDFILE" 2>/dev/null)），跳过启动" >>"$LOG_FILE"
+else
+	daemon_start || echo "[$(date '+%F %T')] 启动失败，详见 appopt.log" >>"$LOG_FILE"
 fi
-nohup ${MODDIR}/AppOpt -w >>"$LOG_FILE" 2>&1 &
 
 # core_ctl：部分内核在低负载时会把整个簇下电，绑在该簇上的线程随之被挤走。
 # 把 min_cpus 拉到 max_cpus 能让核心常在线，代价是待机功耗与发热上升，

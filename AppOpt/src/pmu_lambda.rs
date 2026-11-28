@@ -65,6 +65,13 @@ const DN_WEIGHT: f64 = 1.0;
 // ---- 本仓库自己的展示参数 ----
 /// 面板与日志展示的线程数
 const MAX_PICKS: usize = 8;
+/// 参与求解的活跃样本下限。低于此数时 λ 冻结：真机上前台一退，PMU 只剩
+/// 39 条系统线程（surfaceflinger / binder），它们的分布不代表受管负载，
+/// 拿它推配额会把唯一的 hp 核分配到 24%、误差顶到 88%，前台一回来又跳回 2%
+const MIN_SAMPLES: usize = 64;
+/// 相对上一窗口的骤降比例。样本掉到三成以下按「换了一个负载场景」处理，
+/// 此时旧 λ 对应的是另一批线程，继续迭代等于用前台的解去套后台
+const SAMPLE_DROP: f64 = 0.3;
 
 /// 一层核的静态属性。层序：e_core → p_core → hp_core（低性能在前）
 #[derive(Clone, Debug)]
@@ -99,6 +106,8 @@ struct Lambda {
     gamma: f64,
     /// 累计推进轮数（展示用）
     rounds: u64,
+    /// 上一窗口的活跃样本数。用于识别「样本骤降」，见 `SAMPLE_DROP`
+    last_n: usize,
     congestion: Congestion,
 }
 
@@ -114,7 +123,7 @@ struct Feat {
 
 #[derive(Clone, Debug, Default)]
 pub struct LambdaPlan {
-    /// 状态：「未启用」/「层数不足」/「收敛中」/「已收敛」
+    /// 状态：「未启用」/「层数不足」/「样本不足」/「收敛中」/「已收敛」
     pub state: &'static str,
     pub tiers: Vec<TierInfo>,
     pub lambda: Vec<f64>,
@@ -187,6 +196,16 @@ pub fn snapshot() -> Option<LambdaPlan> {
     lock_ignore_poison(&PLAN).clone()
 }
 
+/// 本窗口是否应当冻结 λ。两条独立触发：
+///
+/// 1. 绝对下限：样本数本身不足以摊到三层；
+/// 2. 相对骤降：样本掉到上一窗口的三成以下，说明前台退到后台、换了一批
+///    线程，旧 λ 对应的是另一个场景。只冻结一个窗口——下一窗口若持平，
+///    说明这就是新的稳态，继续迭代是对的
+fn too_small(n: usize, prev_n: usize) -> bool {
+    n < MIN_SAMPLES || (prev_n >= MIN_SAMPLES && (n as f64) < prev_n as f64 * SAMPLE_DROP)
+}
+
 /// 某条线程的建议层。无建议、或层数不足、或已清空时返回 None
 pub fn hint(tid: i32) -> Option<Hint> {
     lock_ignore_poison(&HINTS)
@@ -219,6 +238,7 @@ pub fn update(samples: &[Sample], topo: &CpuTopology) {
             lambda: vec![1.0; tiers.len()],
             gamma: 1.0,
             rounds: 0,
+            last_n: 0,
             congestion: Congestion {
                 cone: 1.0,
                 ..Default::default()
@@ -240,8 +260,38 @@ pub fn update(samples: &[Sample], topo: &CpuTopology) {
         // 全是空闲线程：与「没有活跃线程」同一处理，保持 λ 不动
         return;
     }
+    let n = feats.len();
     let (_assign, s) = lm.solve(&feats);
-    let err = lm.advance(&s, feats.len());
+
+    // 小样本保护：前台退到后台不是「负载变小」，是「换了一批线程」。
+    // 39 条系统线程里 surfaceflinger/binder 占大半，它们的分布会把唯一的
+    // hp 核推到 24%、误差顶到 88%，再在前台回来时跳回 2%——这个结论对
+    // 受管应用没有任何意义，继续拿它推 λ 只会污染下一次真实窗口的起点
+    let prev_n = lm.last_n;
+    let small = too_small(n, prev_n);
+    lm.last_n = n;
+    if small {
+        let err = lm.rel_err(&s);
+        let plan = LambdaPlan {
+            state: "样本不足",
+            tiers: lm.tiers.clone(),
+            lambda: lm.lambda.clone(),
+            share: s,
+            cap_share: cap_share(&lm.tiers),
+            err,
+            gamma: lm.gamma,
+            rounds: lm.rounds,
+            threads: n,
+            picks: Vec::new(),
+        };
+        drop(guard);
+        // 冻结期间不给建议：hint 来自旧 λ，拿去裁决只会刷出假的「超出规则集合」
+        *lock_ignore_poison(&HINTS) = None;
+        *lock_ignore_poison(&PLAN) = Some(plan);
+        return;
+    }
+
+    let err = lm.advance(&s, n);
 
     // 最终 λ 下的每线程建议。展示用 argmax：pick_tier 每轮重采样会让同一
     // 线程在两轮之间跳层，面板上看着像统计坏了（上游只在真正绑核时才需要采样）
@@ -299,6 +349,15 @@ impl Lambda {
 
     fn eta(&self, _r: usize) -> f64 {
         ETA_TIER
+    }
+
+    /// 分配占比与容量的最大相对误差。收敛判定、日志与面板共用这一个式子，
+    /// 小样本冻结时也要靠它展示「此刻偏了多少」，所以单独抽出来
+    fn rel_err(&self, s: &[f64]) -> f64 {
+        self.tiers.iter().zip(s).fold(0.0f64, |acc, (t, &v)| {
+            let cap = t.rho.max(FLOAT_EPS);
+            acc.max((v - cap).abs() / cap)
+        })
     }
 
     /// 迭代一次 λ。上游原式：`λ = max(0, λ + γ·η·err)`，没有单步限幅，
@@ -394,14 +453,7 @@ impl Lambda {
     /// 用 solve 的累积量推进 λ 与 gamma，返回最大相对误差
     fn advance(&mut self, s: &[f64], n_threads: usize) -> f64 {
         // 误差统计（先算，供 boost 使用）
-        let mut max_rel = 0.0f64;
-        for kk in 0..self.tiers.len() {
-            let cap = self.capacity(kk).max(FLOAT_EPS);
-            let rel = (s[kk] - cap).abs() / cap;
-            if rel > max_rel {
-                max_rel = rel;
-            }
-        }
+        let max_rel = self.rel_err(s);
 
         // 拥塞感知阻尼：系统变化剧烈时压低学习率。
         // 缺失时 γ 峰值达 8（误差 26 时单步 Δλ≈21）→ 必然过冲，
@@ -665,6 +717,7 @@ mod tests {
             lambda: vec![1.0; tiers.len()],
             gamma: 1.0,
             rounds: 0,
+            last_n: 0,
             congestion: Congestion {
                 cone: 1.0,
                 ..Default::default()
@@ -913,5 +966,85 @@ mod tests {
         // 顶层保持原样，不被扩到全核
         let t1 = lm.tier_target(1, &topo, 2);
         assert_eq!(t1.count(), 2, "最高层不参与 min_cpus 扩容");
+    }
+
+    /// 真机上的两组数字：前台在时 400-900，退到后台剩 39
+    #[test]
+    fn small_windows_are_detected() {
+        // 绝对下限
+        assert!(too_small(39, 0), "首窗就 39 条必须冻结");
+        assert!(too_small(39, 39), "持续 39 条仍然冻结");
+        assert!(too_small(63, 900), "不到 64 条一律冻结");
+        // 骤降：900 → 39 是前台退出，不是「负载变小」
+        assert!(too_small(39, 900), "掉到 4% 必须冻结");
+        assert!(too_small(157, 848), "掉到 18% 按换场景处理");
+        // 持平与回升都不能冻
+        assert!(!too_small(900, 900), "持平应继续迭代");
+        assert!(!too_small(462, 159), "样本回升应继续迭代");
+        assert!(!too_small(200, 500), "掉到 40% 仍算同一场景");
+    }
+
+    /// 冻结只发生一个窗口：量级持平后必须恢复迭代，否则 λ 会永远停在旧值
+    #[test]
+    fn small_window_freezes_only_one_round() {
+        let mut prev = 900usize;
+        let mut n = 39usize;
+        assert!(too_small(n, prev));
+        prev = n; // 第二窗口同样 39 条
+        assert!(too_small(n, prev), "39 条低于绝对下限，继续冻结");
+        // 前台回来
+        n = 320;
+        assert!(!too_small(n, prev), "样本回升后必须恢复");
+    }
+
+    /// 整条路径：39 条系统线程的窗口必须报「样本不足」且不递 hint，
+    /// 否则裁决层会拿旧 λ 生成一批假的「超出规则集合」
+    #[test]
+    fn tiny_window_publishes_sample_shortage() {
+        clear();
+        let mut topo = CpuTopology::empty();
+        topo.all_tiers = vec![
+            {
+                let mut s = CpuSet::new();
+                for c in 0..4 {
+                    s.set(c);
+                }
+                s
+            },
+            {
+                let mut s = CpuSet::new();
+                for c in 4..7 {
+                    s.set(c);
+                }
+                s
+            },
+            {
+                let mut s = CpuSet::new();
+                s.set(7);
+                s
+            },
+        ];
+        if build_tiers(&topo).len() < 2 {
+            return; // 容器里读不到在线核时退化，跳过
+        }
+        let samples: Vec<Sample> = (0..39)
+            .map(|i| Sample {
+                tid: 1000 + i,
+                pkg: "com.a".into(),
+                comm: "surfaceflinger".into(),
+                inst: 100,
+                cycles: 200,
+                misses: Some(1),
+                cpu_ns: None,
+                window_ms: 5_000,
+            })
+            .collect();
+        update(&samples, &topo);
+        let plan = snapshot().expect("应发布计划");
+        assert_eq!(plan.state, "样本不足");
+        assert_eq!(plan.threads, 39);
+        assert!(plan.picks.is_empty(), "冻结时不给建议");
+        assert!(hint(1000).is_none(), "hint 必须清空");
+        clear();
     }
 }

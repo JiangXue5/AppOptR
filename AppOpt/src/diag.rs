@@ -28,6 +28,9 @@ use crate::sched::{SKIP_ALLOW, SKIP_LABELS, SKIP_ROLE, SchedSnapshot};
 
 /// 事件环上限。比 S7 的 8 条更宽一点，够看清一次抖动的前后因果
 const EVENT_CAP: usize = 12;
+/// 失败样本上限。事件环只有 12 条，几轮周期摘要就能把失败明细挤掉；
+/// 面板要能回答「哪条线程、想绑哪、为什么被拒」，必须单独留一份
+const FAIL_CAP: usize = 12;
 /// 失败日志最小间隔，避免一个必然失败的线程每秒刷屏
 const FAIL_LOG_GAP: Duration = Duration::from_secs(5);
 /// 同一线程的同一 errno 单独节流。「线程在后台组、目标在大核」是持续状态，
@@ -226,9 +229,37 @@ struct Samples {
     ineffective: Vec<Drift>,
 }
 
+/// 一条线程最近一次绑核失败。统计数只能回答「失败几次」，用户真正要的是
+/// 「哪条线程、想绑到哪、为什么被拒」——尤其是 EINVAL，光看数字无法判断是
+/// 规则写错了还是线程被系统组困住了
+#[derive(Clone)]
+struct FailSample {
+    tid: i32,
+    comm: String,
+    /// 期望的掩码，已格式化成 `4-6` 这种区间
+    want: String,
+    errno: i32,
+    /// 组限制的具体说明（仅 EINVAL 且能读到 cgroup 时非空）
+    note: String,
+    at: Instant,
+}
+
+/// 给面板用的失败样本：`Instant` 换成「多少秒前」，前端不必处理时钟
+#[derive(Clone)]
+pub struct FailView {
+    pub tid: i32,
+    pub comm: String,
+    pub want: String,
+    pub errno: i32,
+    pub note: String,
+    pub age: u64,
+}
+
 struct Sink {
     stats: AffinityStats,
     events: VecDeque<String>,
+    /// 最近失败明细，按 (tid, errno) 去重，最新的在队尾
+    fails: VecDeque<FailSample>,
     last_fail_log: Option<(i32, Instant)>,
     /// 每条线程各自的最近一次失败播报，避免持续失败刷屏
     fail_tid: HashMap<(i32, i32), Instant>,
@@ -279,6 +310,7 @@ fn sink() -> std::sync::MutexGuard<'static, Option<Sink>> {
     guard.get_or_insert_with(|| Sink {
         stats: AffinityStats::default(),
         events: VecDeque::new(),
+        fails: VecDeque::new(),
         last_fail_log: None,
         fail_tid: HashMap::new(),
         last_jank_log: now,
@@ -408,6 +440,9 @@ pub fn note_failure(tid: i32, comm: &str, want: &CpuSet, errno: i32) {
         libc::ENOSYS => s.stats.enosys += 1,
         _ => s.stats.other += 1,
     }
+    // 明细面板的数据源。放在节流之前：面板要的是「最近发生了哪些失败」，
+    // 和日志打不打这条无关
+    let why = s.note_fail(tid, comm, want, errno);
     push_event(s, line.clone());
 
     // 两层节流：全局 5 秒一条防大面积刷屏；同一线程同一 errno 60 秒一条，
@@ -431,12 +466,49 @@ pub fn note_failure(tid: i32, comm: &str, want: &CpuSet, errno: i32) {
             .retain(|_, at| now.duration_since(*at) < FAIL_LOG_GAP_TID);
     }
     // EINVAL 里最常见的一类不是权限，而是线程所在组的生效集合与目标无交集。
-    // 只报「目标集合非法」等于没说，必须把线程被固定在哪一组写出来
-    if errno == libc::EINVAL
-        && let Some(why) = unreachable_note(tid, want)
-    {
+    // 只报「目标集合非法」等于没说，必须把线程被固定在哪一组写出来。
+    // why 在记录样本时已经算过，这里直接复用，避免再次读 /proc
+    if !why.is_empty() {
         push_event(s, why.clone());
         tag("跳过", &why);
+    }
+}
+
+impl Sink {
+    /// 更新失败明细，返回该线程现存的组限制说明（仅 EINVAL 且能读到 cgroup 时非空）。
+    ///
+    /// 同一 (tid, errno) 只留一条并刷新时间：线程被系统组困住时每一轮都会失败，
+    /// 不去重会把 12 条额度全占满，反而看不到别的线程失败。
+    /// 去重路径不重读 /proc，高频失败时开销与一次计数相当
+    fn note_fail(&mut self, tid: i32, comm: &str, want: &CpuSet, errno: i32) -> String {
+        let now = Instant::now();
+        if let Some(f) = self
+            .fails
+            .iter_mut()
+            .find(|f| f.tid == tid && f.errno == errno)
+        {
+            f.at = now;
+            f.comm = comm.to_string();
+            f.want = want.to_range_string();
+            return f.note.clone();
+        }
+        let note = if errno == libc::EINVAL {
+            unreachable_note(tid, want).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        self.fails.push_back(FailSample {
+            tid,
+            comm: comm.to_string(),
+            want: want.to_range_string(),
+            errno,
+            note: note.clone(),
+            at: now,
+        });
+        while self.fails.len() > FAIL_CAP {
+            self.fails.pop_front();
+        }
+        note
     }
 }
 
@@ -1870,18 +1942,38 @@ pub struct Snapshot {
     /// 最近一轮同步的分布。周期摘要会把 `s.tally` 取走用于打印，
     /// 这里读的是另存的一份，Web 随时能回答「缓存里到底有多少受管线程」
     pub(crate) tally: Option<SyncTally>,
+    /// 最近的绑核失败明细，最新的在前。计数只说明「错了几次」，
+    /// 判断「为什么错」要靠它
+    pub fails: Vec<FailView>,
 }
 
 pub fn snapshot() -> Snapshot {
     let mut guard = sink();
-    let (aff, events) = match guard.as_mut() {
-        Some(s) => (s.stats.clone(), s.events.iter().cloned().collect()),
-        None => (AffinityStats::default(), Vec::new()),
+    let now = Instant::now();
+    let (aff, events, fails) = match guard.as_mut() {
+        Some(s) => (
+            s.stats.clone(),
+            s.events.iter().cloned().collect(),
+            s.fails
+                .iter()
+                .rev()
+                .map(|f| FailView {
+                    tid: f.tid,
+                    comm: f.comm.clone(),
+                    want: f.want.clone(),
+                    errno: f.errno,
+                    note: f.note.clone(),
+                    age: now.duration_since(f.at).as_secs(),
+                })
+                .collect(),
+        ),
+        None => (AffinityStats::default(), Vec::new(), Vec::new()),
     };
     Snapshot {
         aff,
         tally: managed_now(),
         events,
+        fails,
         threads: lock_ignore_poison(&THREADS).clone(),
         jank: lock_ignore_poison(&JANK).clone(),
         pressure: cpu_pressure(),
@@ -1930,6 +2022,22 @@ mod tests {
         assert_eq!(after.failed - before.failed, 2);
         assert_eq!(after.einval - before.einval, 1);
         assert_eq!(after.eperm - before.eperm, 1);
+    }
+
+    #[test]
+    fn fail_samples_keep_one_row_per_thread_and_errno() {
+        let set = set_of(&[4, 5, 6]);
+        note_failure(999_998, "ProbeThread", &set, libc::ENOSYS);
+        note_failure(999_998, "ProbeThread", &set, libc::ENOSYS);
+        // 失败样本是全局的，别的测试也会写；只断言自己这条的去重结果
+        let mine: Vec<_> = snapshot()
+            .fails
+            .into_iter()
+            .filter(|f| f.tid == 999_998)
+            .collect();
+        assert_eq!(mine.len(), 1, "同一线程同一 errno 只留一条");
+        assert_eq!(mine[0].want, "4-6");
+        assert_eq!(mine[0].comm, "ProbeThread");
     }
 
     #[test]
@@ -2092,6 +2200,7 @@ mod tests {
                 comm: "RenderThread".into(),
                 applied: true,
                 group: crate::cpuset::SysGroup::Unknown,
+                group_eff: None,
                 blocked: false,
                 source: crate::policy::PolicySource::UserRule,
             },

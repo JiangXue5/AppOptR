@@ -12,6 +12,10 @@ Release，包自然也没有——两个平台手工点两次，迟早漏一个�
 
 幂等：Release 已存在就复用，附件已存在就跳过，缺哪个补哪个。
 令牌从 ~/.git-credentials 读（Gitee 那条是 32 位私人令牌，GitHub 那条是 PAT）。
+
+发完包会顺手写 modules_update/AppOpt.json 与 changelog.md（KernelSU/Magisk 的
+更新检查就吃这两个文件），记得把它们提交到 master —— module.prop 的 updateJson
+指向的就是 Gitee master 上的 raw 地址。
 """
 
 from __future__ import annotations
@@ -217,6 +221,55 @@ def release_gitee(version: str, token: str, files: list[str], dry: bool) -> str:
     return f"https://gitee.com/{GITEE_REPO}/releases/tag/{tag}"
 
 
+def module_meta() -> tuple[str, int]:
+    """从 module/module.prop 读 version / versionCode。
+
+    不采信命令行给的版本号：设备上比的就是 module.prop 里的 versionCode，
+    两者不一致时更新提示要么不出现、要么反复出现。
+    """
+    text = open(os.path.join(ROOT, "module", "module.prop"), encoding="utf-8").read()
+    ver = re.search(r"^version=(.+)$", text, re.M)
+    code = re.search(r"^versionCode=(\d+)$", text, re.M)
+    if not ver or not code:
+        sys.exit("module/module.prop 里没有 version / versionCode")
+    return ver.group(1).strip(), int(code.group(1))
+
+
+def write_update_json(version: str, files: list[str], dry: bool) -> None:
+    """写 modules_update/AppOpt.json 与 changelog.md。
+
+    KernelSU / Magisk 的更新接口只接受一个 zipUrl，这里固定给 arm64 包：
+    x86 是模拟器，本来也不靠管理器更新。changelog 用 raw 链接，
+    管理器会直接展示正文。
+    """
+    arm = [f for f in files if "arm64" in os.path.basename(f)]
+    if not arm:
+        print("没有 arm64 包，跳过 update.json")
+        return
+    name = os.path.basename(arm[0])
+    url = f"https://gitee.com/{GITEE_REPO}/releases/download/v{version}/{name}"
+    prop_ver, code = module_meta()
+    if prop_ver != version:
+        print(f"! module.prop 里是 {prop_ver}，命令行是 {version}，更新检查会按 {prop_ver} 比较")
+    data = {
+        "version": prop_ver,
+        "versionCode": code,
+        "zipUrl": url,
+        "changelog": f"https://gitee.com/{GITEE_REPO}/raw/master/modules_update/changelog.md",
+    }
+    out = os.path.join(ROOT, "modules_update")
+    if dry:
+        print(f"[dry] 写 modules_update/AppOpt.json -> {prop_ver} ({code})")
+        return
+    os.makedirs(out, exist_ok=True)
+    with open(os.path.join(out, "AppOpt.json"), "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+    with open(os.path.join(out, "changelog.md"), "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(changelog_section(prop_ver).rstrip() + "\n")
+    print(f"  已写 modules_update/AppOpt.json（{prop_ver} / {code}）")
+    print("  记得把 modules_update/ 提交到 master，否则设备看到的最新版还是旧的")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="双平台发包")
     ap.add_argument("version", help="形如 2.7.0-beta24，不带 v")
@@ -241,6 +294,8 @@ def main() -> None:
             sys.exit("没有 Gitee 令牌：设 GITEE_TOKEN，或写进 ~/.git-credentials")
         print("Gitee:")
         print("  " + release_gitee(version, creds["gitee"], files, args.dry_run))
+        # 只在 Gitee 发了（或双发）时写：zipUrl 指向 Gitee 的 Release 附件
+        write_update_json(version, files, args.dry_run)
 
 
 if __name__ == "__main__":

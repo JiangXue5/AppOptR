@@ -2461,4 +2461,40 @@ mod tests {
         assert!(e.is_exempt("com.b"));
         assert!(!e.is_exempt("com.c"));
     }
+
+    /// 仓库自带的默认规则必须能完整解析：这是新装用户看到的第一个配置，
+    /// 写坏了只会在真机上表现成「模块没反应」，本地没人会去点开看。
+    /// 同时钉住游戏包级兜底指向 p-core——真机上「小核挤满、中核空转」
+    /// 的修法就在这里，改回去要有测试拦一下
+    #[test]
+    fn bundled_default_rules_parse() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../module/applist.conf");
+        let t = topo_of(&[0, 1, 2, 3], &[4, 5, 6], &[7]);
+        let mut mtime = -1i64;
+        let cfg = load_config(path, &t, &mut mtime).expect("默认规则应能加载");
+        assert!(
+            cfg.rules.len() >= 40,
+            "规则条数明显偏少：{}",
+            cfg.rules.len()
+        );
+        for pkg in [
+            "com.tencent.tmgp.sgame",
+            "com.tencent.tmgp.pubgmhd",
+            "com.miHoYo.Yuanshen",
+            "com.netease.dwrg",
+            "com.tencent.jkchess",
+        ] {
+            let got = crate::rule_match::thread_affinity(pkg, "", &cfg)
+                .unwrap_or_else(|| panic!("{pkg} 应命中包级规则"));
+            assert_eq!(
+                got.cpus,
+                set(&[4, 5, 6]),
+                "{pkg} 包级兜底应落在 p-core（4-6），实得 {}",
+                got.cpus.to_range_string()
+            );
+        }
+        // 微信仍走跨簇：IM 场景下轻线程下放小核是省电的，不该跟着游戏一起改
+        let mm = crate::rule_match::thread_affinity("com.tencent.mm", "", &cfg).unwrap();
+        assert_eq!(mm.cpus, set(&[0, 1, 2, 3, 4, 5, 6]));
+    }
 }

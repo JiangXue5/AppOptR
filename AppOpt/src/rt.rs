@@ -815,6 +815,7 @@ mod tests {
             comm: comm.to_string(),
             applied: true,
             group: crate::cpuset::SysGroup::Unknown,
+            group_eff: None,
             blocked: false,
             source: crate::policy::PolicySource::UserRule,
         }

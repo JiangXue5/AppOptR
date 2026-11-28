@@ -1,4 +1,12 @@
 SKIPUNZIP=0
+
+# KernelSU 1.1+ 的热安装：模块文件当场替换，不必重启设备。
+# 但热安装不会执行 service.sh，内存里还是旧二进制，所以指定一个脚本在安装
+# 完成后跑一次，由它停掉旧进程、用新二进制重启守护进程（见 hotinstall.sh）。
+# 不支持热安装的版本（老 KernelSU / APatch / Magisk）会忽略这两个变量，
+# 退回原来的「重启后生效」，此时可用模块页的「操作」按钮手动重启守护进程。
+export MODULE_HOT_INSTALL_REQUEST=true
+export MODULE_HOT_RUN_SCRIPT=hotinstall.sh
 check_magisk_version() {
 	ui_print "- Magisk version: $MAGISK_VER_CODE"
 	ui_print "- Module version: $(grep_prop version "${TMPDIR}/module.prop")"
@@ -129,6 +137,7 @@ module_instructions() {
 	ui_print "/data/adb/modules/AppOpt/applist.conf"
 	ui_print "------------------------------------------"
 	ui_print "修改与添加规则无需重启，即时生效"
+	ui_print "更新模块后由热安装自动重启守护进程，同样无需重启设备"
 	ui_print "********************************************"
 	cores=$(for cpus in /sys/devices/system/cpu/cpufreq/*/related_cpus; do 
 		[ -f "$cpus" ] && cat "$cpus" | wc -w

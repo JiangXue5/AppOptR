@@ -224,6 +224,7 @@ fn judge(
     now: Instant,
     placed: &[u16; 3],
     mode: SchedMode,
+    group_eff: Option<&CpuSet>,
 ) -> Action {
     if base < 0 {
         return Action::Skip(SKIP_SAMPLE);
@@ -282,6 +283,16 @@ fn judge(
         st.clear_streak();
         return Action::Skip(SKIP_LOAD);
     };
+    // 目标簇必须完整落在所属组的生效集合内。`entry.blocked` 是按「规则目标」
+    // 算的，S7 这里换成了另一个集合：/background(0-3) 的线程被选中 p-core(4-6)、
+    // 或 /top-app/other(0-6) 被选中 hp-core(7)，写下去都是 EINVAL。
+    // 只取交集不行——那等于把小簇改大/改小，回读会判 Stray 再算一次失败
+    if let Some(ge) = group_eff
+        && !cpus.subset_of(ge)
+    {
+        st.clear_streak();
+        return Action::Skip(SKIP_GROUP);
+    }
     st.clear_streak();
     if mode == SchedMode::On {
         Action::Move { target, cpus }
@@ -597,13 +608,19 @@ impl SchedState {
                     }
                 }
                 self.moved += 1;
+                // `from` 为 None = 这条线程此前跨簇、没有固定落点，不是采样失败。
+                // 早先这里打 -1，前半句说「规则集合」、后半句给 -1‰，读日志的人
+                // 只会以为负载没读到（真机上每行都是这样）
+                let from_load = from
+                    .map(|c| format!("{}‰", self.load[c as usize]))
+                    .unwrap_or_else(|| "—".to_string());
                 let mut line = format!(
-                    "S7: {}({}) {} → {}（{}‰ → {}‰）",
+                    "S7: {}({}) {} → {}（{} → {}‰）",
                     m.comm,
                     m.tid,
                     from.map(cluster_label).unwrap_or("规则集合"),
                     cluster_label(m.target),
-                    from.map(|c| self.load[c as usize]).unwrap_or(-1),
+                    from_load,
                     self.load[m.target as usize]
                 );
                 // 回读比目标小时把实际集合写进同一行：读者看到「迁到了大核」
@@ -808,7 +825,18 @@ impl SchedState {
                     } else {
                         weighted_avg(&load, &allow, &cfg.topo)
                     };
-                    judge(st, &home, &allow, load, base, &cfg.topo, now, &placed, mode)
+                    judge(
+                        st,
+                        &home,
+                        &allow,
+                        load,
+                        base,
+                        &cfg.topo,
+                        now,
+                        &placed,
+                        mode,
+                        entry.group_eff.as_ref(),
+                    )
                 }
             };
 
@@ -1234,6 +1262,7 @@ mod tests {
             comm: comm.to_string(),
             applied: true,
             group: crate::cpuset::SysGroup::Unknown,
+            group_eff: None,
             blocked: false,
             source: crate::policy::PolicySource::UserRule,
         }
@@ -1457,6 +1486,42 @@ mod tests {
         assert_eq!(mv[0].cpus.to_range_string(), "7");
     }
 
+    /// 目标簇必须完整落在所属组的生效集合内。真机上 `/background(0-3)` 的线程
+    /// 被选中 p-core(4-6) 后写 EINVAL，就是因为这里只看 `blocked`（按规则目标算），
+    /// 换了新目标却没重新求交
+    #[test]
+    fn group_effective_blocks_out_of_range_target() {
+        let (cfg, mut cache) = span_cache("grp_range");
+        let t = topo();
+        // 线程在 background 组，生效集合只有小核
+        cache.tasks.get_mut(&1001).unwrap().group_eff = Some(t.e_core);
+        let mut st = state_for(&cache, SchedMode::On);
+        let now = Instant::now();
+        // hp 负载最低，模型本来会把它迁到 7
+        for _ in 0..4 {
+            assert!(
+                st.tick_at(&cfg, &cache, [-1, 600, 100], now).is_empty(),
+                "0-3 组不能迁到 7"
+            );
+        }
+        assert_eq!(st.moved, 0);
+        assert!(st.skip[SKIP_GROUP] > 0, "应计入组限制而不是负载判据");
+    }
+
+    /// 组允许时不能误拦：生效集合覆盖目标簇就该照常迁
+    #[test]
+    fn group_effective_allows_in_range_target() {
+        let (cfg, mut cache) = span_cache("grp_ok");
+        let t = topo();
+        cache.tasks.get_mut(&1001).unwrap().group_eff = Some(t.present_cpus);
+        let mut st = state_for(&cache, SchedMode::On);
+        let now = Instant::now();
+        for _ in 0..3 {
+            st.tick_at(&cfg, &cache, [-1, 600, 100], now);
+        }
+        assert_eq!(st.skip[SKIP_GROUP], 0, "组允许时不该记组限制");
+    }
+
     #[test]
     fn shadow_counts_would_once() {
         let cfg = cfg_with("shadow", "com.test.game=p-core,hp-core\n");
@@ -1656,6 +1721,7 @@ mod tests {
                 comm: "Thread-7".to_string(),
                 applied: true,
                 group: crate::cpuset::SysGroup::Unknown,
+                group_eff: None,
                 blocked: false,
                 source: crate::policy::PolicySource::UserRule,
             },
@@ -1790,7 +1856,8 @@ mod tests {
                 &t,
                 now,
                 &placed,
-                SchedMode::On
+                SchedMode::On,
+                None
             ),
             Action::Nothing
         ));
@@ -1807,7 +1874,8 @@ mod tests {
                 &t,
                 now,
                 &placed,
-                SchedMode::On
+                SchedMode::On,
+                None
             ),
             Action::Nothing
         ));
@@ -1953,6 +2021,7 @@ mod tests {
                 comm: "Thread-8".into(),
                 applied: true,
                 group: crate::cpuset::SysGroup::Unknown,
+                group_eff: None,
                 blocked: false,
                 source: crate::policy::PolicySource::UserRule,
             },

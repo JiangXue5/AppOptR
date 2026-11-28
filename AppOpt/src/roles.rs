@@ -56,6 +56,14 @@ const LATENCY_PREFIX: &[&str] = &[
     // V8 的编译/GC 线程池。迁走会让 JS 侧下次编译落在小核
     "V8 DefaultWorke",
     "SurfaceFlinger",
+    // SystemUI 主线程。comm 被截到 15 字节后是 `ndroid.systemui`（`com.android.sys`
+    // 是另一种截法，老 ROM 会这样），两种都收。它不在表里时会落到 Unknown：
+    // S7 每轮记一次「未识别」，真机上 25 分钟刷了 480 次，长期占住 top5 名额，
+    // 把真正该补命名的 `lu_worker.*` 挤掉；而且一旦哪天被误判成 Worker 迁走，
+    // 状态栏与下拉面板会直接掉帧。归 Latency 而不是 Critical：两者都不迁，
+    // 但 Critical 会被 RT 提升，把 SystemUI 主线程提成 RT 会抢占前台渲染
+    "ndroid.systemui",
+    "com.android.sys",
 ];
 
 /// 前缀表：这类名字带序号，精确比较覆盖不到
@@ -166,6 +174,16 @@ mod tests {
         assert_eq!(role_of("GLThread"), Role::Latency);
         assert_eq!(role_of("VkThread"), Role::Latency);
         assert_eq!(role_of("TfLite"), Role::Latency);
+    }
+
+    /// SystemUI 主线程的两种截断名都要认：不认识时 S7 每轮记一次未识别
+    #[test]
+    fn systemui_main_is_known_and_immovable() {
+        for n in ["ndroid.systemui", "com.android.sys"] {
+            assert_eq!(role_of(n), Role::Latency, "{n}");
+            assert!(!role_of(n).movable(), "{n} 不能被 S7 迁走");
+            assert!(!role_of(n).rt_candidate(), "{n} 不该被 RT 提升");
+        }
     }
 
     #[test]

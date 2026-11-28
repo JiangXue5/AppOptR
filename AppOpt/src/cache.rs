@@ -24,6 +24,11 @@ pub struct TaskEntry {
     /// 线程所在的系统 cpuset 组。系统改组配置时会重置组内所有线程的亲和性，
     /// 只有接管到自己组里才不受影响
     pub group: SysGroup,
+    /// 线程所在组的生效集合。`blocked` 只说明「规则目标」写不进去，
+    /// S7 换簇时选的是另一个集合，必须拿这一份重新求交：真机上
+    /// `/background(0-3)` 的线程被 S7 选中 p-core(4-6) 后写 EINVAL，
+    /// 就是因为只看 `blocked` 看不到这个新目标越界。None = 组不限制
+    pub group_eff: Option<CpuSet>,
     /// 目标集合与所在组的生效集合没有交集：写 cpuset 与 sched_setaffinity
     /// 都会被内核拒绝，继续尝试只会产生无效迁移
     pub blocked: bool,
@@ -313,6 +318,13 @@ impl ProcCache {
             path.as_deref()
                 .and_then(crate::cpuset::group_effective_cached)
         };
+        // 组生效集合留一份给 S7：它在 `decide` 里另选簇，不能只靠 `blocked`
+        // （那是按规则目标算的）。空串解析成空集会让所有迁移被误判成越界，
+        // 所以 count==0 一律当「组不限制」
+        let group_eff = eff
+            .as_deref()
+            .map(|s| crate::cpuset::parse_cpu_ranges(s, None))
+            .filter(|s| s.count() > 0);
         // 规则变了（同一条目却算出不同集合）就丢掉旧的 S7 落点：
         // 事件重放或重扫可能在 purge 之前撞上同一个 tid
         if prev.is_some_and(|old| old.want != result.cpus) {
@@ -401,6 +413,7 @@ impl ProcCache {
                     comm: comm.to_string(),
                     applied: false,
                     group,
+                    group_eff,
                     blocked: true,
                     source: target.source,
                 },
@@ -455,6 +468,7 @@ impl ProcCache {
                 comm: comm.to_string(),
                 applied,
                 group,
+                group_eff,
                 blocked: false,
                 source: target.source,
             },
@@ -802,6 +816,7 @@ mod tests {
                 comm: "own-test".into(),
                 applied: true,
                 group: SysGroup::Own,
+                group_eff: None,
                 blocked: false,
                 source: PolicySource::UserRule,
             },
@@ -880,6 +895,7 @@ mod tests {
             comm: "T".into(),
             applied: true,
             group: SysGroup::TopApp,
+            group_eff: None,
             blocked: false,
             source: PolicySource::UserRule,
         };

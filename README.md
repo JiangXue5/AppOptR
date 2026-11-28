@@ -124,6 +124,48 @@ python3 tools/release.py <版本> --dry-run  # 先看要做什么
 读不到再回落到 `~/.git-credentials`。
 
 
+### 更新模块（不用重启设备）
+
+模块更新传统上要重启一次才生效：新文件已经躺在 `/data/adb/modules/AppOpt`，
+但内存里跑的还是旧二进制。现在有两条路都不用重启。
+
+**1. KernelSU 热安装（自动）**：`customize.sh` 里设了
+
+```sh
+export MODULE_HOT_INSTALL_REQUEST=true
+export MODULE_HOT_RUN_SCRIPT=hotinstall.sh
+```
+
+装了支持热安装的 **KernelSU（v1.1 起）**，刷入更新包后模块文件当场替换，
+`hotinstall.sh` 随即被调用：停掉旧进程（`AppOpt` 用 flock 做单实例锁，旧进程没退
+干净新进程会静默退出）、用新二进制重启，几秒内面板就是新版本。安装日志里会写
+明这次是热安装还是仍需重启，一看便知。
+
+安装器最多等脚本 30 秒，所以守护进程是 `nohup ... &` 丢到后台起的，脚本自己只
+等到「pid 还活着」就返回。
+
+**2. 「操作」按钮（手动兜底）**：不支持热安装的版本（老 KernelSU、APatch、
+Magisk）会忽略上面两个变量，仍按老规矩「重启后生效」。这时到管理器里点模块的
+**操作** 按钮，`action.sh` 会做同一件事，同样不用重启设备。
+
+脚本分工：
+
+| 文件 | 作用 |
+|------|------|
+| `daemon.sh` | 启停与就绪判断（`/proc/*/comm` 找 pid、TERM→KILL 升级、日志轮转、权限兜底），三处共用 |
+| `service.sh` | 开机拉起；发现已在跑就跳过，避免和热安装抢 |
+| `hotinstall.sh` | 热安装后回调：停旧进程 → 起新进程 |
+| `action.sh` | 管理器「操作」按钮：同上，输出显示在管理器里 |
+
+包内 `*.sh` 打包时统一 `chmod 0755`，否则热安装直接 exec 会报 Permission denied。
+面板地址不变（`http://127.0.0.1:8889`），刷新即可。
+
+`update.json` 由 `tools/release.py` 在发版后生成（`modules_update/AppOpt.json` +
+`changelog.md`），供管理器检查更新；`module.prop` 的 `updateJson` 指向 Gitee
+raw 的 master 分支，所以**发完版记得把 `modules_update/` 这两个文件提交到 master**，
+否则设备上看到的最新版还是旧的。
+
+
 ### 规则文件指令
 
 规则文件与规则行同级的指令行以 `@` 开头，目前支持：
@@ -199,6 +241,26 @@ com.example.game {
 `补写组归属 N 次`。有就说明线程原先只绑了掩码、没进 `AppOpt` 组，系统每次
 进程状态变化都会把它重置；补组后这个数字应在一个周期内归零。若持续不为零，
 检查 `@group` 是否被设成 `mask`。
+
+### 小核挤满、中核空转怎么调
+
+日志或面板里出现「配额 … 实际 e78 p11 hp12，p-core 偏空 26 个点」时，说明受管
+线程大多落在小核。**这不是 S7 或 λmod 失效**：S7 只能在规则允许的簇之间换，
+λmod 默认只算不执行（`@lambda` 未开，或验收闸门未过）。
+
+根因通常在规则写法：
+
+| 写法 | 效果 |
+|------|------|
+| `com.example.game=e-core,p-core` | 线程可在 0-6 内自由落点，内核倾向填小核省电 |
+| `com.example.game=p-core` | 普通线程全部落在 4-6，小核只留给系统与后台 |
+| `com.example.game { MainThread=hp-core }` | 只有列出的线程被钉住，未列出的走 `@unmatched` |
+
+默认规则里游戏包的包级兜底已改成 `p-core`；微信、QQ 这类 IM 仍保持
+`e-core,p-core`——它们的轻线程下放小核是省电的，不该跟游戏一起改。
+升级时老用户的 `applist.conf` 会被保留，要同样效果就手动改包级集合。
+
+代价是普通线程不再有机会落到小核，轻载功耗会略升。只在游戏包上这么写。
 
 
 ### 内核调参（可选）

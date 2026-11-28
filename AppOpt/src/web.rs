@@ -1233,6 +1233,16 @@ fn diag_json() -> String {
             "sched": d.aff.sched,
             "line": diag::affinity_line(&d.aff),
             "errno_line": d.aff.errno_line(),
+            // 最近失败明细：面板上点开「无效参数 2」要能直接看到是哪条线程、
+            // 目标掩码和原因，而不是让人去翻日志
+            "fails": d.fails.iter().map(|f| json!({
+                "tid": f.tid,
+                "comm": f.comm,
+                "want": f.want,
+                "errno": f.errno,
+                "note": f.note,
+                "age": f.age,
+            })).collect::<Vec<_>>(),
             // 0 未尝试（/proc 模式）、1 已挂 kprobe、2 不可用
             "affinity_probe": crate::ebpf_mode::AFFINITY_PROBE.load(std::sync::atomic::Ordering::Relaxed),
         },

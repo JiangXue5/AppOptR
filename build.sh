@@ -221,7 +221,12 @@ package() {
 	# 模块脚本与配置保持原样，不做任何改写
 	cp "$ROOT/module/module.prop" "$ROOT/module/applist.conf" \
 		"$ROOT/module/applist.asoulopt.conf" \
-		"$ROOT/module/customize.sh" "$ROOT/module/service.sh" "$stage/"
+		"$ROOT/module/customize.sh" "$ROOT/module/service.sh" \
+		"$ROOT/module/daemon.sh" "$ROOT/module/hotinstall.sh" "$ROOT/module/action.sh" \
+		"$stage/"
+	# 脚本必须可执行：hotinstall.sh 由 KernelSU 热安装直接 exec，
+	# action.sh 由管理器的「操作」按钮直接 exec，0644 会在设备上报 Permission denied
+	chmod 0755 "$stage"/*.sh
 	cp -r "$ROOT/module/META-INF" "$stage/"
 	cp "$ROOT/web/index.html" "$stage/webroot/index.html"
 	cp "$BIN_USR" "$stage/bin/$abi/AppOpt"

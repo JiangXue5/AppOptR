@@ -1,5 +1,63 @@
 # AppOptR 变更记录
 
+## 2.7.0-beta39（2026-11-29）
+
+**更新模块不用再重启设备**
+
+以前刷入新包后，`/data/adb/modules/AppOpt` 里的文件已经是新的，但内存里跑的还是
+旧二进制，必须重启一次才换得过来。现在两条路都能省掉这次重启。
+
+- `customize.sh` 里 `export MODULE_HOT_INSTALL_REQUEST=true` 与
+  `MODULE_HOT_RUN_SCRIPT=hotinstall.sh`：KernelSU 1.1+ 走热安装，模块文件当场
+  替换，安装完成后回调 `hotinstall.sh`，由它停掉旧进程、用新二进制重启
+- 新增 `hotinstall.sh`：先 TERM 再 KILL，等到旧进程真的消失才启动——`AppOpt` 用
+  flock 做单实例锁，旧进程没退干净时新进程会拿到 `EWOULDBLOCK` 静默 `exit(0)`，
+  日志里只留一行「已有实例」，现象就是「更新完还是旧版本」
+- 新增 `action.sh`：管理器里的**操作**按钮。老版本 KernelSU、APatch、Magisk
+  不认热安装，装完点一下这个按钮，同样不用重启设备
+- 新增 `daemon.sh`：开机、热安装、手动重启三处共用的启停逻辑。按 `/proc/*/comm`
+  找 pid（不依赖 pidof 实现差异）、TERM→KILL 升级、日志轮转、权限兜底都在这里，
+  避免三份脚本各写一套后走样；启动后确认 pid 还活着，起不来不谎报成功
+- `service.sh` 改为调用 `daemon.sh`；发现已有实例在跑就跳过，避免和刚跑过的
+  热安装抢同一个锁
+- `build.sh` 打包时把 `*.sh` 统一 `chmod 0755`：热安装与操作按钮都是直接 exec，
+  0644 会报 Permission denied
+- `tools/release.py` 发版后生成 `modules_update/AppOpt.json` 与 `changelog.md`
+  （`versionCode` 取自 `module/module.prop`，与命令行版本不一致时会提示），供管理器的
+  更新检查使用；这两个文件仍需提交到 master，`module.prop` 的 `updateJson`
+  指向的就是那条 raw 地址
+
+限制：热安装需要 KernelSU 1.1+；`system.prop`、`sepolicy.rule` 之类由内核在启动
+阶段加载的内容，热安装本来就不生效，那部分改动仍需重启。
+
+**S7 与 λmod 的四处修正（来自 25 分钟真机日志）**
+
+- S7 迁移前校验线程所在 cpuset 组的生效集合：`/background(0-3)` 的线程被选中
+  p-core(4-6) 后写 EINVAL 的那两次失败，根因是 `blocked` 按「规则目标」算，
+  S7 换了新目标却没重新求交。现在目标簇必须是组生效集合的子集，越界记「组限制」，
+  不再产生无效 syscall
+- λmod 加小样本保护：前台退到后台后 PMU 只剩 39 条系统线程（surfaceflinger/binder），
+  它们的分布把唯一的 hp 核推到 24%、误差顶到 88%，前台回来又跳回 2%。活跃样本
+  <64 或掉到上一窗口三成以下时冻结 λ、状态显示「样本不足」，也不再给裁决层递旧 hint
+- SystemUI 主线程（`ndroid.systemui` / `com.android.sys`）补进角色表：原先落到
+  Unknown，S7 每轮记一次未识别（25 分钟 480 次），长期占住 top5 把真正要补命名的
+  线程挤掉；归 Latency 而不是 Critical，避免被 RT 提升后抢占前台渲染
+- S7 迁移日志的 `-1‰` 改成 `—`：那表示线程此前跨簇、没有来源簇，不是采样失败，
+  与前半句「规则集合」不再自相矛盾
+- 默认规则里游戏包的包级兜底从跨簇改成 `p-core`（王者、和平、蛋仔、原神、三角洲、
+  金铲铲、第五人格）：真机日志里小核 450-700‰、中核 100-260‰ 的错位，靠 S7 与
+  λmod 都补不回来，只能在规则层把普通线程放到中核。微信、QQ 保持 `e-core,p-core`
+
+**WebUI 两处修正**
+
+- 删除确认框误用了顶栏的 `.top` 类（`height: 48px`、白底、下边框），整块遮罩被
+  压成一条 48px 的横条，弹窗只剩「取消/删除」按钮行露在屏幕顶上，标题和正文被
+  挤到视口外。改为专属类 `.mask.cf`，恢复全屏遮罩与底部弹窗
+- 诊断页的「失败」计数只有数字（例如「无效参数 2」），看不出是哪条线程。新增
+  「最近失败的线程」明细：线程名、tid、规则要求的目标核区间、errno 标签、组限制
+  原因和相对时间。同一线程同一种 errno 只留最近一条，最多 12 条，不再受 12 条
+  事件环的挤出影响
+
 ## 2.7.0-beta38（2026-11-28）
 
 **λmod 改为分应用开启**
