@@ -600,7 +600,9 @@ impl SchedState {
                         actual.to_range_string()
                     ));
                 }
-                println!("{}", line);
+                /* 与失败行同走一个出口：S7 的三类行（迁移/冻结/失败）在日志里
+                   落在同一列，grep ' 事件 ' 就能连贯看到一次换簇的完整经过 */
+                diag::tag("事件", &line);
                 self.push_ring(line.clone());
                 diag::note_sched(line);
                 if freeze {
@@ -612,7 +614,7 @@ impl SchedState {
                         MOVE_WINDOW.as_secs(),
                         MAX_MOVES_WINDOW
                     );
-                    println!("{}", f);
+                    diag::tag("事件", &f);
                     self.push_ring(f.clone());
                     diag::note_sched(f);
                 }
