@@ -406,6 +406,10 @@ fn main() {
     // 恢复失败记录的重试周期。只在配置变化时扫一遍的话，一次 EPERM/EINVAL
     // 要等到用户下次改配置才会再试，这期间线程一直停在被限制的集合里
     let mut recovery_deadline = Instant::now();
+    // 上一版的黑名单/豁免。这两个名单一改，判断依据就整体变了：账本里没有
+    // 记录的线程（上次运行遗留、被外部塞进组）此刻才算「已经不受管」，
+    // 必须无条件扫一遍组目录。其余配置改动仍按释放结果决定要不要扫
+    let mut prev_guard: Option<(Vec<String>, Vec<String>)> = None;
 
     // 恢复的强制 proc 模式无需 eBPF 初始化
     let mut ebpf_state: Option<EbpfState> = if MODE_FORCE.load(Ordering::Relaxed) == 2 {
@@ -516,9 +520,20 @@ fn main() {
             // 规则可能被删掉了：先把不再受管的线程还回原组，再回收空目录。
             // 顺序不能反——线程还留在子组里，目录就不是空的，GC 只会白跑一趟
             let rep = crate::lifecycle::release_unmanaged(&cfg, false);
-            // 新增黑名单/豁免时，账本之外可能还有上次运行遗留、仍留在子组里的
-            // 线程。只在这次确实释放过东西时才扫一遍组目录，稳态零开销
-            if rep.released > 0 || rep.dropped > 0 {
+            // 名单变了就必须扫：账本只记「本轮之前接管过」的线程，
+            // 而被外部塞进组、或上个进程被 kill -9 留下的线程不在账本里，
+            // 只看释放结果会漏掉它们。sweep 内部按新规则重新判定归属，
+            // 仍匹配的只计数不动，不会把刚接管的线程放走
+            let guard = {
+                let mut b: Vec<String> = cfg.blacklist.iter().cloned().collect();
+                let mut e: Vec<String> = cfg.exempt.iter().cloned().collect();
+                b.sort();
+                e.sort();
+                (b, e)
+            };
+            let guard_changed = prev_guard.as_ref() != Some(&guard);
+            prev_guard = Some(guard);
+            if guard_changed || rep.released > 0 || rep.dropped > 0 {
                 crate::lifecycle::sweep_orphans(&cfg);
             }
             // 只改规则时模式不变，set_mode 会直接返回；不单独唤醒，

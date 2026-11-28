@@ -1648,7 +1648,12 @@ static THREADS: Mutex<Vec<ThreadDiag>> = Mutex::new(Vec::new());
 ///
 /// 第二个返回值表示「这条期望来自降档」，判定时允许实际值是小核集合的
 /// 真子集（组生效集合可能比小核更窄，那属于被系统多裁了一刀，照此处理）。
-fn expect_of(bg: bool, is_thread_rule: bool, floor: Option<&CpuSet>, rule: &CpuSet) -> (CpuSet, bool) {
+fn expect_of(
+    bg: bool,
+    is_thread_rule: bool,
+    floor: Option<&CpuSet>,
+    rule: &CpuSet,
+) -> (CpuSet, bool) {
     match floor {
         Some(f) if bg && !is_thread_rule => (*f, true),
         _ => (*rule, false),

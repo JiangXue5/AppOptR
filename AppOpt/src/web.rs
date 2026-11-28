@@ -1151,6 +1151,7 @@ fn config_json() -> String {
 /// 因此这里的 `actual` 最多滞后 5 秒，够用来发现「一直没绑上」
 fn diag_json() -> String {
     let d = diag::snapshot();
+    let gc = crate::cpuset::eff_cache_stat();
     let pmu_snap = crate::pmu::snapshot();
     let scan = crate::proc_mode::metrics();
     let snap = lock_ignore_poison(&SCHED_SNAPSHOT)
@@ -1238,6 +1239,15 @@ fn diag_json() -> String {
                 "tasks_ms": (scan.last_full.tasks_us / 1000) as u64,
                 "total_ms": (scan.last_full.total_us / 1000) as u64,
             },
+        },
+        // 组生效集合缓存：命中率回答「5 秒 TTL 够不够」，容量回答「会不会
+        // 一直在淘汰」。两项都只观察，不参与判定
+        "group_cache": {
+            "hit": gc.hit,
+            "miss": gc.miss,
+            "size": gc.size,
+            "cap": 128,
+            "ttl_s": 5,
         },
         // 账本条数 vs 缓存受管数。两者应当接近：账本少说明登记漏了，
         // 退出时这些线程的亲和性不会被还原；账本多说明有记录没清掉

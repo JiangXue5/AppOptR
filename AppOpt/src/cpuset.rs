@@ -6,6 +6,7 @@ use std::io;
 use std::io::Write as _;
 
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 pub const CPU_SETSIZE: usize = 1024;
@@ -380,6 +381,29 @@ const EFF_CACHE_CAP: usize = 128;
 /// 读不到时按父链求交会连撞几次失败，没必要每个线程重来一遍
 type EffCache = HashMap<String, (Instant, Option<String>)>;
 static EFF_CACHE: RwLock<Option<EffCache>> = RwLock::new(None);
+/// 命中/未命中计数。唯一用途是回答「5 秒 TTL 够不够」：命中率高说明
+/// 大多数求交在窗口内复用，未命中率高就得怀疑线程在多个组之间被搬来搬去
+static EFF_HIT: AtomicU64 = AtomicU64::new(0);
+static EFF_MISS: AtomicU64 = AtomicU64::new(0);
+
+/// 缓存运行数据。只在 `/api/diag` 里出现，不参与任何判定
+pub struct EffCacheStat {
+    pub hit: u64,
+    pub miss: u64,
+    pub size: usize,
+}
+
+pub fn eff_cache_stat() -> EffCacheStat {
+    EffCacheStat {
+        hit: EFF_HIT.load(Ordering::Relaxed),
+        miss: EFF_MISS.load(Ordering::Relaxed),
+        size: EFF_CACHE
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().map(HashMap::len))
+            .unwrap_or(0),
+    }
+}
 
 /// 插入前的容量整理：先清过期，仍然满就淘汰最早写入的一条。
 /// 这里不引入 LRU：缓存只有一百多条，线性扫一遍比维护链表便宜，
@@ -410,8 +434,10 @@ pub fn group_effective_cached(path: &str) -> Option<String> {
         && let Some((at, v)) = m.get(path)
         && now.duration_since(*at) < EFF_TTL
     {
+        EFF_HIT.fetch_add(1, Ordering::Relaxed);
         return v.clone();
     }
+    EFF_MISS.fetch_add(1, Ordering::Relaxed);
     let v = group_effective(path);
     if let Ok(mut g) = EFF_CACHE.write() {
         let m = g.get_or_insert_with(HashMap::new);
@@ -1290,6 +1316,91 @@ mod tests {
             s.set(c);
         }
         s
+    }
+
+    /// 临时目录。三种 effective 布局靠它挨个搭出来，
+    /// 真机上不可能为了跑测试去改 /dev/cpuset
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("appopt-eff-{}-{tag}", std::process::id()));
+        let _ = fs::remove_dir_all(&p);
+        fs::create_dir_all(&p).expect("建临时目录");
+        p
+    }
+
+    fn write(p: &std::path::Path, v: &str) {
+        fs::write(p, v).expect("写测试文件");
+    }
+
+    /// 三种导出布局都要认，顺序不能反：v1 与 v2 同时存在时以 v1 为准，
+    /// 因为 v1 的 `cpuset.effective_cpus` 是内核算好的最终值
+    #[test]
+    fn effective_reads_all_three_layouts() {
+        let d = tmp("layouts");
+        write(&d.join("cpuset.effective_cpus"), "0-3\n");
+        let (v, src) = read_effective_with_source(d.to_str().unwrap()).expect("v1");
+        assert_eq!(
+            (v.as_str(), src),
+            ("0-3", EffectiveCpuSource::CpusetEffectiveCpus)
+        );
+
+        let d2 = tmp("layouts-v2");
+        write(&d2.join("cpuset.cpus.effective"), "4-7\n");
+        let (v, src) = read_effective_with_source(d2.to_str().unwrap()).expect("v2");
+        assert_eq!(
+            (v.as_str(), src),
+            ("4-7", EffectiveCpuSource::CpusetCpusEffective)
+        );
+
+        let d3 = tmp("layouts-bare");
+        write(&d3.join("effective_cpus"), "0-7\n");
+        let (v, src) = read_effective_with_source(d3.to_str().unwrap()).expect("裸名");
+        assert_eq!(
+            (v.as_str(), src),
+            ("0-7", EffectiveCpuSource::EffectiveCpus)
+        );
+
+        for d in [d, d2, d3] {
+            let _ = fs::remove_dir_all(&d);
+        }
+    }
+
+    /// 三种文件都不存在：必须返回 None 交给父链求交，
+    /// 而不是编一个空集合出去（空集合会被当成「这组没有可运行核」）
+    #[test]
+    fn effective_all_missing_is_none() {
+        let d = tmp("missing");
+        assert!(read_effective_with_source(d.to_str().unwrap()).is_none());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// 空文件 = 没导出。v1 的空 effective 语义是「无可运行核」，
+    /// 但那时父链求交也会得到空结果，让后者给归因（能说清是哪一层卡的）
+    #[test]
+    fn effective_empty_file_falls_through() {
+        let d = tmp("empty");
+        write(&d.join("cpuset.effective_cpus"), "  \n");
+        write(&d.join("cpuset.cpus.effective"), "2-5\n");
+        let (v, src) = read_effective_with_source(d.to_str().unwrap()).expect("应落到 v2");
+        assert_eq!(
+            (v.as_str(), src),
+            ("2-5", EffectiveCpuSource::CpusetCpusEffective)
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// 文件位置被建成了目录（读到 EISDIR）：按不可用跳过，落到下一级。
+    /// 真机上出现过厂商把节点做成目录、`read_to_string` 一直失败的情况
+    #[test]
+    fn effective_unreadable_falls_through() {
+        let d = tmp("isdir");
+        fs::create_dir_all(d.join("cpuset.effective_cpus")).expect("建同名目录");
+        write(&d.join("effective_cpus"), "6,7\n");
+        let (v, src) = read_effective_with_source(d.to_str().unwrap()).expect("应落到裸名");
+        assert_eq!(
+            (v.as_str(), src),
+            ("6,7", EffectiveCpuSource::EffectiveCpus)
+        );
+        let _ = fs::remove_dir_all(&d);
     }
 
     /// 差集只留「自己要了、对方没有」的核：裁剪归因靠它区分

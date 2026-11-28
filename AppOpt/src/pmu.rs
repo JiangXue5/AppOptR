@@ -411,6 +411,16 @@ fn quota_should_log(plan: &crate::pmu_allocator::ShadowPlan) -> bool {
 }
 
 /// 当前快照。未启用过时返回默认值（state = 「未启用」）
+/// 上一窗口的全量样本，按 (包, 线程名) 索引。`PmuSnapshot.samples` 只留
+/// 最忙的几条给面板看，Auto Assign 要按名字查任意线程——查不到时它必须
+/// 知道这是「没测」而不是「测了是 0」，所以两者分开存
+static LOADS: Mutex<Option<HashMap<(String, String), Sample>>> = Mutex::new(None);
+
+/// 取一份全量样本。PMU 关着、息屏暂停、或本窗口没有活跃线程时返回空表
+pub fn loads() -> HashMap<(String, String), Sample> {
+    lock_ignore_poison(&LOADS).clone().unwrap_or_default()
+}
+
 pub fn snapshot() -> PmuSnapshot {
     lock_ignore_poison(&SNAPSHOT)
         .clone()
@@ -692,6 +702,14 @@ pub fn tick(cfg: &AppConfig, cache: &ProcCache) {
         }
     }
 
+    // 截断前先给 Auto Assign 留一份全量：它按 (包, 线程名) 查，
+    // 需要的是「这条线程有没有被测过、测出多少」，而不是「是不是最忙的三条」
+    *lock_ignore_poison(&LOADS) = Some(
+        fresh
+            .iter()
+            .map(|s| ((s.pkg.clone(), s.comm.clone()), s.clone()))
+            .collect(),
+    );
     fresh.truncate(SNAP_SAMPLES);
     p.samples = fresh;
 
@@ -720,6 +738,7 @@ pub fn pause() {
         p.close_all();
         p.samples.clear();
         p.active = 0;
+        *lock_ignore_poison(&LOADS) = None;
         // 息屏期间的数据不代表前台体验，配额结论也一并作废
         crate::pmu_allocator::clear();
         // 亮屏后的第一个窗口不能按「息屏了多久」算速率
@@ -736,6 +755,7 @@ fn shutdown() {
     };
     p.close_all();
     crate::pmu_allocator::clear();
+    *lock_ignore_poison(&LOADS) = None;
     *lock_ignore_poison(&SNAPSHOT) = Some(PmuSnapshot {
         state: "未启用".to_string(),
         ..Default::default()

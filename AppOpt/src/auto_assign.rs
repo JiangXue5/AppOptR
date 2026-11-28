@@ -99,6 +99,49 @@ fn alive(s: &Seen, thread: &str) -> bool {
     fs::read_to_string(format!("/proc/{}/comm", s.tid)).is_ok_and(|c| c.trim() == thread)
 }
 
+/// 采样窗口里的一档负载。只用来校正置信度，**不改变建议集合**：
+/// 集合由角色决定，实测负载回答的是「值不值得现在就去问用户」，
+/// 不是「该绑哪个核」——后者需要对照实验，不是一次采样能定的
+enum Load {
+    Busy,
+    Light,
+    Idle,
+}
+
+fn load_class(s: &crate::pmu::Sample) -> Load {
+    let pct = s
+        .cpu_ns
+        .map(|ns| ns as f64 / (s.window_ms.max(1) as f64 * 1e6));
+    match pct {
+        // 软件计时给的是「占满一个核的比例」，5% 已经能说明这条线程在干活
+        Some(p) if p >= 0.05 => Load::Busy,
+        Some(p) if p < 0.005 => Load::Idle,
+        Some(_) => Load::Light,
+        // 硬件计数只有 M/s。不同 SoC 每 M/s 对应的核占比差一倍以上，
+        // 用它算占比会得出不可比的数，只按量级分忙闲
+        None if s.mips() >= 100.0 => Load::Busy,
+        None if s.mips() < 5.0 => Load::Idle,
+        None => Load::Light,
+    }
+}
+
+/// 置信度与理由。`pmu` 为 `None` 表示这条线程没被测过（PMU 关着、
+/// 或本窗口不够忙没进采样），**不能当成「测了是 0」**——把「没测」
+/// 当「闲」会把正常线程的建议压成低置信度
+fn grade(fg_secs: u64, pmu: Option<&crate::pmu::Sample>) -> (&'static str, &'static str) {
+    let by_time = if fg_secs >= HIGH_ALIVE_SECS {
+        "high"
+    } else {
+        "medium"
+    };
+    match pmu.map(load_class) {
+        Some(Load::Busy) => ("high", "负载采样确认：观察窗口内持续占用 CPU"),
+        Some(Load::Idle) => ("medium", "负载采样：窗口内几乎不占 CPU，仅按角色推断"),
+        Some(Load::Light) => (by_time, "负载采样：窗口内负载较轻"),
+        None => (by_time, "按线程角色推断，未经负载采样验证"),
+    }
+}
+
 fn role_label(role: Role) -> &'static str {
     match role {
         Role::Critical => "Critical",
@@ -183,6 +226,8 @@ pub fn collect(cfg: &AppConfig) -> Vec<Candidate> {
     };
     // 门槛看「前台观察时长」而不是「存活时长」：后台挂着的线程活得再久，
     // 也没有一条能说明它需要绑核的证据
+    // 采样表只在 PMU 开着时有内容。空表意味着「没有实测」，不是「负载为零」
+    let loads = crate::pmu::loads();
     let mut out: Vec<Candidate> = map
         .iter()
         .filter(|((_, thread), s)| alive(s, thread) && s.seen_fg && s.fg_secs >= MIN_ALIVE_SECS)
@@ -192,17 +237,14 @@ pub fn collect(cfg: &AppConfig) -> Vec<Candidate> {
                 return None;
             }
             let cpus = suggest_cpus(s.role)?;
+            let (confidence, reason) = grade(s.fg_secs, loads.get(&(pkg.clone(), thread.clone())));
             Some(Candidate {
                 pkg: pkg.clone(),
                 thread: thread.clone(),
                 cpus: cpus.to_string(),
                 role: role_label(s.role),
-                confidence: if s.fg_secs >= HIGH_ALIVE_SECS {
-                    "high"
-                } else {
-                    "medium"
-                },
-                reason: "按线程角色推断，未经负载采样验证",
+                confidence,
+                reason,
                 created_at: s.first,
                 expires_at: s.first + TTL_SECS,
             })
@@ -388,6 +430,49 @@ mod tests {
         assert_eq!(suggest_cpus(Role::Critical), Some("hp-core"));
         assert_eq!(suggest_cpus(Role::Worker), Some("e-core"));
         assert_eq!(suggest_cpus(Role::Latency), Some("p-core"));
+    }
+
+    fn sample(cpu_ns: Option<u64>, inst: u64) -> crate::pmu::Sample {
+        crate::pmu::Sample {
+            tid: 100,
+            pkg: "com.a".into(),
+            comm: "RenderThread".into(),
+            inst,
+            cycles: inst * 2,
+            misses: None,
+            cpu_ns,
+            window_ms: 5000,
+        }
+    }
+
+    /// 实测持续占用 CPU 的线程直接给高置信度：它自己证明了自己值不值得问
+    #[test]
+    fn busy_sample_raises_to_high() {
+        // 5 秒窗口里跑了 1 秒 = 20% 一个核
+        let s = sample(Some(1_000_000_000), 0);
+        assert_eq!(grade(0, Some(&s)).0, "high");
+        // 硬件计数模式：200 M/s 属于在干活
+        let s2 = sample(None, 1_000_000_000);
+        assert_eq!(grade(0, Some(&s2)).0, "high");
+    }
+
+    /// 采到但几乎不跑：降回 medium 并写明原因。
+    /// 「挂着但不干活」的线程占了 hp-core 只会让真正要跑的线程抢不到
+    #[test]
+    fn idle_sample_downgrades() {
+        let s = sample(Some(1_000_000), 0); // 0.02% 一个核
+        let (c, r) = grade(HIGH_ALIVE_SECS + 10, Some(&s));
+        assert_eq!(c, "medium");
+        assert!(r.contains("几乎不占 CPU"), "{r}");
+    }
+
+    /// 没测到 ≠ 测出来是 0。PMU 关着时不能把全部候选降成低置信度，
+    /// 否则默认配置下 Auto Assign 的建议会整体变差
+    #[test]
+    fn no_sample_keeps_time_grade() {
+        assert_eq!(grade(0, None).0, "medium");
+        assert_eq!(grade(HIGH_ALIVE_SECS, None).0, "high");
+        assert!(grade(0, None).1.contains("未经负载采样"));
     }
 
     #[test]
