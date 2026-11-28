@@ -1301,6 +1301,29 @@ fn diag_json() -> String {
                 "hints": a.hints,
                 "samples": a.samples,
             })),
+            // λmod：每层的影子价格与落层建议。同样只算不执行，
+            // `share` 与 `rho` 都按「线程数占比」计，`cap_share` 才是算力加权
+            "lambda": crate::pmu_lambda::snapshot().map(|l| json!({
+                "state": l.state,
+                "tiers": l.tiers.iter().map(|t| json!({
+                    "cpus": t.cpus.to_range_string(),
+                    "rho": (t.rho * 1000.0).round() / 10.0,
+                    "l2_kb": t.l2_kb.round(),
+                })).collect::<Vec<_>>(),
+                "lambda": l.lambda.iter().map(|x| (x * 100.0).round() / 100.0).collect::<Vec<_>>(),
+                "share": l.share.iter().map(|x| (x * 1000.0).round() / 10.0).collect::<Vec<_>>(),
+                "cap_share": l.cap_share.iter().map(|x| (x * 1000.0).round() / 10.0).collect::<Vec<_>>(),
+                "err": (l.err * 1000.0).round() / 10.0,
+                "rounds": l.rounds,
+                "threads": l.threads,
+                "picks": l.picks.iter().map(|(comm, tid, tier, p)| json!({
+                    "comm": comm,
+                    "tid": tid,
+                    "tier": tier,
+                    "p": (p * 1000.0).round() / 10.0,
+                })).collect::<Vec<_>>(),
+                "line": l.log_text(),
+            })),
         },
         "events": d.events,
     })

@@ -15,6 +15,7 @@ mod lifecycle;
 mod load;
 mod pmu;
 mod pmu_allocator;
+mod pmu_lambda;
 mod policy;
 mod proc_mode;
 mod roles;

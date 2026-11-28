@@ -390,6 +390,8 @@ static SNAPSHOT: Mutex<Option<PmuSnapshot>> = Mutex::new(None);
 /// 实际占比的小数点。真正变化的时刻（忽然从 83% 掉到 34%）反而埋在中间。
 /// 只在「最空层换了」「匹配度变化 ≥15 个百分点」「距上次 5 分钟」时再报
 static QUOTA_LOG: Mutex<Option<(Option<usize>, f64, Instant)>> = Mutex::new(None);
+/// λmod 上一行的（状态, 误差, 时刻）
+static LAMBDA_LOG: Mutex<Option<(&'static str, f64, Instant)>> = Mutex::new(None);
 
 fn quota_should_log(plan: &crate::pmu_allocator::ShadowPlan) -> bool {
     const FIT_STEP: f64 = 0.15;
@@ -410,7 +412,6 @@ fn quota_should_log(plan: &crate::pmu_allocator::ShadowPlan) -> bool {
     changed
 }
 
-/// 当前快照。未启用过时返回默认值（state = 「未启用」）
 /// 上一窗口的全量样本，按 (包, 线程名) 索引。`PmuSnapshot.samples` 只留
 /// 最忙的几条给面板看，Auto Assign 要按名字查任意线程——查不到时它必须
 /// 知道这是「没测」而不是「测了是 0」，所以两者分开存
@@ -421,6 +422,7 @@ pub fn loads() -> HashMap<(String, String), Sample> {
     lock_ignore_poison(&LOADS).clone().unwrap_or_default()
 }
 
+/// 当前快照。未启用过时返回默认值（state = 「未启用」）
 pub fn snapshot() -> PmuSnapshot {
     lock_ignore_poison(&SNAPSHOT)
         .clone()
@@ -697,8 +699,12 @@ pub fn tick(cfg: &AppConfig, cache: &ProcCache) {
     if cfg.pmu_alloc {
         if fresh.is_empty() {
             crate::pmu_allocator::clear();
+            crate::pmu_lambda::clear();
         } else {
             crate::pmu_allocator::update(&fresh, &cfg.topo);
+            // λmod 与配额并行跑：一个报「簇间平不平衡」，一个报「谁该上大核」。
+            // 两者都只写快照，不参与任何迁移决策
+            crate::pmu_lambda::update(&fresh, &cfg.topo);
         }
     }
 
@@ -741,6 +747,7 @@ pub fn pause() {
         *lock_ignore_poison(&LOADS) = None;
         // 息屏期间的数据不代表前台体验，配额结论也一并作废
         crate::pmu_allocator::clear();
+        crate::pmu_lambda::clear();
         // 亮屏后的第一个窗口不能按「息屏了多久」算速率
         p.last_tick = None;
         publish(p, "息屏暂停".to_string());
@@ -755,6 +762,7 @@ fn shutdown() {
     };
     p.close_all();
     crate::pmu_allocator::clear();
+    crate::pmu_lambda::clear();
     *lock_ignore_poison(&LOADS) = None;
     *lock_ignore_poison(&SNAPSHOT) = Some(PmuSnapshot {
         state: "未启用".to_string(),
@@ -891,6 +899,35 @@ fn log_line(p: &Pmu, cfg: &AppConfig) {
     {
         crate::diag::tag("配额", &plan.log_text());
     }
+    // λmod 再单独一行：它回答的是另一个问题（谁该上大核），
+    // 和「簇间平不平衡」拼一行会读成同一件事的两半
+    if cfg.pmu_alloc
+        && let Some(lp) = crate::pmu_lambda::snapshot()
+        && lambda_should_log(&lp)
+    {
+        crate::diag::tag("λmod", &lp.log_text());
+    }
+}
+
+/// λmod 日志节流：状态翻转、误差变化超过 10 个点、或距上次超过 5 分钟才出声。
+/// 每窗口都打会让日志被 λ 的细微抖动淹没，而它本来就是个慢变量
+fn lambda_should_log(plan: &crate::pmu_lambda::LambdaPlan) -> bool {
+    const QUIET: Duration = Duration::from_secs(300);
+    const ERR_STEP: f64 = 0.10;
+    let mut guard = lock_ignore_poison(&LAMBDA_LOG);
+    let now = Instant::now();
+    let changed = match *guard {
+        None => true,
+        Some((state, err, at)) => {
+            state != plan.state
+                || (plan.err - err).abs() >= ERR_STEP
+                || now.duration_since(at) >= QUIET
+        }
+    };
+    if changed {
+        *guard = Some((plan.state, plan.err, now));
+    }
+    changed
 }
 
 /// 槽位满了、又有更忙的线程要进来：从「本窗口没干活」的已开线程里

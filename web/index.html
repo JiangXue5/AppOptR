@@ -1985,6 +1985,15 @@
                 </div>
                 <div id="d-jank"></div>
               </div>
+              <div class="card" id="card-lambda" hidden>
+                <div class="row" style="padding-bottom: 2px">
+                  <span class="k">λmod 落层模型</span><span class="v sub" id="l-state">—</span>
+                </div>
+                <div id="l-body"></div>
+                <div class="sub" style="padding: 0 14px 12px">
+                  影子价格 λ 越高，说明该层越挤。分配按线程数占比计，容量是该层核数占比；两者对齐即收敛。只做对照，不改变绑核。
+                </div>
+              </div>
               <div class="card">
                 <div class="h2" style="margin: 0; padding: 12px 14px 0">线程绑定状态</div>
                 <div style="display: flex; gap: 6px; align-items: center; padding: 10px 12px">
@@ -4618,6 +4627,7 @@
             : '<div class="sub" style="padding:12px 14px">没有渲染线程就绪等待超过 4 ms</div>',
           JSON.stringify(jank),
         );
+        renderLambda(d.pmu && d.pmu.lambda);
         renderThreads();
         const ev = d.events || [];
         const box = $("d-ev");
@@ -4625,6 +4635,56 @@
         const evTxt = ev.length ? ev.join("\n") : "—";
         if (box.textContent !== evTxt) box.textContent = evTxt;
         if ($("d-autosc").checked) box.scrollTop = box.scrollHeight;
+      }
+      /* λmod 面板：只在 PMU 与 Shadow 配额都开着时才有内容 */
+      function renderLambda(l) {
+        const card = $("card-lambda");
+        if (!card) return;
+        const ok = l && Array.isArray(l.tiers) && l.tiers.length > 1;
+        card.hidden = !ok;
+        if (!ok) return;
+        $("l-state").textContent = (l.state || "—") + (num(l.threads) ? " · " + num(l.threads) + " 线程" : "");
+        const pct = (v) => Math.round(num(v));
+        const rows = l.tiers
+          .map(
+            (t, i) =>
+              '<div class="row"><span class="k">' +
+              esc(t.cpus) +
+              '</span><span class="v sub mono">λ ' +
+              num((l.lambda || [])[i]).toFixed(2) +
+              " · 分配 " +
+              pct((l.share || [])[i]) +
+              "% → 容量 " +
+              pct(t.rho) +
+              "%</span></div>",
+          )
+          .join("");
+        const tail =
+          '<div class="row"><span class="k">收敛</span><span class="v sub">误差 ' +
+          num(l.err).toFixed(1) +
+          "% · 已迭代 " +
+          num(l.rounds) +
+          " 轮</span></div>";
+        const picks = (l.picks || [])
+          .slice(0, 5)
+          .map(
+            (p) =>
+              '<div class="row"><span class="k">' +
+              esc(p.comm || "?") +
+              '</span><span class="v sub">' +
+              esc(((l.tiers[p.tier] || {}).cpus || "?").toString()) +
+              " · " +
+              Math.round(num(p.p)) +
+              "%</span></div>",
+          )
+          .join("");
+        mount(
+          $("l-body"),
+          rows +
+            tail +
+            (picks ? '<div class="h2" style="padding: 8px 0 2px; font-size: 12.5px">模型认为该上大核的线程</div>' + picks : ""),
+          JSON.stringify(l),
+        );
       }
       function threadRows() {
         const all = (S.diag && S.diag.threads) || [];
@@ -4716,6 +4776,9 @@
         );
         L.push("[绑核] " + (a.line || ""));
         if (a.errno_line) L.push("[errno] " + a.errno_line);
+        const lm = d.pmu && d.pmu.lambda;
+        if (lm && lm.tiers && lm.tiers.length)
+          L.push("[λmod] " + (lm.line || lm.state + " 误差 " + num(lm.err).toFixed(1) + "%"));
         L.push(
           "[S7] mode=" +
             num(s7.mode) +
