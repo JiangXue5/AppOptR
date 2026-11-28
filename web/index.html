@@ -19,6 +19,9 @@
         --ok-t: #1d7a37;
         --warn-t: #a35a00;
         --err: #ff453a;
+        --err-t: #bf1f16;
+        --badge-ink: #05605d;
+        --badge-p-ink: #0b57a4;
         --e: #34c759;
         --p: #0a84ff;
         --hp: #af52de;
@@ -43,6 +46,9 @@
         --accent-fg: #03201f;
         --ok-t: #34c759;
         --warn-t: #ff9f0a;
+        --err-t: #ff6b60;
+        --badge-ink: #5ee6df;
+        --badge-p-ink: #6fb6ff;
         --bg: #0e1013;
         --card: #181b20;
         --line: rgba(255, 255, 255, 0.09);
@@ -260,11 +266,12 @@
         font-size: 11.5px;
         font-weight: 600;
         background: rgba(10, 157, 152, 0.14);
-        color: var(--accent-ink);
+        /* 徽章文字压在淡色底上，--accent-ink 在这个底色上只有 4.1:1，单独加深 */
+        color: var(--badge-ink);
       }
       .badge.proc {
         background: rgba(10, 132, 255, 0.14);
-        color: var(--p);
+        color: var(--badge-p-ink);
       }
       .seg {
         display: flex;
@@ -275,6 +282,11 @@
       }
       .seg button {
         flex: 1;
+        /* 触控目标 44px：分段控件在设置页是主要操作入口 */
+        min-height: 44px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
         padding: 8px 6px;
         border-radius: 8px;
         font-size: 13px;
@@ -303,6 +315,12 @@
         flex-shrink: 0;
         display: inline-block;
         vertical-align: middle;
+      }
+      /* 开关画得小，按得要大：命中区上下各外扩 8px 到 44px */
+      .sw button::before {
+        content: "";
+        position: absolute;
+        inset: -8px -2px;
       }
       .sw button {
         position: absolute;
@@ -401,7 +419,7 @@
         stroke-linejoin: round;
       }
       .icon.danger {
-        color: var(--err);
+        color: var(--err-t);
       }
       .stat {
         background: var(--card);
@@ -468,9 +486,6 @@
         50% {
           opacity: 1;
         }
-      }
-      .fade {
-        transition: opacity 0.18s;
       }
       .strip {
         display: flex;
@@ -583,14 +598,14 @@
       }
       .pk-in.bad {
         border-color: var(--err);
-        color: var(--err);
+        color: var(--err-t);
       }
       .pk-hint {
         font-size: 11.5px;
         color: var(--sub);
       }
       .pk-hint.bad {
-        color: var(--err);
+        color: var(--err-t);
       }
       .mask {
         position: fixed;
@@ -1004,15 +1019,22 @@
       }
       .fchip {
         flex: 0 0 auto;
-        padding: 7px 12px;
+        padding: 8px 12px;
         border-radius: 999px;
         background: var(--card);
         border: 1px solid var(--line);
         font-size: 12.5px;
         color: var(--sub);
-        min-height: 34px;
+        min-height: 40px;
         display: inline-flex;
         align-items: center;
+        position: relative;
+      }
+      /* 视觉 40px，命中区补到 44px：只往上下长，横向留出 gap 不被邻居抢走 */
+      .fchip::before {
+        content: "";
+        position: absolute;
+        inset: -2px 0;
       }
       .fchip.on {
         background: var(--accent-fill);
@@ -1293,6 +1315,13 @@
         display: flex;
         align-items: center;
         justify-content: center;
+        position: relative;
+      }
+      /* 34px 的方钮上下外扩到 44px 命中区，不撑高这一行 */
+      .step button::before {
+        content: "";
+        position: absolute;
+        inset: -5px 0;
       }
       .step input {
         width: 44px;
@@ -1317,22 +1346,37 @@
         border-bottom: 1px solid var(--line2);
         padding-bottom: 4px;
       }
+      /* 分组后 2 列会把 21 个计数拉成三屏，改成按最小宽度自动分列，
+         390px 上是 3 列，平板/横屏能到 4-5 列 */
       .dgrid {
         display: grid;
-        grid-template-columns: repeat(2, 1fr);
+        grid-template-columns: repeat(auto-fill, minmax(104px, 1fr));
         gap: 8px;
         padding: 10px 12px;
       }
-      @media (min-width: 600px) {
-        .dgrid {
-          grid-template-columns: repeat(3, 1fr);
-        }
-      }
       .dgrid .stat {
-        padding: 9px 8px;
+        padding: 8px 6px;
       }
       .dgrid .stat b {
         font-size: 17px;
+      }
+      /* 21 个计数平铺等于没分组：标题占满整行，说明用小字压在下面 */
+      .dgh {
+        grid-column: 1 / -1;
+        font-size: 12px;
+        font-weight: 600;
+        color: var(--fg);
+        padding: 6px 2px 0;
+      }
+      .dgh:first-child {
+        padding-top: 0;
+      }
+      .dgn {
+        grid-column: 1 / -1;
+        font-size: 11.5px;
+        line-height: 1.5;
+        color: var(--sub);
+        padding: 0 2px 2px;
       }
       .ev {
         font-family: var(--mono);
@@ -1692,10 +1736,20 @@
         border-color: var(--err);
       }
       .tok-err {
-        color: var(--err);
+        color: var(--err-t);
         font-size: 12.5px;
         line-height: 1.5;
         margin-top: 8px;
+      }
+      /* 键盘焦点统一可见。各处 `outline:none` 是为了去掉鼠标点击的框，
+         但会把键盘用户一起坑掉，所以这里用 !important 兜回来 */
+      :focus-visible {
+        outline: 2px solid var(--accent-ink) !important;
+        outline-offset: 2px;
+        border-radius: 6px;
+      }
+      .sw button:focus-visible {
+        outline-offset: 3px;
       }
       @media (prefers-reduced-motion: reduce) {
         * {
@@ -1778,7 +1832,13 @@
                   >
                     <circle cx="11" cy="11" r="7" />
                     <path d="M20 20l-3.5-3.5" /></svg
-                  ><input id="rq" placeholder="搜索应用" autocomplete="off" spellcheck="false" /><button
+                  ><input
+                    id="rq"
+                    placeholder="搜索应用，也可搜线程名"
+                    aria-label="搜索应用或线程名"
+                    autocomplete="off"
+                    spellcheck="false"
+                  /><button
                     class="x"
                     id="rq-x"
                     hidden
@@ -1801,7 +1861,7 @@
           <section class="page" id="pg-sched" data-pg="sched">
             <div class="wrap">
               <div class="card pad" id="c-rt">
-                <div class="h2" style="margin-top: 0">RT 实时调度</div>
+                <div class="h2" style="margin-top: 0">RT（实时优先级）</div>
                 <div class="seg" id="seg-rt">
                   <button data-rt="off">关闭</button><button data-rt="global">全部应用</button
                   ><button data-rt="per_app">按规则开启</button>
@@ -1827,6 +1887,7 @@
                   <button data-s7="off">关闭</button><button data-s7="shadow">观察</button
                   ><button data-s7="on">开启</button>
                 </div>
+                <div class="seg-note" id="s7-mean">—</div>
                 <div class="seg-note" id="s7-tip" hidden style="color: var(--warn-t)">
                   该机型核心层不足，不会生效
                 </div>
@@ -1854,7 +1915,7 @@
                   </div>
                   <div class="rt2">
                     <span class="sw"
-                      ><button id="sw-takeover" role="switch" aria-checked="false"></button
+                      ><button id="sw-takeover" role="switch" aria-checked="false" aria-label="强制绑核"></button
                     ></span>
                   </div>
                 </div>
@@ -1867,7 +1928,7 @@
                   </div>
                 </div>
               </div>
-              <div class="card pad" id="c-adv2">
+              <div class="card pad">
                 <div class="h2" style="margin-top: 0">未匹配线程与 RT 参数</div>
                 <div class="gi" style="padding: 6px 0">
                   <div class="lb">没写规则的线程</div>
@@ -1882,7 +1943,7 @@
                   <div class="rt2">
                     <span class="step"
                       ><button data-st="rtmax:-1">−</button
-                      ><input id="v-rtmax" inputmode="numeric" value="2" /><button data-st="rtmax:1">
+                      ><input id="v-rtmax" inputmode="numeric" value="2" aria-label="每应用 RT 上限" /><button data-st="rtmax:1">
                         ＋
                       </button></span
                     >
@@ -1893,7 +1954,7 @@
                   <div class="rt2">
                     <span class="step"
                       ><button data-st="rtts:-1">−</button
-                      ><input id="v-rtts" inputmode="numeric" value="3" /><button data-st="rtts:1">
+                      ><input id="v-rtts" inputmode="numeric" value="3" aria-label="RT 时间片（毫秒）" /><button data-st="rtts:1">
                         ＋
                       </button></span
                     >
@@ -1915,7 +1976,7 @@
                 <div
                   class="sub mono"
                   id="d-errno"
-                  style="padding: 0 14px 12px; color: var(--err); word-break: break-all"
+                  style="padding: 0 14px 12px; color: var(--err-t); word-break: break-all"
                 ></div>
               </div>
               <div class="card">
@@ -1935,6 +1996,7 @@
                   <input
                     id="d-q"
                     placeholder="搜索"
+                    aria-label="搜索诊断线程"
                     style="
                       width: 96px;
                       border: 1px solid var(--line);
@@ -1986,6 +2048,7 @@
                     <input
                       class="txt"
                       id="set-int"
+                      aria-label="扫描间隔（秒）"
                       inputmode="numeric"
                       style="width: 74px; text-align: center"
                     /><button class="btn sm" data-save="interval">保存</button>
@@ -1994,7 +2057,7 @@
                 <div class="gi">
                   <div class="lb">cpuset 目录<small id="set-cp-sub"></small></div>
                   <div class="rt2">
-                    <input class="txt" id="set-cp" style="width: 110px" /><button
+                    <input class="txt" id="set-cp" style="width: 110px" aria-label="cpuset 目录" /><button
                       class="btn sm"
                       data-save="cpuset"
                     >
@@ -2005,7 +2068,7 @@
                 <div class="gi stack">
                   <div class="lb">规则配置文件<small>仅限模块目录内 .conf</small></div>
                   <div class="rt2" style="display: flex; gap: 8px">
-                    <input class="txt" id="set-cf" /><button class="btn sm" data-save="file">保存</button>
+                    <input class="txt" id="set-cf" aria-label="规则配置文件" /><button class="btn sm" data-save="file">保存</button>
                   </div>
                 </div>
               </div>
@@ -2029,7 +2092,13 @@
                   </div>
                   <div class="rt2">
                     <span class="sw"
-                      ><button role="switch" data-bk="screen" data-on="relax" aria-checked="false"></button
+                      ><button
+                        role="switch"
+                        data-bk="screen"
+                        data-on="relax"
+                        aria-checked="false"
+                        aria-label="息屏后降低检查频率"
+                      ></button
                     ></span>
                   </div>
                 </div>
@@ -2044,6 +2113,7 @@
                         data-bk="foreground_demote"
                         data-on="on"
                         aria-checked="false"
+                        aria-label="后台应用限制在小核"
                       ></button
                     ></span>
                   </div>
@@ -2054,7 +2124,13 @@
                   </div>
                   <div class="rt2">
                     <span class="sw"
-                      ><button role="switch" data-bk="auto_assign" data-on="on" aria-checked="false"></button
+                      ><button
+                        role="switch"
+                        data-bk="auto_assign"
+                        data-on="on"
+                        aria-checked="false"
+                        aria-label="线程规则建议"
+                      ></button
                     ></span>
                   </div>
                 </div>
@@ -2062,7 +2138,13 @@
                   <div class="lb">线程负载观察<small>只读取数据，不改变绑核结果</small></div>
                   <div class="rt2">
                     <span class="sw"
-                      ><button role="switch" data-bk="pmu" data-on="observe" aria-checked="false"></button
+                      ><button
+                        role="switch"
+                        data-bk="pmu"
+                        data-on="observe"
+                        aria-checked="false"
+                        aria-label="线程负载观察"
+                      ></button
                     ></span>
                   </div>
                 </div>
@@ -2075,6 +2157,7 @@
                         data-bk="pmu_alloc"
                         data-on="shadow"
                         aria-checked="false"
+                        aria-label="各层负载估算"
                       ></button
                     ></span>
                   </div>
@@ -2103,31 +2186,31 @@
           </section>
         </main>
       </div>
-      <nav class="tabbar" id="tabbar">
-        <button class="tab on" data-tab="over">
+      <nav class="tabbar" id="tabbar" role="tablist" aria-label="主导航">
+        <button class="tab on" data-tab="over" role="tab" aria-selected="true">
           <svg viewBox="0 0 24 24">
             <path d="M4 15a8 8 0 0 1 16 0" />
             <path d="M12 15l4-4" />
             <circle cx="12" cy="15" r="1.2" fill="currentColor" stroke="none" />
             <path d="M5 19h14" /></svg
           >概览</button
-        ><button class="tab" data-tab="rules">
+        ><button class="tab" data-tab="rules" role="tab" aria-selected="false">
           <svg viewBox="0 0 24 24">
             <path d="M8 6h13M8 12h13M8 18h13" />
             <circle cx="4" cy="6" r="1" fill="currentColor" stroke="none" />
             <circle cx="4" cy="12" r="1" fill="currentColor" stroke="none" />
             <circle cx="4" cy="18" r="1" fill="currentColor" stroke="none" /></svg
           >规则</button
-        ><button class="tab" data-tab="sched">
+        ><button class="tab" data-tab="sched" role="tab" aria-selected="false">
           <svg viewBox="0 0 24 24">
             <path d="M4 7h10M18 7h2M4 12h4M12 12h8M4 17h8M16 17h4" />
             <circle cx="16" cy="7" r="2" />
             <circle cx="10" cy="12" r="2" />
             <circle cx="14" cy="17" r="2" /></svg
           >调度</button
-        ><button class="tab" data-tab="diag">
+        ><button class="tab" data-tab="diag" role="tab" aria-selected="false">
           <svg viewBox="0 0 24 24"><path d="M3 12h4l2-6 3 12 2.5-6H21" /></svg>诊断</button
-        ><button class="tab" data-tab="set">
+        ><button class="tab" data-tab="set" role="tab" aria-selected="false">
           <svg viewBox="0 0 24 24">
             <circle cx="12" cy="12" r="3" />
             <path d="M12 3v2M12 19v2M4.2 7.5l1.8 1M18 15.5l1.8 1M4.2 16.5l1.8-1M18 8.5l1.8-1" /></svg
@@ -2258,6 +2341,7 @@
         <input
           id="tok"
           placeholder="32 位十六进制令牌"
+          aria-label="访问令牌"
           autocomplete="off"
           spellcheck="false"
           autocapitalize="off"
@@ -2437,7 +2521,10 @@
               : { headers: h, signal: ctl.signal };
           return fetch(API_BASE + path, o);
         };
-        let r;
+        let r,
+          /* 记下这次请求实际带的是哪个令牌：401 回来时如果 TOKEN 已经变了，
+             说明是用户在弹窗里补好了令牌，这波 401 属于旧请求，不该再弹窗 */
+          sentTok = TOKEN;
         try {
           r = await send();
         } catch (e) {
@@ -2460,13 +2547,14 @@
           }
           const fresh = authWait ? await authWait : false;
           if (fresh) {
+            sentTok = TOKEN;
             try {
               r = await send();
             } catch (e) {}
           }
           if (r.status === 401) {
             clearTimeout(tm);
-            showGate();
+            if (!TOKEN || TOKEN === sentTok) showGate();
             throw new Error("需要访问令牌");
           }
         }
@@ -2626,6 +2714,26 @@
         el.__sig = s;
         el.innerHTML = html;
       }
+      /* 分段控件与过滤 chip 的选中态只体现在 class 上，读屏需要 aria-pressed。
+         用一个观察器统一同步，省得每条切换路径都手动补一遍 */
+      (function segA11y() {
+        const sync = (root) =>
+          root.querySelectorAll("button").forEach((b) => {
+            const on = b.classList.contains("on") ? "true" : "false";
+            if (b.getAttribute("aria-pressed") !== on) b.setAttribute("aria-pressed", on);
+          });
+        [".seg", "#rq-f", "#d-tf"].forEach((sel) =>
+          document.querySelectorAll(sel).forEach((r) => {
+            sync(r);
+            if (window.MutationObserver)
+              new MutationObserver(() => sync(r)).observe(r, {
+                attributes: true,
+                attributeFilter: ["class"],
+                subtree: true,
+              });
+          }),
+        );
+      })();
       function setDot(ok) {
         const d = $("dot");
         d.className = "dot " + (ok ? "ok" : "err");
@@ -2665,6 +2773,12 @@
       setInterval(() => {
         if (S.online === false && !document.hidden) paintOffline();
       }, 1000);
+      /* 开关的三种表达（class / 橙色 / aria）必须同步改，否则读屏和视觉会打架 */
+      function setSw(el, on) {
+        el.classList.toggle("on", on);
+        el.classList.toggle("rt", on);
+        el.setAttribute("aria-checked", on ? "true" : "false");
+      }
       function busy(btn, on, label) {
         if (!btn) return;
         if (on) {
@@ -2755,7 +2869,7 @@
             return;
           }
           if (c === "all-core") {
-            spec = spec === "all-core" ? "" : spec === "all-core" ? "" : "all-core";
+            spec = spec === "all-core" ? "" : "all-core";
             paint();
             return;
           }
@@ -2813,9 +2927,56 @@
         };
       }
       let sheetClose = null,
-        sheetDirty = false;
+        sheetDirty = false,
+        uiFocus = null;
+      /* 返回键：Sheet 与确认框各压一条 history，按返回时关最上层，
+         而不是直接把整个 WebUI 退掉。栈里存的是「怎么关这一层」 */
+      const UISTACK = [];
+      /* uiPop 自己也会 back()，那一下的 popstate 不能再当成「用户按返回」，
+         否则关掉确认框时会立刻被重新弹出来 */
+      let uiSelfBack = false;
+      function uiPush(close) {
+        try {
+          history.pushState({ ui: UISTACK.length + 1 }, "");
+        } catch (e) {
+          return; // file:// 或老 WebView 不允许 pushState，退化成不接管返回键
+        }
+        UISTACK.push(close);
+      }
+      /* 界面主动关闭：先把栈项摘掉再 back()，回来的 popstate 就不会重复关 */
+      function uiPop(close) {
+        const i = UISTACK.lastIndexOf(close);
+        if (i < 0) {
+          close();
+          return;
+        }
+        UISTACK.splice(i, 1);
+        close();
+        if (i === UISTACK.length) {
+          uiSelfBack = true;
+          history.back();
+        }
+      }
+      addEventListener("popstate", () => {
+        if (uiSelfBack) {
+          uiSelfBack = false;
+          return;
+        }
+        if (!UISTACK.length) return;
+        /* 有未保存修改时不能静默丢弃：把状态压回去，走一次确认流程 */
+        if (sheetDirty && !$("mask").hidden) {
+          try {
+            history.pushState({ ui: UISTACK.length }, "");
+          } catch (e) {}
+          closeSheet();
+          return;
+        }
+        UISTACK.pop()();
+      });
       function openSheet(cfg) {
+        const wasOpen = !$("mask").hidden;
         sheetDirty = false;
+        uiFocus = document.activeElement;
         $("sh-t").textContent = cfg.title || "";
         $("sh-b").innerHTML = "";
         if (typeof cfg.body === "string") $("sh-b").innerHTML = cfg.body;
@@ -2826,9 +2987,26 @@
         $("mask").hidden = false;
         $("sheet").style.transform = "";
         sheetClose = cfg.onClose || null;
+        if (!wasOpen) uiPush(sheetLayer);
         if (cfg.after) cfg.after();
+        /* 打开就落到第一个输入框，省一次点击；没有输入框就落关闭按钮 */
+        const first = $("sh-b").querySelector("input:not([disabled]), textarea, select");
+        (first || $("sh-x")).focus({ preventScroll: true });
+      }
+      function sheetLayer() {
+        hideSheet();
+      }
+      /* 纯收起：不碰 history、不跑回调，供 popstate 与 closeSheet 共用 */
+      function hideSheet() {
+        $("mask").hidden = true;
+        $("sheet").style.transform = "";
+        sheetDirty = false;
+        const back = uiFocus;
+        uiFocus = null;
+        if (back && back.focus && document.contains(back)) back.focus({ preventScroll: true });
       }
       function closeSheet(force) {
+        if ($("mask").hidden) return;
         if (!force && sheetDirty) {
           confirmSheet({
             title: "放弃修改？",
@@ -2842,31 +3020,47 @@
           });
           return;
         }
-        $("mask").hidden = true;
-        $("sheet").style.transform = "";
+        hideSheet();
         const cb = sheetClose;
         sheetClose = null;
-        if (cb && !force) cb();
-        if (cb && force) cb();
+        if (cb) cb();
+        uiPop(sheetLayer);
       }
       $("sh-x").onclick = () => closeSheet();
       $("mask").addEventListener("click", (e) => {
         if (e.target === $("mask")) closeSheet();
       });
       document.addEventListener("keydown", (e) => {
-        if (e.key !== "Escape") return;
-        if (!$("cmask").hidden) {
-          $("cmask").hidden = true;
+        if (e.key === "Escape") {
+          if (!$("cmask").hidden) {
+            closeConfirm();
+            return;
+          }
+          if (!$("mask").hidden) {
+            closeSheet();
+            return;
+          }
+          document.querySelectorAll(".page2.on").forEach((p) => p.classList.remove("on"));
           return;
         }
-        if (!$("mask").hidden) {
-          closeSheet();
-          return;
+        /* Tab 不出框：焦点在 Sheet 内循环，别跑到背后的页面上 */
+        if (e.key !== "Tab" || $("mask").hidden) return;
+        const box = $("sheet");
+        const f = [...box.querySelectorAll('button, input, select, textarea, a[href], [tabindex]:not([tabindex="-1"])')]
+          .filter((x) => !x.disabled && x.offsetParent !== null);
+        if (!f.length) return;
+        const first = f[0],
+          last = f[f.length - 1];
+        if (!e.shiftKey && document.activeElement === last) {
+          e.preventDefault();
+          first.focus();
+        } else if (e.shiftKey && document.activeElement === first) {
+          e.preventDefault();
+          last.focus();
         }
-        document.querySelectorAll(".page2.on").forEach((p) => p.classList.remove("on"));
       });
       $("cmask").addEventListener("click", (e) => {
-        if (e.target === $("cmask")) $("cmask").hidden = true;
+        if (e.target === $("cmask")) closeConfirm();
       });
       (function drag() {
         let y0 = 0,
@@ -2895,7 +3089,14 @@
           } else sh.style.transform = "";
         });
       })();
+      function confirmLayer() {
+        $("cmask").hidden = true;
+      }
+      function closeConfirm() {
+        if (!$("cmask").hidden) uiPop(confirmLayer);
+      }
       function confirmSheet(o) {
+        const wasOpen = !$("cmask").hidden;
         $("cm-t").textContent = o.title || "确认";
         $("cm-b").innerHTML = '<p class="sub" style="padding:2px 0 12px">' + esc(o.msg || "") + "</p>";
         const f = $("cm-f");
@@ -2903,19 +3104,20 @@
         const c = document.createElement("button");
         c.className = "btn ghost";
         c.textContent = o.cancel || "取消";
-        c.onclick = () => {
-          $("cmask").hidden = true;
-        };
+        c.onclick = closeConfirm;
         const k = document.createElement("button");
         k.className = "btn" + (o.danger ? " danger" : "");
         k.textContent = o.ok || "确定";
         k.onclick = () => {
-          $("cmask").hidden = true;
+          closeConfirm();
           o.onOk && o.onOk();
         };
         f.appendChild(c);
         f.appendChild(k);
         $("cmask").hidden = false;
+        if (!wasOpen) uiPush(confirmLayer);
+        /* 危险操作默认焦点给「取消」，防手滑回车 */
+        (o.danger ? c : k).focus({ preventScroll: true });
       }
       const BAD = /[;$`\\|&><()"']/;
       const CTRL = /[\x00-\x1f\x7f]/;
@@ -2941,8 +3143,17 @@
         if (spec.length >= 64) return "CPU 规格过长";
         const set = specSet(spec);
         if (!set.size) return "无法解析的 CPU 范围";
+        /* 保存前按本机核数拦一道：picker 里的红字是提示，这里是真正的门 */
+        const maxCore = CORE.all.size ? Math.max(...CORE.all) : -1;
+        if (maxCore >= 0 && [...set].some((i) => i > maxCore))
+          return "核编号超出本机范围（0-" + maxCore + "）";
         return "";
       }
+      const SG_HIDE = new Set();
+      document.addEventListener("pointerdown", (e) => {
+        if (!SG_HIDE.size || e.target.closest(".picker, .sg-wrap")) return;
+        for (const f of [...SG_HIDE]) if (!f(e.target)) SG_HIDE.delete(f);
+      });
       function attachSuggest(input, opt) {
         const o = opt || {};
         let box = null,
@@ -3027,9 +3238,12 @@
           o.onpick && o.onpick(v);
           hide();
         };
-        document.addEventListener("pointerdown", (e) => {
-          if (box && !e.target.closest(".picker, .sg-wrap") && e.target !== input && !box.contains(e.target))
-            hide();
+        /* 每个建议框不再各自往 document 上挂监听（增删行时会越挂越多），
+           只登记一个「点外面就收起」的回调，由全局那一个监听统一调度 */
+        SG_HIDE.add((t) => {
+          if (!document.contains(input)) return false; // 行已被重建，摘掉这条
+          if (box && t !== input && !box.contains(t)) hide();
+          return true;
         });
         return { hide: hide };
       }
@@ -3355,7 +3569,9 @@
         const gs = (S.rules && S.rules.rules) || [];
         const q = F.q.trim().toLowerCase();
         return gs.filter((g) => {
-          if (q && !String(g.pkg).toLowerCase().includes(q)) return false;
+          /* 搜索同时匹配线程名：想看「谁绑了 RenderThread」时不必先记住包名 */
+          if (q && !String(g.pkg).toLowerCase().includes(q) && !g.items.some((it) => String(it.thread || "").toLowerCase().includes(q)))
+            return false;
           if (F.ff === "rt") return !!g.rt;
           if (F.ff === "thread") return g.items.some((it) => it.thread);
           if (F.ff === "pkg") return !g.items.some((it) => it.thread);
@@ -3387,10 +3603,16 @@
             const pkgIt = g.items.find((it) => !it.thread);
             const set = pkgIt ? specSet(pkgIt.spec) : unionSpec(g.items);
             const nt = g.items.filter((it) => it.thread).length;
+            /* 靠线程名命中时把命中的名字写出来，否则用户看不出这行为什么在结果里 */
+            const q = F.q.trim().toLowerCase();
+            const hitTh =
+              q && !String(g.pkg).toLowerCase().includes(q)
+                ? (g.items.find((it) => String(it.thread || "").toLowerCase().includes(q)) || {}).thread || ""
+                : "";
             return (
               '<div class="rrow" data-pkg="' +
               esc(g.pkg) +
-              '">' +
+              '" tabindex="0">' +
               '<div class="l1"><span class="pk">' +
               pkgHTML(g.pkg) +
               (g.bl ? ' <span class="chip">黑名单</span>' : "") +
@@ -3398,7 +3620,9 @@
               "</span>" +
               '<span class="sw"><button role="switch" aria-checked="' +
               (g.rt ? "true" : "false") +
-              '" data-rt="' +
+              '" aria-label="' +
+              esc(g.pkg) +
+              ' 实时调度" data-rt="' +
               esc(g.pkg) +
               '"' +
               (scope ? ' aria-disabled="true" data-dis="1"' : "") +
@@ -3409,7 +3633,7 @@
               stripHTML(set) +
               "</span>" +
               '<span class="c">' +
-              (nt ? nt + " 条线程规则" : "仅包级") +
+              (hitTh ? "线程 " + esc(hitTh) : nt ? nt + " 条线程规则" : "仅包级") +
               "</span></div></div>"
             );
           })
@@ -3445,18 +3669,31 @@
             return;
           }
           const pkg = rt.dataset.rt;
+          const want = !rt.classList.contains("on");
+          /* 先动界面再发请求：点一下要立刻有反馈，失败再回滚 */
+          setSw(rt, want);
           try {
-            await api("/api/rt/toggle", { pkg: pkg, enabled: !rt.classList.contains("on") });
-            toast(rt.classList.contains("on") ? "已关闭优先调度" : "已开启优先调度");
+            await api("/api/rt/toggle", { pkg: pkg, enabled: want });
+            toast(want ? "已开启 RT" : "已关闭 RT");
             await loadRules();
             kick("sched");
           } catch (err) {
+            setSw(rt, !want);
             toast(err.message, { type: "err" });
           }
           return;
         }
         const row = e.target.closest("[data-pkg]");
         if (row) openApp(row.dataset.pkg);
+      });
+      /* 行本身可聚焦：键盘用 Enter/空格 打开编辑面板 */
+      $("r-list").addEventListener("keydown", (e) => {
+        if (e.key !== "Enter" && e.key !== " ") return;
+        if (e.target.closest("[data-rt]")) return;
+        const row = e.target.closest("[data-pkg]");
+        if (!row) return;
+        e.preventDefault();
+        openApp(row.dataset.pkg);
       });
       $("r-add").onclick = () => openApp(null);
       let edit = null;
@@ -3726,6 +3963,7 @@
           },
         });
       }
+      let candAll = false;
       async function loadCand() {
         let items = [];
         try {
@@ -3740,13 +3978,15 @@
         }
         const ROLE = { Critical: "关键", Latency: "延迟敏感", Worker: "计算", Background: "后台" };
         const CONF = { high: "可信度高", medium: "中等", low: "可信度低" };
+        /* 默认只铺 3 条：候选一多就会把规则列表整段挤出首屏 */
+        const rows = (candAll ? items : items.slice(0, 3)).map((c) => [items.indexOf(c), c]);
         const html =
           '<div class="card"><div class="h2" style="margin:0;padding:12px 14px 2px">推荐规则 ' +
           items.length +
           " 条</div>" +
-          items
+          rows
             .map(
-              (c, i) =>
+              ([i, c]) =>
                 '<div class="cand"><div style="display:flex;align-items:center;gap:8px">' +
                 '<span class="sub mono" style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' +
                 esc(c.pkg) +
@@ -3770,12 +4010,22 @@
                 "</button></div></div>",
             )
             .join("") +
+          (items.length > 3
+            ? '<button class="btn ghost wide" id="cand-more" style="margin:10px 14px 12px;width:calc(100% - 28px)">' +
+              (candAll ? "收起" : "查看全部 " + items.length + " 条") +
+              "</button>"
+            : "") +
           "</div>";
         mount(box, html, html);
       }
       $("r-cand").addEventListener("click", async (e) => {
         const ok = e.target.closest("[data-cok]"),
           no = e.target.closest("[data-cno]");
+        if (e.target.closest("#cand-more")) {
+          candAll = !candAll;
+          loadCand();
+          return;
+        }
         if (!ok && !no) return;
         const i = +((ok || no).dataset.cok || (ok || no).dataset.cno);
         const c = S.cand[i];
@@ -3783,7 +4033,22 @@
         try {
           if (ok) {
             await api("/api/candidate/accept", { pkg: c.pkg, thread: c.thread });
-            toast("已写入规则：" + (c.thread || c.pkg));
+            /* 采纳是覆盖式写入，给一次撤销机会比事后去规则页翻更省事 */
+            toast("已写入规则：" + (c.thread || c.pkg), {
+              action: {
+                label: "撤销",
+                fn: async () => {
+                  try {
+                    await api("/api/rule/del", { pkg: c.pkg, thread: c.thread || "" });
+                    toast("已撤销");
+                    await loadRules();
+                    await loadCand();
+                  } catch (err) {
+                    toast("撤销失败：" + err.message, { type: "err" });
+                  }
+                },
+              },
+            });
           } else {
             await api("/api/candidate/del", { pkg: c.pkg, thread: c.thread });
             toast("已忽略该候选");
@@ -3796,6 +4061,8 @@
       });
       /*! pages js: sched */
       const RTX = new Set();
+      /* 步进器防抖定时器：pkg -> timer */
+      const RT_MAX_T = {};
       const ADV = { unm: null };
       job("schedcfg", "sched", 5e3, async () => {
         await Promise.all([loadCfg(true), loadRt(true)]);
@@ -3907,7 +4174,9 @@
               "</span>" +
               '<span class="sw"><button role="switch" aria-checked="' +
               (a.enabled ? "true" : "false") +
-              '" data-rton="' +
+              '" aria-label="' +
+              esc(a.pkg) +
+              ' 实时调度" data-rton="' +
               esc(a.pkg) +
               '" class="' +
               (a.enabled ? "on rt" : "") +
@@ -3924,7 +4193,9 @@
               num(a.max) +
               '" data-rtmv="' +
               esc(a.pkg) +
-              '" inputmode="numeric" style="width:36px"><button data-rtmx="' +
+              '" inputmode="numeric" aria-label="' +
+              esc(a.pkg) +
+              ' RT 上限" style="width:36px"><button data-rtmx="' +
               esc(a.pkg) +
               ':1">＋</button></span>' +
               '<button class="btn sm ghost" data-rtx="' +
@@ -3946,7 +4217,7 @@
                   esc(a.pkg) +
                   '" value="' +
                   esc(names) +
-                  '" placeholder="留空=自动，逗号分隔，支持 *"></div>'
+                  '" placeholder="留空=自动，逗号分隔，支持 *" aria-label="RT 线程名"></div>'
                 : "") +
               "</div>"
             );
@@ -3954,7 +4225,8 @@
           .join("");
         mount($("rt-apps"), html, html);
       }
-      async function putRt(pkg, patch) {
+      /* quiet：连点步进器时不弹「已更新」，只在失败时报错 */
+      async function putRt(pkg, patch, quiet) {
         const a = ((S.rt && S.rt.apps) || []).find((x) => x.pkg === pkg);
         if (!a && !patch.delete) return;
         const body = {
@@ -3967,12 +4239,14 @@
         };
         try {
           await api("/api/rt/app", body);
-          toast("已更新");
+          if (!quiet) toast("已更新");
           await loadRt(true);
           await loadCfg(true);
           kick("rules");
         } catch (e) {
           toast(e.message, { type: "err" });
+          /* 失败要把界面拉回服务端现状，别让乐观更新停在错误状态 */
+          await loadRt(true).catch(() => {});
         }
       }
       $("rt-apps").addEventListener("click", (e) => {
@@ -3982,7 +4256,9 @@
           st = e.target.closest("[data-rtmx]");
         if (on) {
           const pkg = on.dataset.rton;
-          return putRt(pkg, { enabled: !on.classList.contains("on") });
+          const want = !on.classList.contains("on");
+          setSw(on, want);
+          return putRt(pkg, { enabled: want });
         }
         if (del) return putRt(del.dataset.rtd, { delete: true });
         if (ed) {
@@ -3996,7 +4272,15 @@
           const a = ((S.rt && S.rt.apps) || []).find((x) => x.pkg === pkg);
           if (!a) return;
           const v = Math.max(1, Math.min(8, num(a.max) + +dd));
-          if (v !== num(a.max)) putRt(pkg, { max: v });
+          if (v === num(a.max)) return;
+          /* 连点只改本地，600ms 内没有新点击才发一次请求 */
+          a.max = v;
+          renderRtApps(S.rt || { apps: [] });
+          clearTimeout(RT_MAX_T[pkg]);
+          RT_MAX_T[pkg] = setTimeout(() => {
+            delete RT_MAX_T[pkg];
+            putRt(pkg, { max: v }, true);
+          }, 600);
         }
       });
       $("rt-apps").addEventListener("change", (e) => {
@@ -4057,6 +4341,13 @@
         if (!c) return;
         const mode = ["off", "shadow", "on"][num(c.sched_mode)] || "off";
         document.querySelectorAll("#seg-s7 button").forEach((b) => b.classList.toggle("on", b.dataset.s7 === mode));
+        /* 档位含义写在控件下面：折叠说明里那句话没人会主动展开 */
+        $("s7-mean").textContent =
+          {
+            off: "关闭：不做跨层迁移，线程停在哪一层就一直在那一层。",
+            shadow: "观察：只记录「本该迁走」的线程，不执行迁移，用来验证判断准不准。",
+            on: "开启：某层过载时把非关键线程迁到较空闲的一层，过载解除后迁回。",
+          }[mode] || "—";
         $("s7-tip").hidden = !(mode !== "off" && num(c.cluster_levels) < 2);
         const kv = [
           ["轮次", c.sched_ticks],
@@ -4252,28 +4543,51 @@
         }
         $("d-ts").textContent = "更新于 " + new Date().toLocaleTimeString("zh-CN", { hour12: false });
         S.ts = new Date().toLocaleString("zh-CN");
-        const g = [];
-        g.push(statHTML("调用", a.calls), statHTML("真写", a.writes), statHTML("短路", a.noop));
-        g.push(
-          statHTML("失败", a.failed, "e"),
-          statHTML("无权限", a.eperm),
-          statHTML("无效参数", a.einval),
-          statHTML("不支持", a.enosys),
-          statHTML("其它错误", a.other, "w"),
-          statHTML("线程已退出", a.gone),
+        /* 按「一次写入走到了哪一步」分组，比 21 个数字平铺好读 */
+        const grp = (h, note, cells) =>
+          '<div class="dgh">' + h + '</div><div class="dgn">' + note + "</div>" + cells;
+        let g = "";
+        g += grp(
+          "写入结果",
+          "调用=尝试写入的次数；真写=内核接受了新掩码；短路=读回已一致，直接返回。",
+          statHTML("调用", a.calls) + statHTML("真写", a.writes) + statHTML("短路", a.noop),
         );
-        g.push(statHTML("cpuset 失败", a.cpuset_fail, "w"), statHTML("cpuset 暂停", a.cpuset_paused ? 1 : 0));
-        g.push(
-          statHTML("裁剪", a.clip),
-          statHTML("重置", a.reset),
-          statHTML("改簇", a.shifted),
-          statHTML("被裁剪", a.ineffective, "w"),
-          statHTML("暂停重绑", a.stuck, "w"),
-          statHTML("跳过重绑", a.stuck_skip),
+        g += grp(
+          "失败",
+          "errno 说明内核为什么拒绝；线程已退出（ESRCH）是竞态，不计入故障。",
+          statHTML("失败", a.failed, "e") +
+            statHTML("无权限", a.eperm, num(a.eperm) ? "w" : "") +
+            statHTML("无效参数", a.einval, num(a.einval) ? "w" : "") +
+            statHTML("不支持", a.enosys, num(a.enosys) ? "w" : "") +
+            statHTML("其它错误", a.other, "w") +
+            statHTML("线程已退出", a.gone),
         );
-        g.push(statHTML("后台组跳过", a.sysgroup_skip), statHTML("无交集", a.unreachable, "w"));
-        g.push(statHTML("规则来源", a.rule), statHTML("同步来源", a.sync), statHTML("S7 来源", a.sched));
-        mount($("d-stats"), g.join(""), g.join(""));
+        g += grp(
+          "cpuset",
+          "目录写入失败时改由 sched_setaffinity 单独维持；连续失败会暂停一段时间不再尝试。",
+          statHTML("cpuset 失败", a.cpuset_fail, "w") + statHTML("cpuset 暂停", a.cpuset_paused ? 1 : 0),
+        );
+        g += grp(
+          "校验与重绑",
+          "裁剪=被 cgroup 的 effective_cpus 裁掉；重置=被整体写回全核；改簇=被挪到另一簇；被裁剪=写入后回读仍不一致。",
+          statHTML("裁剪", a.clip) +
+            statHTML("重置", a.reset) +
+            statHTML("改簇", a.shifted) +
+            statHTML("被裁剪", a.ineffective, "w") +
+            statHTML("暂停重绑", a.stuck, "w") +
+            statHTML("跳过重绑", a.stuck_skip),
+        );
+        g += grp(
+          "跳过",
+          "后台组跳过=系统把线程放进受限组，规则目标不在该组；无交集=目标与该组生效集合没有交集，内核必然拒绝。",
+          statHTML("后台组跳过", a.sysgroup_skip) + statHTML("无交集", a.unreachable, "w"),
+        );
+        g += grp(
+          "来源",
+          "按触发原因拆分，用来看绑核主要由规则、定时同步还是 S7 动态分配驱动。",
+          statHTML("规则来源", a.rule) + statHTML("同步来源", a.sync) + statHTML("S7 来源", a.sched),
+        );
+        mount($("d-stats"), g, g);
         $("d-line").textContent = a.line || "";
         $("d-errno").textContent = a.errno_line || "";
         const jank = (d.jank || []).slice().sort((x, y) => num(y.wait_ms) - num(x.wait_ms));
@@ -4307,7 +4621,9 @@
         renderThreads();
         const ev = d.events || [];
         const box = $("d-ev");
-        box.textContent = ev.length ? ev.join("\n") : "—";
+        /* 每 5s 整段重写会打断选区：内容没变就不碰 DOM */
+        const evTxt = ev.length ? ev.join("\n") : "—";
+        if (box.textContent !== evTxt) box.textContent = evTxt;
         if ($("d-autosc").checked) box.scrollTop = box.scrollHeight;
       }
       function threadRows() {
@@ -4493,7 +4809,11 @@
         if (!["over", "rules", "sched", "diag", "set"].includes(t)) t = "over";
         S.tab = t;
         ls.set("appopt_tab", t);
-        document.querySelectorAll(".tab").forEach((b) => b.classList.toggle("on", b.dataset.tab === t));
+        document.querySelectorAll(".tab").forEach((b) => {
+          const on = b.dataset.tab === t;
+          b.classList.toggle("on", on);
+          b.setAttribute("aria-selected", on ? "true" : "false");
+        });
         document.querySelectorAll(".page").forEach((p) => p.classList.toggle("on", p.dataset.pg === t));
         $("r-add").hidden = t !== "rules";
         if (t === "over") renderOver();
