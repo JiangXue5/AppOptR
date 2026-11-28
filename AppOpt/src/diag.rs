@@ -1640,21 +1640,50 @@ pub struct ThreadDiag {
 
 static THREADS: Mutex<Vec<ThreadDiag>> = Mutex::new(Vec::new());
 
+/// 这条线程此刻「期望被绑在哪里」。
+///
+/// 前台线程就是规则集合；被降档的后台线程是后台配置（小核），不再拿规则
+/// 原值去比——规则写大核、后台组只给 0-3 时，内核必然拒绝绑定，拿 4-7
+/// 当期望只会让每一条后台线程都顶着一个假异常。
+///
+/// 第二个返回值表示「这条期望来自降档」，判定时允许实际值是小核集合的
+/// 真子集（组生效集合可能比小核更窄，那属于被系统多裁了一刀，照此处理）。
+fn expect_of(bg: bool, is_thread_rule: bool, floor: Option<&CpuSet>, rule: &CpuSet) -> (CpuSet, bool) {
+    match floor {
+        Some(f) if bg && !is_thread_rule => (*f, true),
+        _ => (*rule, false),
+    }
+}
+
+fn matches(want: &CpuSet, actual: Option<&CpuSet>, demoted: bool) -> bool {
+    match actual {
+        None => false,
+        Some(a) if demoted => a.subset_of(want),
+        Some(a) => a == want,
+    }
+}
+
 pub fn publish_threads(cache: &ProcCache) {
+    let cfg = lock_ignore_poison(&crate::config::CURRENT_CONFIG).clone();
+    let floor = cfg
+        .as_ref()
+        .filter(|c| c.foreground_demote)
+        .and_then(|c| crate::background::floor_of(&c.topo));
     let mut out: Vec<ThreadDiag> = Vec::new();
     for (&tid, e) in cache.tasks.iter().take(THREAD_CAP) {
         let actual = CpuSet::get_affinity(tid);
-        let ok = actual.as_ref() == Some(&e.cpus);
+        let bg = crate::background::is_background(e.pid, e.group);
+        let (want, demoted) = expect_of(bg, e.is_thread_rule, floor.as_ref(), &e.cpus);
         out.push(ThreadDiag {
             tid,
             pkg: e.pkg.clone(),
             comm: e.comm.clone(),
-            expect: e.cpus.to_range_string(),
+            expect: want.to_range_string(),
             actual: actual
                 .map(|c| c.to_range_string())
                 .unwrap_or_else(|| "已退出".to_string()),
-            ok,
-            bg: crate::background::is_background(e.pid, e.group),
+            ok: matches(&want, actual.as_ref(), demoted),
+            bg,
         });
     }
     // 只把「前台且没绑住」排到最前：后台线程被系统组或降档压在小核是
@@ -2245,5 +2274,41 @@ mod tests {
         let mut moved = wait.clone();
         moved.state = "等待采样窗口";
         assert!(sched_period_line(Some(&wait), &moved, &mut hint).is_some());
+    }
+
+    fn range(s: &str) -> CpuSet {
+        crate::cpuset::parse_cpu_ranges(s, None)
+    }
+
+    #[test]
+    fn background_expects_small_cores_not_rule() {
+        let rule = range("4-7");
+        let floor = range("0-3");
+        let (want, demoted) = expect_of(true, false, Some(&floor), &rule);
+        assert!(demoted);
+        assert_eq!(want.to_range_string(), "0-3");
+        // 落在小核里（含被组再裁一刀）都算正常
+        assert!(matches(&want, Some(&range("0-2")), demoted));
+        assert!(matches(&want, Some(&range("0-3")), demoted));
+        // 混进大核就不是降档该有的样子
+        assert!(!matches(&want, Some(&range("0-6")), demoted));
+    }
+
+    #[test]
+    fn foreground_and_thread_rules_keep_rule_value() {
+        let rule = range("4-7");
+        let floor = range("0-3");
+        let (fg, d1) = expect_of(false, false, Some(&floor), &rule);
+        assert!(!d1);
+        assert_eq!(fg.to_range_string(), "4-7");
+        assert!(!matches(&fg, Some(&range("0-2")), false));
+        // 显式线程规则优先于降档，后台也不改期望
+        let (own, d2) = expect_of(true, true, Some(&floor), &rule);
+        assert!(!d2);
+        assert_eq!(own.to_range_string(), "4-7");
+        // 没有小核集合（拓扑未分层）时保持原样
+        let (none, d3) = expect_of(true, false, None, &rule);
+        assert!(!d3);
+        assert_eq!(none.to_range_string(), "4-7");
     }
 }
