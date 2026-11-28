@@ -842,6 +842,37 @@
         font-size: 11.5px;
         color: var(--sub);
       }
+      /* 断开时整块置灰：数字是旧的，绿/橙/紫的语义不能继续沿用 */
+      .hero.stale {
+        opacity: 0.5;
+        filter: grayscale(0.85);
+      }
+      .topo-note {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        width: 100%;
+        min-height: 44px;
+        /* 与 .row / .leg 的 14px 内缩对齐，否则文字贴在卡片边缘 */
+        padding: 0 14px;
+        font-size: 12.5px;
+        line-height: 1.4;
+        color: var(--sub);
+        text-align: left;
+      }
+      .topo-note .a {
+        margin-left: auto;
+        flex-shrink: 0;
+        transition: transform 0.15s;
+      }
+      .topo-note[aria-expanded="true"] .a {
+        transform: rotate(90deg);
+      }
+      .topo-desc {
+        padding: 2px 14px 6px;
+        font-size: 12.5px;
+        line-height: 1.6;
+      }
       .att {
         display: flex;
         flex-direction: column;
@@ -1686,7 +1717,7 @@
           <section class="page on" id="pg-over" data-pg="over">
             <div class="wrap">
               <div class="card">
-                <div class="hero">
+                <div class="hero" id="o-hero">
                   <div class="l">
                     <div class="m">
                       <span class="badge" id="o-mode">—</span><span class="sub" id="o-uptime"></span>
@@ -1721,12 +1752,18 @@
                 <div class="row" style="padding-top: 8px">
                   <span class="k">cpuset</span><span class="v sub" id="o-cpuset">—</span>
                 </div>
+                <button class="topo-note" id="o-topo-note" hidden aria-expanded="false" aria-controls="o-topo-desc">
+                  簇数不足 3，语义核可能重合 <span class="a">›</span>
+                </button>
+                <div class="sub topo-desc" id="o-topo-desc" hidden>
+                  e-core 与 hp-core 指向同一批核心，语义名仍可保存，但按实际 CPU 集合生效。
+                </div>
               </div>
               <div class="grid4">
                 <div class="stat"><b id="o-rules">0</b><span>规则</span></div>
                 <div class="stat"><b id="o-pkgs">0</b><span>覆盖应用</span></div>
                 <div class="stat"><b id="o-hit">0</b><span>命中应用</span></div>
-                <div class="stat"><b id="o-th">0</b><span>绑定线程</span></div>
+                <div class="stat"><b id="o-th">—</b><span>落位率</span></div>
               </div>
               <div class="mini" id="o-mini"></div>
             </div>
@@ -2449,6 +2486,9 @@
         diagTs: 0,
         cand: [],
         theme: "auto",
+        /* null = 还没联通过；true/false = 最近一次状态轮询的结果 */
+        online: null,
+        statusTs: 0,
       };
       const CORE = { e: new Set(), p: new Set(), hp: new Set(), all: new Set() };
       function setTopo(st) {
@@ -2591,7 +2631,40 @@
         d.className = "dot " + (ok ? "ok" : "err");
         d.title = ok ? "守护进程连通" : "守护进程无响应";
         $("banner").hidden = ok;
+        if (ok) S.statusTs = Date.now();
+        if (S.online !== ok) {
+          S.online = ok;
+          paintOffline();
+        }
       }
+      /* 断线时把概览整块置灰，并把「运行 3 天」换成「离线 · 数据 12 秒前」：
+         继续显示运行时长会让人以为数字是刚采的 */
+      function paintOffline() {
+        const hero = $("o-hero");
+        if (!hero) return;
+        const off = S.online === false;
+        hero.classList.toggle("stale", off);
+        const el = $("o-uptime");
+        if (!el) return;
+        if (!off) {
+          if (S.status) el.textContent = "运行 " + fmtUp(S.status.uptime);
+          return;
+        }
+        if (!S.statusTs) {
+          el.textContent = "离线";
+          return;
+        }
+        const sec = Math.max(1, Math.round((Date.now() - S.statusTs) / 1000));
+        el.textContent = "离线 · 数据 " + fmtAgo(sec);
+      }
+      function fmtAgo(sec) {
+        if (sec < 60) return sec + " 秒前";
+        if (sec < 3600) return Math.floor(sec / 60) + " 分钟前";
+        return Math.floor(sec / 3600) + " 小时前";
+      }
+      setInterval(() => {
+        if (S.online === false && !document.hidden) paintOffline();
+      }, 1000);
       function busy(btn, on, label) {
         if (!btn) return;
         if (on) {
@@ -3016,7 +3089,6 @@
         if (num(st.parse_fail) > 0) out.push({ t: num(st.parse_fail) + " 行规则格式无效被跳过", go: "rules" });
         if (num(st.dropped) > 0)
           out.push({ t: "eBPF 事件丢弃 " + num(st.dropped) + " 条，已自动对账", go: "diag" });
-        if (st.topo_degraded) out.push({ t: "簇数不足 3，语义名可能指向同一批核心", go: "over" });
         const bad =
           num(af.failed) + num(af.ineffective) + num(af.unreachable) + num(af.cpuset_fail) + num(af.stuck);
         if (bad > 0) out.push({ t: "绑核异常 " + bad + " 项（失败 / 被裁剪 / 不可达）", go: "diag" });
@@ -3026,7 +3098,9 @@
       }
       function renderOver() {
         const st = S.status || {},
-          cf = S.cfg || {};
+          cf = S.cfg || {},
+          dg = S.diag || {},
+          lg = dg.ledger || {};
         if (!st.version && !st.mode) return;
         $("o-mode").textContent = modeLabel(st.mode);
         $("o-mode").className = "badge" + (st.mode === "ebpf" ? "" : " proc");
@@ -3036,7 +3110,21 @@
         $("o-rules").textContent = num(st.rules);
         $("o-pkgs").textContent = num(st.pkgs);
         $("o-hit").textContent = num(st.hit_pkgs);
-        $("o-th").textContent = num(st.threads);
+        /* 落位率 = 账本里读回与期望一致的线程 / 受管线程。
+           不看 ok 计数：那个数含「线程已退出」，分母会把已退出的也算进去 */
+        const mgd = num(lg.managed),
+          hit = num(lg.consistent);
+        const th = $("o-th");
+        if (lg.known && mgd > 0) {
+          const pct = (hit / mgd) * 100;
+          th.textContent = (pct >= 100 ? "100" : pct.toFixed(1)) + "%";
+          th.parentNode.title = hit + " / " + mgd + " 个受管线程落在期望核上";
+          th.style.color = pct >= 100 ? "var(--ok-t)" : pct >= 90 ? "" : "var(--warn-t)";
+        } else {
+          th.textContent = "—";
+          th.parentNode.removeAttribute("title");
+          th.style.color = "";
+        }
         $("o-mini").textContent =
           num(st.cores) + " 核 · " + num(st.total_procs) + " 进程 · 检查间隔 " + num(st.interval) + " 秒";
         const iss = issues();
@@ -3072,8 +3160,21 @@
             st.topo_source
           ] || "—";
         $("o-cpuset").textContent = st.cpuset_enabled ? "可用" : "不可用（只写亲和性）";
+        /* 簇数不足是拓扑事实，不是故障：灰字折叠说明，不进「需注意」 */
+        const note = $("o-topo-note");
+        note.hidden = !st.topo_degraded;
+        if (note.hidden) {
+          note.setAttribute("aria-expanded", "false");
+          $("o-topo-desc").hidden = true;
+        }
         $("a-ver").textContent = "v" + (st.version || "?");
       }
+      $("o-topo-note").addEventListener("click", () => {
+        const n = $("o-topo-note"),
+          open = n.getAttribute("aria-expanded") === "true";
+        n.setAttribute("aria-expanded", open ? "false" : "true");
+        $("o-topo-desc").hidden = open;
+      });
       $("o-att").addEventListener("click", (e) => {
         const b = e.target.closest("[data-go]");
         if (b) switchTab(b.dataset.go);
